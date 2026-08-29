@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-ziot_rtp_bridge.py — Reliability-patched version
-==================================================
-Changes from original:
-  - Frame rate tracking per camera (fps over last 5s window)
-  - Faster re-resolve: 2s starvation threshold (was 4s)
-  - /health endpoint with per-camera stats + fps
-  - Periodic frame rate logging every 30s
-  - Re-punch on endpoint move (not just re-resolve)
+ziot_rtp_bridge.py — v2 with auto-recovery
+============================================
+Changes from v1:
+  - Full re-rendezvous on endpoint move (send_stun_addr + notify wake)
+  - Auto-recovery thread: tears down socket and re-rendezvous from scratch
+    when stream dies permanently
+  - Exponential backoff on re-rendezvous (5s → 60s)
+  - Socket recreation to avoid stale NAT bindings
+  - /health endpoint with re-rendezvous count + backoff state
 """
 import argparse
 import json
@@ -28,8 +29,11 @@ APP_ID = "b1ee47e92dfa22635907aa6bb882b1dc0ebc0285"
 PUNCH = b"App send hello"
 KEEPALIVE_INTERVAL = 2
 PUNCH_INTERVAL = 0.5
-STARVED_THRESHOLD = 2.0        # re-resolve after 2s of silence (was 4s)
+STARVED_THRESHOLD = 2.0        # re-resolve after 2s of silence
 FPS_LOG_INTERVAL = 30           # log fps every 30s
+RECOVERY_DEAD_THRESHOLD = 10.0  # start recovery after 10s dead
+RECOVERY_MAX_BACKOFF = 60.0     # max wait between re-rendezvous attempts
+RECOVERY_INITIAL_BACKOFF = 5.0  # first retry after 5s
 
 log = logging.getLogger("ziot")
 
@@ -187,6 +191,10 @@ class RtpJpegReassembler:
         self._meta = {}
         self._emit = emit
 
+    def reset(self):
+        self._frags.clear()
+        self._meta.clear()
+
     def feed(self, pkt: bytes) -> None:
         marker = pkt[1] >> 7
         ts = struct.unpack(">I", pkt[4:8])[0]
@@ -223,45 +231,87 @@ class ZiotCamera:
         self.audio = Fanout(maxsize=64)
         self._stop = threading.Event()
         self.addr = None
+        self.sock = None
+        self._sock_lock = threading.Lock()  # guards socket swap
         self.stats = {"frames": 0, "audio_pkts": 0}
         self._last_rx = 0.0
         # FPS tracking
-        self._frame_times: deque = deque(maxlen=120)  # last 120 timestamps
+        self._frame_times: deque = deque(maxlen=120)
         self._last_fps_log = time.monotonic()
         # Endpoint move tracking
         self._endpoint_moves = 0
         self._last_resolve = 0.0
+        # Recovery tracking
+        self._re_rendezvous_count = 0
+        self._backoff = RECOVERY_INITIAL_BACKOFF
+        self._last_re_rendezvous = 0.0
 
-    def start(self) -> bool:
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.bind_ip, 0))
-        port = self.sock.getsockname()[1]
+    def _rendezvous(self) -> bool:
+        """Full rendezvous: bind socket, register port, wake camera, get address.
+        Returns True if we got a valid camera address."""
+        # Close old socket if any
+        old_sock = None
+        with self._sock_lock:
+            if self.sock:
+                old_sock = self.sock
+                self.sock = None
+        if old_sock:
+            try:
+                old_sock.close()
+            except Exception:
+                pass
 
+        # Create fresh socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((self.bind_ip, 0))
+        port = sock.getsockname()[1]
+
+        # Register our port with cloud
         for _ in range(3):
             try:
                 self.api.send_stun_addr(self.uid, self.bind_ip, port)
             except Exception as e:
                 log.warning("[%s] send-stun-addr: %s", self.uid, e)
+
+        # Wake the camera
         try:
             self.api.notify(self.uid, 1)
         except Exception as e:
             log.warning("[%s] notify(1): %s", self.uid, e)
 
+        # Get camera address
+        addr = None
         for _ in range(5):
             try:
                 d = self.api.get_stun_addr(self.uid)
-                self.addr = (d["IpcPrivateIP"], d["IpcPrivatePort"])
+                addr = (d["IpcPrivateIP"], d["IpcPrivatePort"])
                 break
             except Exception:
                 time.sleep(1)
-        if not self.addr:
+
+        if not addr:
             log.error("[%s] no address from broker", self.uid)
+            try:
+                sock.close()
+            except Exception:
+                pass
             return False
 
-        log.info("[%s] camera at %s:%d (we are %s:%d)",
-                 self.uid, self.addr[0], self.addr[1], self.bind_ip, port)
+        # Install the new socket
+        with self._sock_lock:
+            self.sock = sock
+            self.addr = addr
 
-        for fn in (self._keepalive, self._punch, self._receive, self._fps_logger):
+        log.info("[%s] camera at %s:%d (we are %s:%d)",
+                 self.uid, addr[0], addr[1], self.bind_ip, port)
+        return True
+
+    def start(self) -> bool:
+        if not self._rendezvous():
+            return False
+
+        for fn in (self._keepalive, self._punch, self._receive, self._fps_logger,
+                   self._recovery):
             threading.Thread(target=fn, daemon=True).start()
         return True
 
@@ -289,16 +339,56 @@ class ZiotCamera:
         while not self._stop.is_set():
             if time.monotonic() - self._last_rx > STARVED_THRESHOLD:
                 self._resolve()
-                # Re-punch immediately after resolve
                 try:
-                    self.sock.sendto(PUNCH, self.addr)
+                    with self._sock_lock:
+                        if self.sock:
+                            self.sock.sendto(PUNCH, self.addr)
                 except Exception:
                     pass
             try:
-                self.sock.sendto(PUNCH, self.addr)
+                with self._sock_lock:
+                    if self.sock:
+                        self.sock.sendto(PUNCH, self.addr)
             except Exception:
                 pass
             self._stop.wait(PUNCH_INTERVAL)
+
+    def _recovery(self):
+        """Monitor stream health and trigger full re-rendezvous when dead."""
+        while not self._stop.is_set():
+            self._stop.wait(RECOVERY_DEAD_THRESHOLD)
+            if self._stop.is_set():
+                break
+
+            if self.is_streaming:
+                # Stream is alive — reset backoff
+                self._backoff = RECOVERY_INITIAL_BACKOFF
+                continue
+
+            # Stream is dead
+            dead_for = time.monotonic() - self._last_rx if self._last_rx else float('inf')
+
+            # Don't re-rendezvous too often
+            since_last = time.monotonic() - self._last_re_rendezvous
+            if since_last < self._backoff:
+                continue
+
+            log.warning("[%s] stream dead %.0fs — re-rendezvous (backoff %.0fs)",
+                        self.uid, dead_for, self._backoff)
+            self._last_re_rendezvous = time.monotonic()
+            self._re_rendezvous_count += 1
+
+            if self._rendezvous():
+                # Reset frame tracker
+                self._frame_times.clear()
+                # After re-rendezvous, wait a bit before checking again
+                self._stop.wait(self._backoff)
+                # Exponential backoff
+                self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+            else:
+                log.error("[%s] re-rendezvous failed", self.uid)
+                self._stop.wait(self._backoff)
+                self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
 
     @property
     def is_streaming(self) -> bool:
@@ -306,7 +396,6 @@ class ZiotCamera:
 
     @property
     def fps(self) -> float:
-        """Frames per second over the last 5 seconds."""
         now = time.monotonic()
         cutoff = now - 5.0
         count = sum(1 for t in self._frame_times if t > cutoff)
@@ -319,14 +408,22 @@ class ZiotCamera:
 
     def _receive(self):
         asm = RtpJpegReassembler(self._on_frame)
-        self.sock.settimeout(0.5)
         while not self._stop.is_set():
+            # Get the current socket (may change during re-rendezvous)
+            with self._sock_lock:
+                sock = self.sock
+            if not sock:
+                self._stop.wait(0.5)
+                continue
+            sock.settimeout(0.5)
             try:
-                data, _ = self.sock.recvfrom(65535)
+                data, _ = sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError:
-                break
+                # Socket was closed (re-rendezvous in progress)
+                self._stop.wait(0.5)
+                continue
             if len(data) < 12:
                 continue
             self._last_rx = time.monotonic()
@@ -338,7 +435,6 @@ class ZiotCamera:
                 self.audio.publish(ulaw_to_pcm16(data[12:]))
 
     def _fps_logger(self):
-        """Log frame rate every 30s for diagnostics."""
         while not self._stop.is_set():
             self._stop.wait(FPS_LOG_INTERVAL)
             if self._stop.is_set():
@@ -346,12 +442,14 @@ class ZiotCamera:
             fps = self.fps
             streaming = self.is_streaming
             moves = self._endpoint_moves
+            rr = self._re_rendezvous_count
             if streaming:
-                log.info("[%s] %.1f fps, %d frames total, %d endpoint moves",
-                         self.uid, fps, self.stats["frames"], moves)
+                log.info("[%s] %.1f fps, %d frames total, %d endpoint moves, %d re-rendezvous",
+                         self.uid, fps, self.stats["frames"], moves, rr)
             else:
-                log.warning("[%s] NO STREAM — last rx %.0fs ago, %d endpoint moves",
-                            self.uid, time.monotonic() - self._last_rx if self._last_rx else 0, moves)
+                log.warning("[%s] NO STREAM — last rx %.0fs ago, %d moves, %d re-rendezvous",
+                            self.uid, time.monotonic() - self._last_rx if self._last_rx else 0,
+                            moves, rr)
 
     def health(self) -> dict:
         now = time.monotonic()
@@ -362,6 +460,8 @@ class ZiotCamera:
             "frames_total": self.stats["frames"],
             "audio_pkts": self.stats["audio_pkts"],
             "endpoint_moves": self._endpoint_moves,
+            "re_rendezvous_count": self._re_rendezvous_count,
+            "backoff_s": round(self._backoff, 1),
             "last_rx_ago_s": round(now - self._last_rx, 1) if self._last_rx else None,
             "addr": f"{self.addr[0]}:{self.addr[1]}" if self.addr else None,
         }
@@ -372,6 +472,13 @@ class ZiotCamera:
             self.api.notify(self.uid, 0)
         except Exception:
             pass
+        with self._sock_lock:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
 
 
 def make_handler(cameras: dict):
@@ -416,7 +523,6 @@ def make_handler(cameras: dict):
                 "application/json")
 
         def _health(self):
-            """Detailed health endpoint for watchdog/monitoring."""
             data = {
                 "status": "ok" if any(c.is_streaming for c in cameras.values()) else "degraded",
                 "cameras": [c.health() for c in cameras.values()],
