@@ -1,0 +1,4 @@
+ziot_config.json
+*.pyc
+__pycache__/
+.env
