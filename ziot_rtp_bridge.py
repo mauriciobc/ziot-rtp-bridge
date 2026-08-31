@@ -1008,6 +1008,8 @@ class ZiotCamera:
         costs a short gap; if direct then fails, the normal failure counter
         brings the relay straight back.
         """
+        if self.force_relay:
+            return          # told to stay on the relay; never probe direct
         now = time.monotonic()
         if now - self._relay_last_direct_try < RELAY_RETRY_DIRECT:
             return
@@ -1015,7 +1017,12 @@ class ZiotCamera:
         log.info("[%s] relayed — retrying the direct path", self.uid)
         self._stop_relay()
         self._last_rx = 0.0
-        if self._rendezvous():
+        try:
+            regained = self._rendezvous()
+        except Exception as e:
+            log.error("[%s] direct retry failed: %s", self.uid, e)
+            regained = False
+        if regained:
             self._consec_failures = 0
             self._backoff = RECOVERY_INITIAL_BACKOFF
             log.info("[%s] back on the direct path", self.uid)
@@ -1024,10 +1031,20 @@ class ZiotCamera:
             self._start_relay()
 
     def _open_transport(self) -> bool:
-        """One attempt at whichever transport this camera is configured for."""
-        if self.force_relay:
-            return self._start_relay()
-        return self._rendezvous()
+        """One attempt at whichever transport this camera is configured for.
+
+        Never raises. `_rendezvous()` binds a socket, which throws for an
+        address that is not (or is no longer) local — `--bind-ip` on a downed
+        interface, say. Letting that escape would kill whichever thread called
+        us: at startup the camera would never be registered, and from the
+        recovery loop the thread would die silently and the camera would never
+        retry again. A failed attempt is a False, not an exception.
+        """
+        try:
+            return self._start_relay() if self.force_relay else self._rendezvous()
+        except Exception as e:
+            log.error("[%s] transport attempt failed: %s", self.uid, e)
+            return False
 
     def start(self) -> bool:
         """Bring the camera up and start its threads.
@@ -1039,20 +1056,27 @@ class ZiotCamera:
         when it returns. The return value says whether the *first* attempt
         worked, for logging — it is not a reason to discard the camera.
         """
-        ok = self._open_transport()
-        if not ok:
-            if self.force_relay:
-                log.error("[%s] --force-relay: no relay URL answered. Serving "
-                          "anyway and retrying every %.0fs — the direct path "
-                          "will NOT be tried while --force-relay is set.",
-                          self.uid, RECOVERY_DEAD_THRESHOLD)
-            else:
-                log.warning("[%s] initial rendezvous failed — serving anyway "
-                            "and retrying in the background", self.uid)
-
-        for fn in (self._keepalive, self._punch, self._receive, self._fps_logger,
-                   self._recovery):
-            threading.Thread(target=fn, daemon=True).start()
+        try:
+            ok = self._open_transport()
+            if not ok:
+                if self.force_relay:
+                    log.error("[%s] --force-relay: no relay URL answered. "
+                              "Serving anyway and retrying every %.0fs — the "
+                              "direct path will NOT be tried while "
+                              "--force-relay is set.",
+                              self.uid, RECOVERY_DEAD_THRESHOLD)
+                else:
+                    log.warning("[%s] initial rendezvous failed — serving "
+                                "anyway and retrying in the background",
+                                self.uid)
+        finally:
+            # In a finally so the threads exist even if the first attempt blew
+            # up unexpectedly. Registering a camera with no recovery thread
+            # would put it on /health and then never retry it, which is worse
+            # than dropping it: it would look present but be permanently dead.
+            for fn in (self._keepalive, self._punch, self._receive,
+                       self._fps_logger, self._recovery):
+                threading.Thread(target=fn, daemon=True).start()
         return ok
 
     def _keepalive(self):
@@ -1114,64 +1138,72 @@ class ZiotCamera:
             self._stop.wait(RECOVERY_DEAD_THRESHOLD)
             if self._stop.is_set():
                 break
+            try:
+                self._recovery_tick()
+            except Exception:
+                # This thread is the only thing that will ever bring the camera
+                # back; it must not die on an unexpected error.
+                log.exception("[%s] recovery tick failed", self.uid)
 
-            if self.relayed:
-                if not self.is_streaming:
-                    # Negotiated fine but no media is arriving. Don't sit on it
-                    # until the direct-retry timer comes round.
-                    log.warning("[%s] relay is silent — dropping it", self.uid)
-                    self._stop_relay()
-                    self._relay_last_direct_try = 0.0
-                    continue
-                self._try_return_direct()
-                continue
+    def _recovery_tick(self):
+        """One pass of the recovery loop. `return` here means "done for now"."""
+        if self.relayed:
+            if not self.is_streaming:
+                # Negotiated fine but no media is arriving. Don't sit on it
+                # until the direct-retry timer comes round.
+                log.warning("[%s] relay is silent — dropping it", self.uid)
+                self._stop_relay()
+                self._relay_last_direct_try = 0.0
+                return
+            self._try_return_direct()
+            return
 
+        if self.is_streaming:
+            # Stream is alive — reset backoff
+            self._backoff = RECOVERY_INITIAL_BACKOFF
+            self._consec_failures = 0
+            return
+
+        # Stream is dead
+        dead_for = time.monotonic() - self._last_rx if self._last_rx else float('inf')
+
+        # Don't re-rendezvous too often
+        since_last = time.monotonic() - self._last_re_rendezvous
+        if since_last < self._backoff:
+            return
+
+        what = "relay" if self.force_relay else "re-rendezvous"
+        log.warning("[%s] stream dead %.0fs — %s (backoff %.0fs)",
+                    self.uid, dead_for, what, self._backoff)
+        self._last_re_rendezvous = time.monotonic()
+        self._re_rendezvous_count += 1
+
+        if self._open_transport():
+            # Reset frame tracker
+            self._frame_times.clear()
+            # After re-rendezvous, wait a bit before checking again
+            self._stop.wait(self._backoff)
             if self.is_streaming:
-                # Stream is alive — reset backoff
-                self._backoff = RECOVERY_INITIAL_BACKOFF
                 self._consec_failures = 0
-                continue
-
-            # Stream is dead
-            dead_for = time.monotonic() - self._last_rx if self._last_rx else float('inf')
-
-            # Don't re-rendezvous too often
-            since_last = time.monotonic() - self._last_re_rendezvous
-            if since_last < self._backoff:
-                continue
-
-            what = "relay" if self.force_relay else "re-rendezvous"
-            log.warning("[%s] stream dead %.0fs — %s (backoff %.0fs)",
-                        self.uid, dead_for, what, self._backoff)
-            self._last_re_rendezvous = time.monotonic()
-            self._re_rendezvous_count += 1
-
-            if self._open_transport():
-                # Reset frame tracker
-                self._frame_times.clear()
-                # After re-rendezvous, wait a bit before checking again
-                self._stop.wait(self._backoff)
-                if self.is_streaming:
-                    self._consec_failures = 0
-                else:
-                    self._consec_failures += 1
-                # Exponential backoff
-                self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
             else:
-                log.error("[%s] re-rendezvous failed", self.uid)
                 self._consec_failures += 1
-                self._stop.wait(self._backoff)
-                self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+            # Exponential backoff
+            self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+        else:
+            log.error("[%s] %s failed", self.uid, what)
+            self._consec_failures += 1
+            self._stop.wait(self._backoff)
+            self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
 
-            # The direct path is not coming back — try the vendor relay, which
-            # is what the app does when it cannot reach the camera itself.
-            if (self._consec_failures >= RELAY_AFTER_FAILURES
-                    and not self.relayed and not self.force_relay):
-                log.warning("[%s] %d direct attempts failed — trying the relay",
-                            self.uid, self._consec_failures)
-                self._relay_last_direct_try = time.monotonic()
-                if self._start_relay():
-                    self._frame_times.clear()
+        # The direct path is not coming back — try the vendor relay, which
+        # is what the app does when it cannot reach the camera itself.
+        if (self._consec_failures >= RELAY_AFTER_FAILURES
+                and not self.relayed and not self.force_relay):
+            log.warning("[%s] %d direct attempts failed — trying the relay",
+                        self.uid, self._consec_failures)
+            self._relay_last_direct_try = time.monotonic()
+            if self._start_relay():
+                self._frame_times.clear()
 
     @property
     def is_streaming(self) -> bool:
@@ -1536,18 +1568,36 @@ def main():
     cloud = CloudState(api, cfg["user_id"])
 
     def boot(cam_rec):
-        z = ZiotCamera(api, cam_rec, bind_ip,
-                       force_relay=args.force_relay,
-                       relay_user=cfg.get("relay_user"),
-                       relay_pass=cfg.get("relay_pass"))
-        started = z.start()
+        uid = cam_rec["uid"]
+        try:
+            z = ZiotCamera(api, cam_rec, bind_ip,
+                           force_relay=args.force_relay,
+                           relay_user=cfg.get("relay_user"),
+                           relay_pass=cfg.get("relay_pass"))
+        except Exception:
+            # Nothing to register or recover if we could not even build it.
+            log.exception("%s: could not be constructed — skipping", uid)
+            with lock:
+                cold.append(uid)
+            return
+
+        try:
+            started = z.start()
+        except Exception:
+            # start() is not supposed to raise, but if it ever does, the camera
+            # must still be registered: an unregistered camera is invisible on
+            # /health and, with no threads and no CloudState entry, would never
+            # be retried either.
+            log.exception("%s: start() raised — keeping it for recovery", uid)
+            started = False
+
         # Keep the camera either way: it retries in the background, and a
         # camera that is merely offline right now must still appear on /health
         # rather than vanishing from the bridge until someone restarts it.
         with lock:
-            live[cam_rec["uid"]] = z
+            live[uid] = z
             if not started:
-                cold.append(cam_rec["uid"])
+                cold.append(uid)
         cloud.register(z)
 
     cold: list[str] = []
