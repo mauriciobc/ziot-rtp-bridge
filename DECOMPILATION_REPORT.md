@@ -118,7 +118,17 @@ path. The relay flow is driven by `CameraNet.requestSendRelay`
 `CameraEventType.relay`, and then `CameraControllerMove.setupRelayVideo` (`:2074`) calls
 `relayPath()` and hands the URL to the player.
 
-**This is a working off-LAN fallback the bridge does not implement.**
+**Live verdict (2026-08-31): the relay did not serve media even for an online camera.**
+With `.73` cloud-online (`onlineState=1`, correct Bearer auth), `--force-relay` fired
+`notify(EVENT_RELAY)` and then opened `/live/<uid>` and `/rtp/<last8>`: both TCP
+connections were accepted but `OPTIONS` never got an answer (10 s timeout each) — no
+SDP, no interleaved RTP. Raw-socket probes against the same relay, with and without a
+relay notify, get an instant `OPTIONS 200` from `Server: ZLMediaKit` but an empty
+`DESCRIBE`. The relay behaves like a ZLMediaKit instance *waiting for the camera to
+publish* (the app's flow is camera → relay → viewer), and these cameras never publish
+because their media/session daemon is dead (see §7 verdict below). So the relay is not a
+usable fallback for these units: it cannot conjure media from a camera whose session
+never starts.
 
 ### 1.3 `libzlmediakit_jni.so` is not "arm64-only" — it is missing only from x86_64
 
@@ -369,13 +379,25 @@ Applied in `ziot_rtp_bridge.py` (v3). See the README for operator-facing detail.
 
 ### Still open
 
-* **Which relay URL form actually plays — still unknown.** A live `--force-relay` run on
-  2026-08-30 got `DESCRIBE -> 404` on *both* forms and failed over cleanly. That is not
-  evidence against §1.2: all three cameras were cloud-offline at the time
-  (`onlineState` 0), so no forwarding session could exist for the cloud to serve, and a
-  404 is what an absent stream should look like. **Retest with a camera online**, then
-  record the winning form here. If both 404 again while a camera is online and streaming,
-  §1.2 needs revisiting.
+* **(resolved 2026-08-31) Which relay URL form actually plays — neither did.** A live
+  `--force-relay` run against camera `.73` while it was cloud-online
+  (`onlineState=1`, `140979857781`) fired `notify(EVENT_RELAY)` and tried
+  `rtsp://156.246.16.114:554/live/140979857781` and `/rtp/79857781`: no media on either
+  form. The bridge reported this as "relay accepted but never answered", which was a
+  bad error message on our side, not what happened — `RelayStream` did not name the
+  stalled request, so an `OPTIONS`-then-`DESCRIBE` sequence that got through the first
+  step read as total silence. Re-tested 2026-08-31 with the message fixed: the relay
+  answers `OPTIONS 200` in ~0.2–0.4 s for every URL form (root, `/live/…`, `/rtp/…`,
+  with and without our User-Agent) and then **stalls on `DESCRIBE`**. That matches the
+  raw-socket checks exactly — instant `OPTIONS 200` (`Server: ZLMediaKit…`), empty
+  `DESCRIBE`, with or without a relay notify — so the two observations agree once the
+  reporting bug is removed. The relay looks like a ZLMediaKit publisher-wait: the app's relay flow
+  is camera → relay → viewer, and these cameras never publish because their
+  media/session daemon fails to start after boot (the 2026-08-30 boot-watch: a rebooted
+  camera re-registers once with the cloud, then never keepalives, never opens a media
+  socket, and ignores wake events — the session daemon never comes up). §1.2's "working
+  off-LAN fallback" therefore does not hold for these units — the relay cannot
+  manufacture media a camera never sends.
 * **Whether the relay needs credentials.** Nothing in the snapshot authenticates to it.
   The client handles Basic and Digest and fails loudly rather than guessing;
   `relay_user` / `relay_pass` config keys are ready if it turns out to need them.

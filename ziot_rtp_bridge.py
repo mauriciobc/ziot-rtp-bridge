@@ -451,7 +451,7 @@ class RelayStream:
             if time.monotonic() > deadline:
                 # recv() timing out is not an error on its own, so without this
                 # a server that goes mute would spin here forever.
-                raise ConnectionError("relay went quiet during header read")
+                raise ConnectionError("relay went quiet mid-header")
         head, _, rest = self._buf.partition(b"\r\n\r\n")
         self._buf = rest
         return head
@@ -507,7 +507,7 @@ class RelayStream:
             self._sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
 
         send()
-        status, hdrs, body = self._read_response()
+        status, hdrs, body = self._read_response(method)
 
         if status == 401 and not self._auth and "www-authenticate" in hdrs:
             if self._user is None:
@@ -519,21 +519,28 @@ class RelayStream:
             self._cseq += 1
             headers["CSeq"] = str(self._cseq)
             send()
-            status, hdrs, body = self._read_response()
+            status, hdrs, body = self._read_response(method)
         return status, hdrs, body
 
-    def _read_response(self) -> tuple:
-        """Read one RTSP response, skipping any interleaved media in front of it."""
+    def _read_response(self, method: str = "request") -> tuple:
+        """Read one RTSP response, skipping any interleaved media in front of it.
+
+        `method` is only used in error text, but naming the stalled request
+        matters: a relay that answers OPTIONS and then hangs on DESCRIBE is a
+        publisher-wait (nobody is sending it media), which is a completely
+        different diagnosis from one that never speaks at all.
+        """
         deadline = time.monotonic() + self._timeout
         while True:
             while not self._buf:
                 if self._stop.is_set() or not self._recv_some():
-                    raise ConnectionError("relay closed awaiting response")
+                    raise ConnectionError(f"relay closed while awaiting {method}")
                 if time.monotonic() > deadline:
                     # A relay that accepts the connection but never answers and
                     # never closes would otherwise spin here: recv() timing out
                     # is reported as idle, not as failure.
-                    raise ConnectionError("relay accepted but never answered")
+                    raise ConnectionError(
+                        f"relay did not answer {method} within {self._timeout:.0f}s")
             if self._buf[:1] == b"$":
                 self._consume_interleaved()
                 continue
@@ -625,11 +632,20 @@ class RelayStream:
             log.warning("[%s] relay OPTIONS -> %s", self.tag, status)
             return False
 
-        status, hdrs, body = self._request(
-            "DESCRIBE", headers={"Accept": "application/sdp"})
+        try:
+            status, hdrs, body = self._request(
+                "DESCRIBE", headers={"Accept": "application/sdp"})
+        except ConnectionError as e:
+            # OPTIONS succeeded to get here, so the relay is alive and talking.
+            # A stall on DESCRIBE is ZLMediaKit waiting for a publisher: the
+            # camera is not sending it media, and no client can conjure that.
+            log.warning("[%s] relay is up but has no stream to serve "
+                        "(OPTIONS answered, DESCRIBE did not: %s). The camera "
+                        "is not publishing to it.", self.tag, e)
+            return False
         if status != 200 or not body:
-            log.warning("[%s] relay DESCRIBE -> %s (%d bytes)",
-                        self.tag, status, len(body))
+            log.warning("[%s] relay DESCRIBE -> %s (%d bytes) — relay reachable "
+                        "but no media for this URL", self.tag, status, len(body))
             return False
 
         tracks = self._parse_sdp(body)
@@ -916,6 +932,13 @@ class ZiotCamera:
     def relayed(self) -> bool:
         return self._relay is not None
 
+    @property
+    def mode(self) -> str:
+        """"relay", "direct", or "down" — down meaning no transport is open."""
+        if self.relayed:
+            return "relay"
+        return "direct" if (self.sock and self.addr) else "down"
+
     def _mark_rx(self) -> None:
         self._last_rx = time.monotonic()
 
@@ -1000,18 +1023,37 @@ class ZiotCamera:
             self._consec_failures = RELAY_AFTER_FAILURES
             self._start_relay()
 
-    def start(self) -> bool:
+    def _open_transport(self) -> bool:
+        """One attempt at whichever transport this camera is configured for."""
         if self.force_relay:
-            log.info("[%s] --force-relay: skipping the direct path", self.uid)
-            if not self._start_relay():
-                return False
-        elif not self._rendezvous():
-            return False
+            return self._start_relay()
+        return self._rendezvous()
+
+    def start(self) -> bool:
+        """Bring the camera up and start its threads.
+
+        The threads start whether or not the first attempt succeeds: these
+        cameras spend a lot of time cloud-offline, and a bridge that gave up at
+        startup would stay down until someone noticed. `_recovery` retries on
+        the usual backoff, so a camera that is merely offline right now joins in
+        when it returns. The return value says whether the *first* attempt
+        worked, for logging — it is not a reason to discard the camera.
+        """
+        ok = self._open_transport()
+        if not ok:
+            if self.force_relay:
+                log.error("[%s] --force-relay: no relay URL answered. Serving "
+                          "anyway and retrying every %.0fs — the direct path "
+                          "will NOT be tried while --force-relay is set.",
+                          self.uid, RECOVERY_DEAD_THRESHOLD)
+            else:
+                log.warning("[%s] initial rendezvous failed — serving anyway "
+                            "and retrying in the background", self.uid)
 
         for fn in (self._keepalive, self._punch, self._receive, self._fps_logger,
                    self._recovery):
             threading.Thread(target=fn, daemon=True).start()
-        return True
+        return ok
 
     def _keepalive(self):
         while not self._stop.is_set():
@@ -1040,8 +1082,10 @@ class ZiotCamera:
     def _punch(self):
         tick = 0
         while not self._stop.is_set():
-            if self.relayed:
-                # The relay owns the media; punching would only churn the API.
+            if self.relayed or self.force_relay:
+                # The relay owns the media. Punching would churn the STUN API
+                # and log endpoint moves for a path we are not using — and
+                # under --force-relay we must not touch the direct path at all.
                 self._stop.wait(PUNCH_INTERVAL)
                 continue
             tick += 1
@@ -1096,12 +1140,13 @@ class ZiotCamera:
             if since_last < self._backoff:
                 continue
 
-            log.warning("[%s] stream dead %.0fs — re-rendezvous (backoff %.0fs)",
-                        self.uid, dead_for, self._backoff)
+            what = "relay" if self.force_relay else "re-rendezvous"
+            log.warning("[%s] stream dead %.0fs — %s (backoff %.0fs)",
+                        self.uid, dead_for, what, self._backoff)
             self._last_re_rendezvous = time.monotonic()
             self._re_rendezvous_count += 1
 
-            if self._rendezvous():
+            if self._open_transport():
                 # Reset frame tracker
                 self._frame_times.clear()
                 # After re-rendezvous, wait a bit before checking again
@@ -1120,7 +1165,8 @@ class ZiotCamera:
 
             # The direct path is not coming back — try the vendor relay, which
             # is what the app does when it cannot reach the camera itself.
-            if self._consec_failures >= RELAY_AFTER_FAILURES and not self.relayed:
+            if (self._consec_failures >= RELAY_AFTER_FAILURES
+                    and not self.relayed and not self.force_relay):
                 log.warning("[%s] %d direct attempts failed — trying the relay",
                             self.uid, self._consec_failures)
                 self._relay_last_direct_try = time.monotonic()
@@ -1195,7 +1241,7 @@ class ZiotCamera:
         now = time.monotonic()
         return {
             "uid": self.uid,
-            "mode": "relay" if self.relayed else "direct",
+            "mode": self.mode,
             "relay_url": self._relay_url,
             "endpoint_kind": self._endpoint_kind,
             "stun_seq": self._stun_seq,
@@ -1334,7 +1380,7 @@ def make_handler(cameras: dict):
                 "media_state": c.cloud.get("mediaState"),
                 "online": cloud_is_on(c.cloud),
                 "media_free": cloud_is_free(c.cloud),
-                "mode": "relay" if c.relayed else "direct",
+                "mode": c.mode,
                 "streaming": c.is_streaming,
                 "fps": round(c.fps, 1),
                 "stats": c.stats,
@@ -1494,20 +1540,31 @@ def main():
                        force_relay=args.force_relay,
                        relay_user=cfg.get("relay_user"),
                        relay_pass=cfg.get("relay_pass"))
-        if z.start():
-            with lock:
-                live[cam_rec["uid"]] = z
-            cloud.register(z)
+        started = z.start()
+        # Keep the camera either way: it retries in the background, and a
+        # camera that is merely offline right now must still appear on /health
+        # rather than vanishing from the bridge until someone restarts it.
+        with lock:
+            live[cam_rec["uid"]] = z
+            if not started:
+                cold.append(cam_rec["uid"])
+        cloud.register(z)
 
+    cold: list[str] = []
     threads = [threading.Thread(target=boot, args=(c,)) for c in cams]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    if not live:
-        log.error("no cameras started")
-        return
+    if cold:
+        log.warning("%d of %d camera(s) did not come up yet (%s) — the bridge "
+                    "is serving anyway and will keep retrying them",
+                    len(cold), len(cams), ", ".join(sorted(cold)))
+    if len(cold) == len(cams):
+        log.warning("no camera is streaming yet. These cameras register with "
+                    "the cloud but often never open a session; /health will "
+                    "show mode=down until one does.")
 
     cloud.start()
 
