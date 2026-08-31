@@ -17,7 +17,7 @@ import subprocess
 import sys
 import urllib.request
 
-BRIDGE_URL = "http://127.0.0.1:8085"
+BRIDGE_URL = "http://127.0.0.1:8085"   # matches the bridge's default port
 GO2RTC_URL = "http://127.0.0.1:1984"
 FRIGATE_CONTAINER = "frigate"
 MIN_FPS = 1.0  # minimum fps to consider a camera "healthy"
@@ -71,9 +71,17 @@ def main():
             fps = cam["fps"]
             moves = cam["endpoint_moves"]
             last_rx = cam.get("last_rx_ago_s")
+            # Fields added in bridge v3; tolerate an older bridge.
+            mode = cam.get("mode", "direct")
+            online = cam.get("online")
+            free = cam.get("media_free")
 
             if not streaming:
-                if last_rx and last_rx > 30:
+                if last_rx is None:
+                    # Never received a packet at all. `if last_rx and ...` used
+                    # to swallow this case, hiding the worst failure there is.
+                    issues.append(f"{uid}: no RTP since the bridge started")
+                elif last_rx > 30:
                     issues.append(f"{uid}: offline for {last_rx:.0f}s")
                 else:
                     # Brief blip, might recover
@@ -81,9 +89,18 @@ def main():
             elif fps < MIN_FPS:
                 issues.append(f"{uid}: low fps ({fps})")
 
+            if mode == "relay":
+                # Working, but on the vendor's forwarding server rather than
+                # directly — worth surfacing, not worth restarting anything.
+                issues.append(f"{uid}: streaming via relay, not direct")
+
             status = "OK" if streaming and fps >= MIN_FPS else "DEGRADED"
+            state = f"online={online}, free={free}" if online is not None else \
+                    f"online={cam.get('online_state')}, media={cam.get('media_state')}"
+            seen = "never" if last_rx is None else f"{last_rx}s ago"
             print(f"  [{status}] {uid}: {fps} fps, streaming={streaming}, "
-                  f"moves={moves}, last_rx={last_rx}s")
+                  f"mode={mode}, {state}, "
+                  f"moves={moves}, last_rx={seen}")
 
     # 2. Check go2rtc
     go2rtc = check_go2rtc()
