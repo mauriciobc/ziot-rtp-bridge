@@ -162,10 +162,17 @@ def rtp_payload(pkt: bytes) -> bytes | None:
     if len(pkt) < off:
         return None
     payload = pkt[off:]
-    if pkt[0] & 0x20 and payload:           # P: trailing padding
+    if pkt[0] & 0x20:                       # P: trailing padding
+        # RFC 3550: the last octet counts the padding octets, itself included,
+        # so 0 is invalid and so is anything longer than the payload. Such a
+        # packet is malformed; keeping it would decode padding as media, which
+        # is exactly what this function exists to prevent.
+        if not payload:
+            return None
         pad = payload[-1]
-        if 0 < pad <= len(payload):
-            payload = payload[:-pad]
+        if pad == 0 or pad > len(payload):
+            return None
+        payload = payload[:-pad]
     return payload
 
 
