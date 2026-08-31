@@ -315,6 +315,15 @@ camera's subnet (`ping` its LAN IP) and that `--bind-ip` is an address on that
 subnet. The bridge re-resolves a starved camera's endpoint automatically every
 2 s — watch for `endpoint moved …` lines, which are expected and healthy.
 
+**Everything says `mode: down` and nothing streams.**
+The bridge stays up and retries rather than exiting, so this is a report, not a
+crash. If the cameras hold DHCP leases, answer ARP, and the device list shows a
+fresh `IpcPrivatePort` and a current `commTime`, then they are reaching the
+cloud and the network is fine — the camera registered but never started its
+session daemon, so it answers no hello and publishes nothing to the relay.
+That is a device-side failure; nothing in this bridge can open a session the
+camera never offers. See `DECOMPILATION_REPORT.md` §5 and §7.
+
 **A camera streams but `online` is `false` (or `media_free` is `true`).**
 The bridge streams while it receives RTP regardless of these flags. They are
 the cloud's opinion — we've observed cameras actively streaming while the
@@ -388,7 +397,20 @@ over RTSP — `rtsp://<relay_ip>/live/<uid>` or `rtsp://<relay_ip>/rtp/<last 8 o
 uid>`, whichever answers — with RTP interleaved on the RTSP TCP connection. It
 retries the direct path every two minutes and returns to it as soon as that
 works. `--force-relay` takes this path immediately, for testing. `/health`
-reports `mode` and `relay_url`.
+reports `mode` — `direct`, `relay`, or `down` when no transport is open — and
+`relay_url`.
+
+In practice the relay has never served media for these cameras: it answers
+`OPTIONS` promptly and then stalls on `DESCRIBE`, which is a ZLMediaKit
+publisher-wait. The relay flow is camera → relay → viewer, and these units
+never publish. Treat the fallback as untested rather than working.
+
+**The bridge does not exit when cameras are down.** A camera that fails its
+first rendezvous is kept and retried in the background, and the HTTP server
+comes up even if nothing is streaming, so `/health` stays readable and the
+watchdog can tell "bridge dead" from "cameras dead". These cameras spend a lot
+of time cloud-offline; a bridge that gave up at startup would stay down until
+someone noticed.
 
 Cloud device-list state (`onlineState`, `mediaState`, `relay_ip`, `commTime`)
 is refreshed every 30 s by a single account-wide poller — the device-list
