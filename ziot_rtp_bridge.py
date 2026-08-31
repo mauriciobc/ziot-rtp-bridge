@@ -143,6 +143,39 @@ def ulaw_to_pcm16(payload: bytes) -> bytes:
     return bytes(out)
 
 
+def rtp_payload(pkt: bytes) -> bytes | None:
+    """Return an RTP packet's payload, or None if the packet is malformed.
+
+    The header is only 12 bytes when there are no CSRCs and no extension, which
+    is true of what these cameras send but is not guaranteed of anything else —
+    a relay may well add either. Slicing a fixed [12:] then feeds header bytes
+    to the decoder as media. Padding is stripped too, since µ-law padding would
+    otherwise be played as samples.
+    """
+    if len(pkt) < 12:
+        return None
+    off = 12 + 4 * (pkt[0] & 0x0f)          # CC: CSRC identifiers
+    if pkt[0] & 0x10:                       # X: one header extension
+        if len(pkt) < off + 4:
+            return None
+        off += 4 + 4 * struct.unpack("!H", pkt[off + 2:off + 4])[0]
+    if len(pkt) < off:
+        return None
+    payload = pkt[off:]
+    if pkt[0] & 0x20:                       # P: trailing padding
+        # RFC 3550: the last octet counts the padding octets, itself included,
+        # so 0 is invalid and so is anything longer than the payload. Such a
+        # packet is malformed; keeping it would decode padding as media, which
+        # is exactly what this function exists to prevent.
+        if not payload:
+            return None
+        pad = payload[-1]
+        if pad == 0 or pad > len(payload):
+            return None
+        payload = payload[:-pad]
+    return payload
+
+
 AUDIO_RATE = 8000
 
 
@@ -367,9 +400,11 @@ class RtpJpegReassembler:
         self._meta.clear()
 
     def feed(self, pkt: bytes) -> None:
+        p = rtp_payload(pkt)
+        if p is None or len(p) < 8:
+            return
         marker = pkt[1] >> 7
         ts = struct.unpack(">I", pkt[4:8])[0]
-        p = pkt[12:]
         frag_off = struct.unpack(">I", b"\x00" + p[1:4])[0]
         jtype, q = p[4], p[5]
         width, height = p[6] * 8, p[7] * 8
@@ -573,42 +608,77 @@ class RelayStream:
         if kind == "video":
             self._asm.feed(packet)
         else:
-            self._on_audio(ulaw_to_pcm16(packet[12:]))
+            payload = rtp_payload(packet)
+            if payload:
+                self._on_audio(ulaw_to_pcm16(payload))
 
     # ---- SDP ----------------------------------------------------------------
 
-    def _parse_sdp(self, body: bytes) -> list:
-        """Return [(kind, payload_type, control_url)] for the media we can use.
+    # What we can actually decode: static payload type, and the a=rtpmap
+    # encoding name for relays that assign a dynamic type instead.
+    _DECODABLE = {"video": (26, "JPEG"), "audio": (0, "PCMU")}
 
-        Payload types are read, not assumed: the relay is free to renumber.
+    def _parse_sdp(self, body: bytes) -> list:
+        """Return [(kind, payload_type, control_url)] for each media section.
+
+        An `m=` line may offer several formats — `m=audio 0 RTP/AVP 8 0` offers
+        PCMA *and* PCMU — so every format is considered and the one we can
+        decode is chosen, rather than taking the first and giving up. A payload
+        type is None when the section offers nothing we handle; the caller skips
+        those. Malformed sections are dropped with a warning instead of raising.
         """
-        tracks = []
-        kind = pt = None
-        control = None
+        sections, cur = [], None
         for raw in body.decode("utf8", "replace").splitlines():
             line = raw.strip()
             if line.startswith("m="):
-                if kind:
-                    tracks.append((kind, pt, control))
+                if cur:
+                    sections.append(cur)
+                cur = None
                 parts = line[2:].split()
-                kind, pt, control = None, None, None
-                media = parts[0]
-                fmts = parts[3:]
-                try:
-                    pt = int(fmts[0])
-                except (IndexError, ValueError):
-                    pt = None
-                if media == "video":
-                    kind = "video"
-                elif media == "audio":
-                    kind = "audio"
-                else:
-                    kind = "other"
-            elif line.startswith("a=control:") and kind:
-                control = line[len("a=control:"):].strip()
-        if kind:
-            tracks.append((kind, pt, control))
-        return [t for t in tracks if t[0] in ("video", "audio")]
+                if len(parts) < 4:
+                    log.warning("[%s] relay SDP: ignoring malformed media line "
+                                "%r", self.tag, line)
+                    continue
+                fmts = []
+                for f in parts[3:]:
+                    try:
+                        fmts.append(int(f))
+                    except ValueError:
+                        pass        # a non-numeric format we cannot use anyway
+                cur = {"kind": parts[0], "fmts": fmts, "rtpmap": {},
+                       "control": None}
+            elif cur is None:
+                continue
+            elif line.startswith("a=control:"):
+                cur["control"] = line[len("a=control:"):].strip()
+            elif line.startswith("a=rtpmap:"):
+                # a=rtpmap:<pt> <encoding>/<clock>[/<channels>]
+                rest = line[len("a=rtpmap:"):].split(None, 1)
+                if len(rest) == 2:
+                    try:
+                        cur["rtpmap"][int(rest[0])] = \
+                            rest[1].split("/")[0].strip().upper()
+                    except ValueError:
+                        pass
+        if cur:
+            sections.append(cur)
+
+        out = []
+        for sec in sections:
+            if sec["kind"] not in self._DECODABLE:
+                continue
+            out.append((sec["kind"], self._choose_pt(sec), sec["control"]))
+        return out
+
+    def _choose_pt(self, sec: dict):
+        """Pick a decodable payload type from one media section, or None."""
+        static_pt, encoding = self._DECODABLE[sec["kind"]]
+        if static_pt in sec["fmts"]:
+            return static_pt
+        for pt in sec["fmts"]:
+            if sec["rtpmap"].get(pt) == encoding:
+                return pt
+        return None
 
     def _track_url(self, control: str) -> str:
         if not control or control == "*":
@@ -655,12 +725,9 @@ class RelayStream:
 
         channel = 0
         for kind, pt, control in tracks:
-            if kind == "video" and pt is not None and pt != 26:
-                log.warning("[%s] relay video payload type %d is not JPEG/RFC2435 "
-                            "— frames will not decode", self.tag, pt)
-            if kind == "audio" and pt is not None and pt != 0:
-                log.warning("[%s] relay audio payload type %d is not PCMU "
-                            "— skipping this track", self.tag, pt)
+            if pt is None:
+                log.warning("[%s] relay offers no decodable %s format — "
+                            "skipping that track", self.tag, kind)
                 continue
             transport = (f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1}")
             status, hdrs, _ = self._request(
@@ -1249,8 +1316,10 @@ class ZiotCamera:
             if pt == 26:
                 asm.feed(data)
             elif pt == 0:
-                self.stats["audio_pkts"] += 1
-                self.audio.publish(ulaw_to_pcm16(data[12:]))
+                payload = rtp_payload(data)
+                if payload:
+                    self.stats["audio_pkts"] += 1
+                    self.audio.publish(ulaw_to_pcm16(payload))
 
     def _fps_logger(self):
         while not self._stop.is_set():
