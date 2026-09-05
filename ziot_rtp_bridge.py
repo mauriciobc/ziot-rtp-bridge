@@ -907,7 +907,7 @@ class ZiotCamera:
         self.sock = None
         self._sock_lock = threading.Lock()  # guards socket swap
         self.stats = {"frames": 0, "audio_pkts": 0, "rx_errors": 0,
-                      "foreign_ssrc": 0}
+                      "foreign_ssrc": 0, "rx_datagrams": 0}
         self._last_rx = 0.0
         # Media identity. None means this UID carries no usable SSRC, so the
         # direct path can only check which socket a datagram arrived on.
@@ -1480,6 +1480,11 @@ class ZiotCamera:
                 # Socket was closed (re-rendezvous in progress)
                 self._stop.wait(0.5)
                 continue
+            # Counted before any filtering, so "nothing is on the wire" and
+            # "packets arrive but we reject them" cannot look alike on /health.
+            # Everything below this line can drop a packet for a good reason;
+            # this is the only number that says one showed up at all.
+            self.stats["rx_datagrams"] += 1
             try:
                 self._handle_direct_packet(sock, source, data, asm)
             except Exception:
@@ -1502,8 +1507,14 @@ class ZiotCamera:
                 log.info("[%s] %.1f fps, %d frames total, %d endpoint moves, %d re-rendezvous",
                          self.uid, fps, self.stats["frames"], moves, rr)
             else:
-                log.warning("[%s] NO STREAM — last rx %.0fs ago, %d moves, %d re-rendezvous",
-                            self.uid, time.monotonic() - self._last_rx if self._last_rx else 0,
+                # "0s ago" for a camera that has never sent anything reads as
+                # "a packet just landed", which is the opposite of the truth
+                # and the worst case to misreport. Say so instead.
+                last_rx = (f"{time.monotonic() - self._last_rx:.0f}s ago"
+                           if self._last_rx else "never")
+                log.warning("[%s] NO STREAM — last rx %s, %d datagrams in, "
+                            "%d moves, %d re-rendezvous",
+                            self.uid, last_rx, self.stats["rx_datagrams"],
                             moves, rr)
 
     def health(self) -> dict:
@@ -1526,6 +1537,7 @@ class ZiotCamera:
             "fps": round(self.fps, 1),
             "frames_total": self.stats["frames"],
             "audio_pkts": self.stats["audio_pkts"],
+            "rx_datagrams": self.stats["rx_datagrams"],
             "rx_errors": self.stats["rx_errors"],
             "foreign_ssrc": self.stats["foreign_ssrc"],
             "media_source": (f"{self._media_source[0]}:{self._media_source[1]}"

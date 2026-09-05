@@ -245,10 +245,72 @@ class DirectPacketTests(unittest.TestCase):
                     self.assertGreater(cam._last_rx, 0.0)
                     self.assertEqual(cam.stats["audio_pkts"], 2)
                     self.assertEqual(cam.stats["rx_errors"], 1)
+                    self.assertEqual(cam.stats["rx_datagrams"], 2)
                 finally:
                     cam._stop.set()
                     worker.join(timeout=5)
         self.assertFalse(worker.is_alive())
+
+
+class RxDatagramTests(unittest.TestCase):
+    """Counted before any filter runs, so an empty /health can distinguish
+    "the camera is silent" from "packets arrive and we drop them all"."""
+
+    def receive(self, packets):
+        rx = bind_loopback()
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.bind(("127.0.0.1", 0))
+        self.addCleanup(rx.close)
+        self.addCleanup(tx.close)
+        cam = make_camera()
+        cam.sock = rx
+        cam.addr = ("127.0.0.1", tx.getsockname()[1])
+        worker = threading.Thread(target=cam._receive, daemon=True)
+        worker.start()
+        try:
+            for pkt in packets:
+                tx.sendto(pkt, ("127.0.0.1", rx.getsockname()[1]))
+            deadline = time.monotonic() + 5
+            while (cam.stats["rx_datagrams"] < len(packets)
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+        finally:
+            cam._stop.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        return cam
+
+    def test_rejected_traffic_still_shows_up_as_arrivals(self):
+        cam = self.receive([
+            rtp_packet(0, b"\x11" * 160, ts=1, ssrc=CAM_SSRC + 1),  # foreign
+            rtp_packet(0, b"\x22" * 160, ts=2, ssrc=CAM_SSRC + 1),  # foreign
+            b"runt",                                                # under 12B
+            rtp_packet(8, b"\x33" * 160, ts=3),                     # unknown pt
+        ])
+        self.assertEqual(cam.stats["rx_datagrams"], 4)
+        self.assertEqual(cam.stats["foreign_ssrc"], 2)
+        self.assertEqual(cam.stats["audio_pkts"], 0)
+        self.assertEqual(cam.stats["frames"], 0)
+        self.assertEqual(cam._last_rx, 0.0)
+
+    def test_accepted_traffic_counts_once_each(self):
+        cam = self.receive([rtp_packet(0, b"\x44" * 160, ts=i)
+                            for i in range(3)])
+        self.assertEqual(cam.stats["rx_datagrams"], 3)
+        self.assertEqual(cam.stats["audio_pkts"], 3)
+        self.assertEqual(cam.stats["foreign_ssrc"], 0)
+
+    def test_a_silent_camera_reads_differently_from_a_rejected_one(self):
+        silent = self.receive([])
+        self.assertEqual(silent.stats["rx_datagrams"], 0)
+        rejected = self.receive([rtp_packet(0, b"\x55" * 160, ts=9,
+                                            ssrc=CAM_SSRC + 1)])
+        self.assertEqual(rejected.stats["rx_datagrams"], 1)
+        # Both look identical on every other counter; this is the one that
+        # tells them apart.
+        for cam in (silent, rejected):
+            self.assertEqual(cam.stats["frames"], 0)
+            self.assertEqual(cam.stats["audio_pkts"], 0)
 
 
 class RelayConsumeTests(unittest.TestCase):

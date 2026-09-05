@@ -225,6 +225,7 @@ should come back up rather than sit dead.
       "fps": 6.5,
       "frames_total": 1234,
       "audio_pkts": 5678,
+      "rx_datagrams": 9012,
       "rx_errors": 0,
       "foreign_ssrc": 0,
       "media_source": "192.168.1.73:49201",
@@ -249,6 +250,15 @@ go. `media_source` is where media actually arrives from. They normally match;
 a lasting disagreement means the broker's answer is stale and the direct path
 is one-way. `foreign_ssrc` counts datagrams dropped for carrying another
 camera's SSRC, `rx_errors` counts packets whose handling raised.
+
+`rx_datagrams` counts every datagram that arrived on the direct socket, before
+any filtering. It is the one number that separates *"the camera is silent"*
+from *"packets arrive and we reject them all"* — two states that look identical
+on every other counter. `rx_datagrams: 0` means nothing reached us and the
+problem is upstream (camera asleep, not publishing, no L2 route). A climbing
+`rx_datagrams` with `frames_total` stuck at 0 means the media is arriving and
+being dropped — check `foreign_ssrc` next, and the `dropping RTP with ssrc …`
+log line names what it saw against what it expected.
 
 `status` is `"ok"` when at least one camera is streaming, `"degraded"` otherwise.
 Use `/health` for Docker HEALTHCHECK or external monitoring.
