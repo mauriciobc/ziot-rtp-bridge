@@ -82,10 +82,12 @@ Create `ziot_config.json` next to the script:
 | `token` | yes* | Account JWT, sent as `Authorization: Bearer …`. Required on TXW817 even with `--offline`. Omit only if `ziot_offline_probe.py` reports a HIT (punch-only cameras) |
 | `user_id` | no | Numeric account id. Taken from the JWT `user_id` claim when omitted. Needed for the device-list roster and `--list-cameras` |
 | `port` | no | HTTP listen port, default `8085` |
+| `http_host` | no | Interface the HTTP server binds. Default `0.0.0.0` — set it to the LAN IP (e.g. `192.168.18.6`) to keep the streams off other interfaces |
+| `http_token` | no | When set, every route except `/health` requires `Authorization: Bearer <token>` or `?token=<token>` (the query form exists for `<img>`/`<audio>` tags, which cannot set headers). `/health` stays open on purpose: the watchdog polls it unauthenticated |
 | `cameras` | no | Allow-list of UIDs. `[]` or omitted = every camera on the account (or every key in `offline_endpoints` when `--offline`) |
 | `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state. Ignored under `--offline` |
 | `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
-| `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Unset by default — the relay is not known to authenticate, and the bridge fails loudly rather than guessing |
+| `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Basic and Digest are both handled; a cached digest challenge is re-derived per request (method and URI are hashed into the response, so it cannot be replayed across requests) |
 | `offline` / `offline_endpoints` | no | Roster from LAN targets instead of `GET /v1/ipc`: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75"}}`. With a token, IP only is enough — the listen port rotates and comes from STUN. Punch-only (no token), IP only makes the bridge hello-sweep the ephemeral range from its own socket; `ip:port` from a probe HIT skips the sweep. A token in the same file still does notify/keepalive. See "Running without the device list" |
 
 ```bash
@@ -292,6 +294,8 @@ should come back up rather than sit dead.
 ```json
 {
   "status": "ok",
+  "version": "4",
+  "uptime_s": 3600,
   "boot": { "phase": "ready" },
   "cameras": [
     {
@@ -352,7 +356,10 @@ being dropped — check `foreign_ssrc` next, and the `dropping RTP with ssrc …
 log line names what it saw against what it expected.
 
 `status` is `"ok"` when at least one camera is streaming, `"degraded"` otherwise.
-Use `/health` for Docker HEALTHCHECK or external monitoring.
+Use `/health` for Docker HEALTHCHECK or external monitoring (the image ships a
+HEALTHCHECK wired to it). `/health` is always unauthenticated — even with
+`http_token` set — because a 401 there is indistinguishable from a dead bridge
+to every reader; it exposes counters and cloud flags, not media.
 
 ---
 
@@ -745,6 +752,22 @@ reliability improvements were added during deployment:
   tracebacking. A failed attempt after a wake keeps its backoff: the wake
   sets `_backoff` to 0 for its one-shot bypass, and doubling from 0 had
   pinned recovery at zero interval.
+* **Bound before bring-up** — the HTTP server binds and serves before the
+  device list is fetched and before any camera rendezvous, so `/health`
+  answers (with the boot phase) from the first second of the process,
+  including during a punch-only port sweep.
+* **Hardened edges** — `http_host`/`http_token` optional config (media
+  routes authenticated, `/health` deliberately open); a stalled MJPEG
+  viewer gets a 30 s write timeout instead of pinning its handler thread
+  forever, and handler threads are daemonized; `notify(keepAlive)` and
+  `send-stun-addr` carry short timeouts (3 s / 5 s) so a slow cloud call
+  cannot straddle the 12 s session death or triple-stall a rendezvous;
+  relay digest auth is re-derived per request instead of replaying
+  DESCRIBE's header on SETUP and PLAY; a relay `close()` racing its pump
+  thread exits cleanly; the watchdog skips malformed camera rows; the
+  shipped `go2rtc.yaml` webrtc candidate is a host:port pair (the old
+  `stun:8555` parsed as host "stun"); Docker gains a `/health`
+  HEALTHCHECK.
 * **Wake on 0→1** — full rendezvous the moment `onlineState` flips, rather
   than sitting in a 60 s backoff through a battery camera's awake window.
 * **Probe requires RTP v2 PT 0/26** — an echo of `App send hello` is not a

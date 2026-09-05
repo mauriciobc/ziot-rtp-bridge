@@ -136,5 +136,19 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(probe.describe(b"runt"), "4B non-RTP")
 
 
+class ParsePortsErrorTests(unittest.TestCase):
+    def test_a_bad_port_spec_is_an_argparse_error(self):
+        """1024-abc used to raise a raw ValueError traceback."""
+        err = io.StringIO()
+        with mock.patch.object(
+                    sys, "argv", ["probe", "127.0.0.1", "--ports", "1024-abc"]), \
+                contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as cm:
+            probe.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("bad --ports", err.getvalue())
+        self.assertIn("32768-61000", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

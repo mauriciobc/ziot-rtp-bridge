@@ -137,10 +137,16 @@ def main():
             print(f"  [BOOT] {phase}: {detail}")
 
         for cam in bridge.get("cameras", []):
-            uid = cam["uid"]
-            streaming = cam["streaming"]
-            fps = cam["fps"]
-            moves = cam["endpoint_moves"]
+            # Tolerate an older or partial camera row: a malformed entry is
+            # skipped, not a KeyError in the middle of the report.
+            if not isinstance(cam, dict):
+                continue
+            uid = cam.get("uid")
+            if not uid:
+                continue
+            streaming = cam.get("streaming", False)
+            fps = cam.get("fps", 0.0)
+            moves = cam.get("endpoint_moves", 0)
             last_rx = cam.get("last_rx_ago_s")
             # Fields added in bridge v3; tolerate an older bridge.
             mode = cam.get("mode", "direct")

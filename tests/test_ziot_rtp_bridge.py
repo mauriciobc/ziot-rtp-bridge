@@ -1,5 +1,6 @@
 """Behavior regressions for direct/relay RTP acceptance and startup validation."""
 import http.client
+import inspect
 import json
 import queue
 import socket
@@ -630,7 +631,9 @@ class PunchIntervalTests(unittest.TestCase):
                       float("nan"), float("inf"), None, [], {}):
             with self.subTest(value=value):
                 bridge.PUNCH_INTERVAL = 1.0
-                self.run_main({"token": "t", "user_id": 1,
+                # port 0: ephemeral. main() binds the HTTP socket before
+                # bring-up now, and 8085 may be taken on the test host.
+                self.run_main({"token": "t", "user_id": 1, "port": 0,
                                "punch_interval": value})
                 with mock.patch.object(bridge, "GPS555") as gps:
                     gps.return_value.list_cameras.return_value = []
@@ -643,7 +646,8 @@ class PunchIntervalTests(unittest.TestCase):
                     logs.output)
 
     def test_valid_interval_passes_validation(self):
-        self.run_main({"token": "t", "user_id": 1, "punch_interval": 1.999})
+        self.run_main({"token": "t", "user_id": 1, "port": 0,
+                       "punch_interval": 1.999})
         with mock.patch.object(bridge, "GPS555") as gps:
             gps.return_value.list_cameras.return_value = []
             bridge.main()
@@ -1006,9 +1010,12 @@ class BootResilienceTests(unittest.TestCase):
         self.addCleanup(Path(self.path).unlink, missing_ok=True)
         sys.argv = ["ziot_rtp_bridge.py", "--config", self.path]
 
-    def test_a_rejected_token_at_startup_exits_before_binding(self):
-        """Nothing is serving yet and no token un-expires itself, so this is
-        fatal in the same sense as an unreadable config file."""
+    def test_a_rejected_token_at_startup_exits_2(self):
+        """No retry can un-reject a token, so this is fatal in the same
+        sense as an unreadable config file: exit 2 right after the first
+        device-list call. The HTTP socket is bound before that call now
+        (/health must answer during bring-up), so binding happens even on
+        this path -- for the milliseconds before the exit."""
         with mock.patch.object(bridge, "GPS555") as gps, \
                 mock.patch.object(bridge, "ThreadingHTTPServer") as server:
             gps.return_value.list_cameras.side_effect = \
@@ -1018,7 +1025,7 @@ class BootResilienceTests(unittest.TestCase):
                     bridge.main()
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("rejected the token", "\n".join(logs.output))
-        server.assert_not_called()
+        server.assert_called_once()
 
     def test_a_cloud_outage_at_startup_serves_health_anyway(self):
         """Exiting instead is the same retry loop with every camera dark in
@@ -1737,6 +1744,285 @@ class PunchOnlyPortDiscoveryTests(unittest.TestCase):
             cam._stop.set()
             rx.join(timeout=5)
         self.addCleanup(cam.stop)
+
+
+class HttpTokenTests(unittest.TestCase):
+    """http_token guards the media routes; /health stays token-free on
+    purpose (the watchdog polls it unauthenticated from cron)."""
+
+    TOKEN = "sekrit"
+
+    def serve(self, token=None):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: make_camera()}, boot,
+                                threading.Lock(), token))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def get(self, port, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", path, headers=headers or {})
+        return conn.getresponse()
+
+    def test_media_routes_demand_the_token(self):
+        port = self.serve(self.TOKEN)
+        cases = (
+            (f"/cam/{CAM_UID}", None, 401),
+            (f"/cam/{CAM_UID}?token=wrong", None, 401),
+            (f"/cam/{CAM_UID}?token={self.TOKEN}", None, 200),
+            (f"/view/{CAM_UID}", None, 401),
+            (f"/view/{CAM_UID}", {"Authorization": "Bearer wrong"}, 401),
+            (f"/view/{CAM_UID}",
+             {"Authorization": f"Bearer {self.TOKEN}"}, 200),
+            (f"/audio/{CAM_UID}", None, 401),
+            ("/cameras", None, 401),
+            ("/health", None, 200),          # the watchdog's contract
+        )
+        for path, headers, expect in cases:
+            with self.subTest(path=path, headers=headers):
+                resp = self.get(port, path, headers)
+                if expect != 200:
+                    resp.read()       # error bodies are small and finite
+                # status is available without reading: streaming routes
+                # never end, and their first frame may not have arrived.
+                self.assertEqual(resp.status, expect)
+
+    def test_no_token_configured_means_no_auth(self):
+        port = self.serve(None)
+        for path in (f"/cam/{CAM_UID}", "/health"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(port, path).status, 200)
+
+    def test_handler_stream_timeout_is_set(self):
+        """The class attribute becomes the connection socket's timeout: a
+        client that stops reading must not pin its handler thread forever."""
+        Handler = bridge.make_handler({}, bridge.BootState(),
+                                      threading.Lock())
+        self.assertEqual(Handler.timeout, 30)
+
+    def test_a_stalled_write_ends_the_pump(self):
+        """The 30s connection timeout surfaces as TimeoutError on write;
+        _pump must treat that as a hangup, not crash the thread."""
+        Handler = bridge.make_handler({}, bridge.BootState(),
+                                      threading.Lock())
+        h = object.__new__(Handler)
+        h.wfile = mock.Mock()
+        h.wfile.flush = lambda: None
+        cam = make_camera()
+        writes = {"n": 0}
+
+        def write(item):
+            writes["n"] += 1
+            if writes["n"] == 2:
+                raise TimeoutError()
+
+        q = queue.Queue()
+        for i in range(4):
+            q.put(i)
+        h._pump(cam, q, "viewer", write)
+        self.assertEqual(writes["n"], 2)     # stopped at the stall, cleanly
+
+
+class BindBeforeBootTests(unittest.TestCase):
+    """/health must answer during bring-up -- BootState exists for exactly
+    that, and the watchdog's boot-phase logic depends on it. The socket
+    therefore binds (and serves) before the device list is fetched."""
+
+    def test_the_socket_binds_before_the_device_list_is_fetched(self):
+        order = []
+
+        def recording_server(*a, **k):
+            order.append("bind")
+            m = mock.MagicMock()
+            return m
+
+        path = None
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "ThreadingHTTPServer",
+                               side_effect=recording_server), \
+                mock.patch.object(bridge, "GPS555") as gps:
+            gps.return_value.list_cameras.side_effect = \
+                lambda *a, **k: order.append("list") or []
+            bridge.main()
+        self.assertEqual(order[:2], ["bind", "list"])
+
+
+class NotifyTimeoutTests(unittest.TestCase):
+    """notify() rides the keepalive cadence: one 10s cloud stall inside the
+    2s cadence is session death (~12s). It needs a timeout well under that;
+    so does send_stun_addr, which the rendezvous retries 3x."""
+
+    def test_notify_and_stun_addr_carry_short_timeouts(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(api, "_get", return_value={"data": {}}) as g:
+            api.notify("u", bridge.EVENT_KEEPALIVE)
+            api.send_stun_addr("u", "1.2.3.4", 5)
+        notify_timeout = g.call_args_list[0].kwargs["timeout"]
+        stun_timeout = g.call_args_list[1].kwargs["timeout"]
+        self.assertEqual(notify_timeout, bridge.NOTIFY_TIMEOUT)
+        self.assertEqual(stun_timeout, bridge.STUN_ADDR_TIMEOUT)
+
+    def test_the_device_list_keeps_the_leisurely_default(self):
+        # list_cameras passes no timeout: it rides _get's default.
+        default = inspect.signature(bridge.GPS555._get).\
+            parameters["timeout"].default
+        self.assertEqual(default, bridge.CLOUD_TIMEOUT)
+
+
+class DigestRelayTests(unittest.TestCase):
+    """Digest auth binds the response to method+URI. The old code cached the
+    Authorization header and replayed DESCRIBE's on SETUP and PLAY, so any
+    digest-authenticating relay passed DESCRIBE and then failed SETUP
+    forever."""
+
+    def test_digest_authorization_is_recomputed_per_request(self):
+        seen = []
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        sdp = (b"v=0\r\n"
+               b"m=video 0 RTP/AVP 26\r\n"
+               b"a=control:track1\r\n"
+               b"m=audio 0 RTP/AVP 0\r\n"
+               b"a=control:track2\r\n")
+
+        def serve():
+            conn, _ = server.accept()
+            f = conn.makefile("rb")
+
+            def read_req():
+                head = b""
+                while not head.endswith(b"\r\n\r\n"):
+                    line = f.readline()
+                    if not line:
+                        return None
+                    head += line
+                length = 0
+                for ln in head.split(b"\r\n"):
+                    if ln.lower().startswith(b"content-length:"):
+                        length = int(ln.split(b":")[1])
+                return head, f.read(length)
+
+            def reply(code, headers=b"", body=b""):
+                conn.sendall(
+                    f"RTSP/1.0 {code}\r\nCSeq: 1\r\n".encode()
+                    + headers + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body)
+
+            try:
+                while True:
+                    req = read_req()
+                    if req is None:
+                        return
+                    head, _ = req
+                    method, uri, _, _ = head.split(b" ", 3)
+                    method = method.decode()
+                    uri = uri.decode()
+                    auth = ""
+                    for ln in head.split(b"\r\n"):
+                        if ln.lower().startswith(b"authorization:"):
+                            auth = ln.split(b":", 1)[1].strip().decode()
+                    seen.append((method, uri, auth))
+                    if not auth:
+                        reply(401, b'WWW-Authenticate: Digest realm="r", '
+                                   b'nonce="abc"\r\n')
+                    elif method == "DESCRIBE":
+                        reply(200, b"Content-Type: application/sdp\r\n", sdp)
+                    elif method == "SETUP":
+                        reply(200, b"Session: 12345;timeout=60\r\n")
+                    else:
+                        reply(200)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        stream = bridge.RelayStream(
+            f"rtsp://127.0.0.1:{port}/live/x",
+            lambda jpeg: None, lambda pcm: None, lambda: None,
+            threading.Event(), CAM_UID, user="u", password="p")
+        self.addCleanup(stream.close)
+        self.assertTrue(stream.open())
+
+        describe = next(a for m, u, a in seen
+                        if m == "DESCRIBE" and a)
+        setup = next(a for m, u, a in seen if m == "SETUP")
+        play = next(a for m, u, a in seen if m == "PLAY")
+        # Each request carries the digest for its own method+URI...
+        base = f"rtsp://127.0.0.1:{port}/live/x"
+        self.assertIn(f'uri="{base}"', describe)
+        self.assertIn(f'uri="{base}/track1"', setup)
+        self.assertIn(f'uri="{base}"', play)
+        # ...which means no two are identical (the method is hashed in).
+        self.assertNotEqual(describe, setup)
+        self.assertNotEqual(setup, play)
+        self.assertTrue({c: k for c, k in stream._channels.items()} ==
+                        {0: "video", 2: "audio"})
+
+
+class RelayCloseRaceTests(unittest.TestCase):
+    """close() may null the socket while pump() is inside recv: that used to
+    raise AttributeError outside pump's caught exceptions and kill the pump
+    thread with an unhandled traceback."""
+
+    def test_close_during_pump_ends_cleanly(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        accepted = []
+
+        def serve():
+            try:
+                conn, _ = listener.accept()
+                accepted.append(conn)
+            except OSError:
+                pass
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        stream = bridge.RelayStream(
+            f"rtsp://127.0.0.1:{port}/live/x",
+            lambda jpeg: None, lambda pcm: None, lambda: None,
+            stop, CAM_UID)
+        stream._sock = socket.create_connection(("127.0.0.1", port),
+                                                timeout=2)
+        self.addCleanup(stream._sock.close)
+
+        errors = []
+        old_hook = threading.excepthook
+        threading.excepthook = lambda a: errors.append(a)
+        self.addCleanup(setattr, threading, "excepthook", old_hook)
+
+        pump = threading.Thread(target=stream.pump, daemon=True)
+        pump.start()
+        time.sleep(0.2)                 # pump is parked in recv
+        stream.close()                  # TEARDOWN ignored, socket closed
+        pump.join(timeout=5)
+        self.assertFalse(pump.is_alive())
+        self.assertEqual(errors, [],
+                         "pump died with an unhandled exception")
+        for conn in accepted:
+            conn.close()
 
 
 if __name__ == "__main__":

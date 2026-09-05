@@ -86,7 +86,11 @@ def main() -> int:
         print(f"cannot resolve {args.target}: {e}", file=sys.stderr)
         return 1
 
-    ports = parse_ports(args.ports)
+    try:
+        ports = parse_ports(args.ports)
+    except ValueError:
+        ap.error(f"bad --ports spec {args.ports!r} -- "
+                 "use N, N-M, comma-separated, e.g. 32768-61000")
     if not ports:
         print("no ports to scan", file=sys.stderr)
         return 1

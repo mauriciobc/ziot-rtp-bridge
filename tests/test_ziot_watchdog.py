@@ -213,5 +213,32 @@ class RestartPolicyTests(unittest.TestCase):
         restart.assert_not_called()
 
 
+class MalformedCameraRowTests(unittest.TestCase):
+    def run_main(self, bridge, go2rtc):
+        out = io.StringIO()
+        with mock.patch.object(watchdog, "check_bridge", return_value=bridge), \
+                mock.patch.object(watchdog, "check_go2rtc",
+                                  return_value=go2rtc), \
+                mock.patch.object(watchdog, "restart_frigate",
+                                  return_value=True) as restart, \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                watchdog.main()
+        return cm.exception.code, out.getvalue(), restart
+
+    def test_a_malformed_camera_row_is_skipped_not_a_keyerror(self):
+        """Tolerating an older bridge must include skipping rows that are
+        not usable, not dying mid-report on cam["uid"]. No usable row and
+        no go2rtc stream means no issues, so this exits 0 -- the old code
+        raised KeyError instead of returning at all."""
+        bridge = {
+            "status": "degraded", "boot": {"phase": "ready"},
+            "cameras": [{"uid": None}, {}, "garbage"],
+        }
+        code, out, restart = self.run_main(bridge, {})
+        self.assertEqual(code, 0)
+        restart.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

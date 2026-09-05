@@ -44,6 +44,11 @@ APP_ID = "b1ee47e92dfa22635907aa6bb882b1dc0ebc0285"
 PUNCH = b"App send hello"
 HEART = b"App send heart for stun"   # the app also sends this to keep NAT alive
 
+# /health reports this so a watchdog log line can say which bridge generation
+# produced it. Field generation, not marketing: v3 added mode/online/media_free.
+BRIDGE_VERSION = "4"
+_STARTED_MONOTONIC = time.monotonic()
+
 # CameraEventType, recovered whole from the app's Dart snapshot. The wire value
 # equals the enum index. We use start/keepAlive/stop; relay asks the cloud to
 # open a forwarding session (see RelayStream).
@@ -107,6 +112,14 @@ STUN_SUBNET_MASK = "255.255.255.0"   # the app's isSameSubnet() mask
 LAN_SWEEP_LO = 32768
 LAN_SWEEP_HI = 61000
 LAN_SWEEP_RATE = 2000.0              # hellos per second during a LAN resweep
+# Cloud HTTP timeouts. The device list can take its time -- a slow answer is
+# fine there. notify() cannot: the session dies ~12s without a keepalive
+# every 2s, so one 10s stall next to the 10s urlopen default is session
+# death. send_stun_addr runs up to 3x per rendezvous; 3 slow calls must not
+# stall boot for half a minute.
+CLOUD_TIMEOUT = 10.0
+NOTIFY_TIMEOUT = 3.0
+STUN_ADDR_TIMEOUT = 5.0
 
 log = logging.getLogger("ziot")
 
@@ -457,12 +470,12 @@ class GPS555:
             "User-Agent": "Dart/3.10 (dart:io)",
         }
 
-    def _get(self, path: str, **params) -> dict:
+    def _get(self, path: str, timeout: float = CLOUD_TIMEOUT, **params) -> dict:
         url = BASE_URL + path
         if params:
             url += "?" + urllib.parse.urlencode({k: str(v) for k, v in params.items()})
         req = urllib.request.Request(url, headers=self._h)
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
 
     @staticmethod
@@ -477,7 +490,9 @@ class GPS555:
         return self._data(self._get("/v1/ipc", terminalFamilyId=user_id))["list"]
 
     def send_stun_addr(self, uid, ip, port):
-        return self._data(self._get("/v1/ipc/send-stun-addr", appId=APP_ID,
+        return self._data(self._get("/v1/ipc/send-stun-addr",
+                                    timeout=STUN_ADDR_TIMEOUT,
+                                    appId=APP_ID,
                                     uid=uid, publicIp=ip, publicPort=port,
                                     privateIp=ip, privatePort=port))
 
@@ -488,6 +503,7 @@ class GPS555:
         """GET /v1/ipc/notify-live-event — event_type is a CameraEventType value
         (EVENT_START, EVENT_KEEPALIVE, EVENT_STOP, EVENT_RELAY, ...)."""
         self._get("/v1/ipc/notify-live-event",
+                  timeout=NOTIFY_TIMEOUT,
                   appId=APP_ID, eventType=event_type, uid=uid)
 
     def _post(self, path: str, body: dict) -> dict:
@@ -653,7 +669,7 @@ class RelayStream:
         self._cseq = 0
         self._session = None
         self._session_timeout = 60.0
-        self._auth = None               # cached Authorization header value
+        self._challenge = None          # WWW-Authenticate from the last 401
         # interleaved channel -> ("video"|"audio")
         self._channels: dict[int, str] = {}
         self._asm = RtpJpegReassembler(on_frame)
@@ -661,6 +677,8 @@ class RelayStream:
     # ---- low-level socket helpers ------------------------------------------
 
     def _recv_some(self) -> bool:
+        if self._sock is None:          # close() raced the pump thread
+            return False
         try:
             chunk = self._sock.recv(65536)
         except socket.timeout:
@@ -720,7 +738,13 @@ class RelayStream:
         raise ValueError(f"unsupported auth scheme {scheme!r}")
 
     def _request(self, method: str, uri: str = None, headers: dict = None) -> tuple:
-        """Send one RTSP request and return (status, headers, body)."""
+        """Send one RTSP request and return (status, headers, body).
+
+        A cached challenge is re-derived per request, never replayed: a
+        digest response covers exactly one method+URI, so replaying the
+        DESCRIBE header on SETUP's track URI (and on PLAY) fails SETUP
+        forever on any digest-authenticating relay.
+        """
         uri = uri or self.url
         headers = dict(headers or {})
         self._cseq += 1
@@ -728,8 +752,9 @@ class RelayStream:
         headers["User-Agent"] = "ziot-rtp-bridge"
         if self._session:
             headers["Session"] = self._session
-        if self._auth:
-            headers["Authorization"] = self._auth
+        if self._challenge:
+            headers["Authorization"] = self._auth_header(
+                method, uri, self._challenge)
 
         def send():
             lines = [f"{method} {uri} RTSP/1.0"]
@@ -739,13 +764,16 @@ class RelayStream:
         send()
         status, hdrs, body = self._read_response(method)
 
-        if status == 401 and not self._auth and "www-authenticate" in hdrs:
+        if status == 401 and "www-authenticate" in hdrs:
             if self._user is None:
                 raise PermissionError(
                     "relay demands authentication but no credentials are "
                     "configured (set relay_user/relay_pass in the config)")
-            self._auth = self._auth_header(method, uri, hdrs["www-authenticate"])
-            headers["Authorization"] = self._auth
+            # Refresh on every 401, not just the first: a nonce can expire
+            # mid-session, and the retry below then answers it.
+            self._challenge = hdrs["www-authenticate"]
+            headers["Authorization"] = self._auth_header(
+                method, uri, self._challenge)
             self._cseq += 1
             headers["CSeq"] = str(self._cseq)
             send()
@@ -952,7 +980,10 @@ class RelayStream:
         """Read interleaved media until stopped or the relay drops us."""
         keepalive_every = max(5.0, self._session_timeout / 2)
         last_keepalive = time.monotonic()
-        self._sock.settimeout(1.0)
+        sock = self._sock               # close() may null it mid-pump
+        if sock is None:
+            return
+        sock.settimeout(1.0)
         try:
             while not self._stop.is_set():
                 while self._buf and self._buf[:1] != b"$":
@@ -966,7 +997,9 @@ class RelayStream:
                 if time.monotonic() - last_keepalive > keepalive_every:
                     last_keepalive = time.monotonic()
                     self._cseq += 1
-                    self._sock.sendall(
+                    if sock is not self._sock or self._sock is None:
+                        return          # closed under us; never send on it
+                    sock.sendall(
                         f"OPTIONS {self.url} RTSP/1.0\r\nCSeq: {self._cseq}\r\n"
                         f"Session: {self._session}\r\n\r\n".encode())
         except (ConnectionError, OSError) as e:
@@ -1573,8 +1606,9 @@ class ZiotCamera:
         for port in range(LAN_SWEEP_LO, LAN_SWEEP_HI + 1):
             if self._stop.is_set() or self.is_streaming:
                 return
-            if self.sock is not sock:
-                return
+            with self._sock_lock:
+                if self.sock is not sock:
+                    return
             try:
                 sock.sendto(PUNCH, (ip, port))
             except OSError:
@@ -2014,7 +2048,8 @@ def print_camera_table(cams: list[dict]) -> None:
               f"{str(c.get('relay_ip','')):<22}  {c.get('wifiSsid','')}")
 
 
-def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
+def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock,
+                 http_token: str | None = None):
     def snapshot() -> list:
         # The retry-boot path registers cameras while these threads serve:
         # iterating the shared map directly can raise "dictionary changed
@@ -2024,16 +2059,38 @@ def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
+        # Applied to the connection socket: a client that stops reading pins
+        # its handler thread forever on a write without this, and each
+        # MJPEG/WAV client holds a thread. A healthy viewer never stalls
+        # 30 s; a stalled one gets a TimeoutError, which _pump treats as a
+        # hangup.
+        timeout = 30
 
         def log_message(self, *a):
             pass
 
+        def _authorized(self, query: str) -> bool:
+            if not http_token:
+                return True
+            if self.headers.get("Authorization", "") == f"Bearer {http_token}":
+                return True
+            # ?token= too: <img src> and <audio src> cannot set headers.
+            got = urllib.parse.parse_qs(query).get("token", [None])[0]
+            return got == http_token
+
         def do_GET(self):
-            path = self.path.strip("/")
+            split = urllib.parse.urlsplit(self.path)
+            path = split.path.strip("/")
+            if path == "health":
+                # Token-free on purpose: the watchdog polls it unauthenticated
+                # from cron and a 401 there reads as "bridge dead".
+                self._health()
+                return
+            if not self._authorized(split.query):
+                self.send_error(401)
+                return
             if path in ("", "cameras"):
                 self._index()
-            elif path == "health":
-                self._health()
             else:
                 # One route table; the slice length comes from the prefix,
                 # so the per-route offsets can never drift apart.
@@ -2081,6 +2138,8 @@ def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
             cams = snapshot()
             data = {
                 "status": "ok" if any(c.is_streaming for c in cams) else "degraded",
+                "version": BRIDGE_VERSION,
+                "uptime_s": round(time.monotonic() - _STARTED_MONOTONIC),
                 "boot": boot.snapshot(),
                 "cameras": [c.health() for c in cams],
             }
@@ -2125,6 +2184,11 @@ sound until you interact &mdash; press play if silent.</p>
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except TimeoutError:
+                # The handler's 30s connection timeout fired on a write: the
+                # client stopped reading. Same as a hangup, not an error.
+                log.info("[%s] %s client stalled past the write timeout",
+                         cam.uid, label)
 
         def _mjpeg(self, cam: ZiotCamera):
             self.send_response(200)
@@ -2428,6 +2492,36 @@ def main():
             bring_up(cams)
             return
 
+    # 8085 is what the README, the go2rtc examples and the watchdog assume.
+    port = args.port or cfg.get("port", 8085)
+    # Bind before bring_up: BootState exists precisely so /health can answer
+    # "starting" while cameras are still rendezvousing, and the watchdog's
+    # boot-phase logic depends on that -- a bridge that binds only after a
+    # successful device list reads as dead during boot instead.
+    http_host = cfg.get("http_host")
+    if http_host is not None and not (isinstance(http_host, str) and http_host):
+        log.error("http_host %r must be an interface address string -- "
+                  "using 0.0.0.0", http_host)
+        http_host = None
+    http_host = http_host or "0.0.0.0"
+    http_token = cfg.get("http_token")
+    if http_token is not None and \
+            not (isinstance(http_token, str) and http_token):
+        log.error("http_token %r must be a non-empty string -- ignoring it; "
+                  "media routes stay unauthenticated", http_token)
+        http_token = None
+    if http_token:
+        log.info("media routes require the configured http_token; /health "
+                 "stays open for the watchdog")
+    server = ThreadingHTTPServer((http_host, port),
+                                 make_handler(live, boot, lock, http_token))
+    # A stalled viewer holds a thread per connection; Ctrl-C must not wait
+    # on open MJPEG streams to exit.
+    server.daemon_threads = True
+    serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serve_thread.start()
+    log.info("serving on http://%s:%d/", http_host, port)
+
     if offline:
         cams = [{"uid": uid} for uid in static]
         if api is None:
@@ -2454,14 +2548,12 @@ def main():
 
     if cams is not None:
         if not bring_up(cams):
+            # Settled, not transient -- and deliberately exit 0: the roster
+            # simply held nothing for us. See bring_up.
             return
     else:
         threading.Thread(target=retry_boot, daemon=True).start()
 
-    # 8085 is what the README, the go2rtc examples and the watchdog assume.
-    port = args.port or cfg.get("port", 8085)
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(live, boot, lock))
-    log.info("serving on http://0.0.0.0:%d/", port)
     with lock:
         serving = list(live)
     for uid in serving:
@@ -2470,12 +2562,16 @@ def main():
         log.info("  audio http://localhost:%d/audio/%s", port, uid)
     log.info("  health http://localhost:%d/health", port)
     try:
-        server.serve_forever()
+        # serve_forever runs in its own thread now; the main thread just
+        # waits for it (Ctrl-C interrupts the join like it interrupted the
+        # old inline serve_forever).
+        serve_thread.join()
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:
         stopping.set()
         server.shutdown()
+        server.server_close()       # release the port before main returns
         if cloud is not None:
             cloud.stop()
         with lock:
