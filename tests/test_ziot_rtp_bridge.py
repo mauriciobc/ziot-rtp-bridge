@@ -896,7 +896,76 @@ class CloudAuthParkTests(unittest.TestCase):
         boot.set("retrying", "device list unavailable: timed out", 2)
         cloud = bridge.CloudState(api, 1, boot)
         cloud.poll()
+        cloud.poll()
         self.assertEqual(boot.snapshot()["phase"], "retrying")
+
+
+class OfflineModeTests(unittest.TestCase):
+    """--offline punches probe-found endpoints with zero cloud calls."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+
+    def write_cfg(self, cfg):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        return path
+
+    def test_static_rendezvous_needs_no_cloud(self):
+        peer = bind_loopback()
+        self.addCleanup(peer.close)
+        port = peer.getsockname()[1]
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", port))
+        self.assertTrue(cam._rendezvous())
+        self.assertEqual(cam.addr, ("127.0.0.1", port))
+        self.assertEqual(cam._fetch_endpoint(),
+                         ("127.0.0.1", port, "static"))
+        cam.start()
+        cam.stop()
+
+    def test_main_offline_boots_without_token_or_cloud(self):
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        gps.assert_not_called()
+        _, kwargs = cam.call_args
+        self.assertEqual(kwargs["static_addr"], ("127.0.0.1", 56061))
+        server.assert_called_once()
+
+    def test_offline_without_endpoints_is_argparse_error(self):
+        path = self.write_cfg({"offline": True})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertRaises(SystemExit) as cm:
+                bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        gps.assert_not_called()
+
+    def test_offline_ignores_only_online(self):
+        # Cloud flags are absent offline, so the startup-only filter would
+        # drop every camera if it were applied.
+        path = self.write_cfg(
+            {"offline": True, "only_online": True,
+             "offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555"), \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        server.assert_called_once()
 
 
 if __name__ == "__main__":

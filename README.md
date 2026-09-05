@@ -72,6 +72,7 @@ Create `ziot_config.json` next to the script:
 | `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state |
 | `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
 | `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Unset by default — the relay is not known to authenticate, and the bridge fails loudly rather than guessing |
+| `offline` / `offline_endpoints` | no | Skip the cloud entirely: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75:52901"}}` with `--offline`. No token needed. See "Running without the cloud" |
 
 ```bash
 chmod 600 ziot_config.json    # it holds an account credential
@@ -141,8 +142,43 @@ python3 ziot_rtp_bridge.py                  # serve on :8085
 | `--port N` | override listen port |
 | `--list-cameras` | print cameras on the account and exit |
 | `--bind-ip IP` | LAN IP to stream from. Set this on multi-homed hosts |
+| `--offline` | No cloud calls at all — punch `offline_endpoints` directly (see below) |
 
 Cameras start in parallel; expect all of them live within ~10 s.
+
+### Running without the cloud
+
+Media is plain UDP RTP; the cloud is only signalling (device list, STUN
+address, wake/keepalive). If the camera answers a hello on the LAN, the
+bridge can stream it with no account and no token:
+
+```bash
+# 1. Find where each camera listens (run on the bridge host, same LAN).
+#    No token, no cloud — just UDP hellos and listening for RTP.
+python3 ziot_offline_probe.py 192.168.18.75 --uid 141030191094
+#    HIT RESPONDER 192.168.18.75:52901  12 pkts  ssrc=0x30191094 pt=26,0
+
+# 2. Put the hits in the config. Nothing else cloud-related is needed.
+#    ziot_offline.json:
+#    {"offline": true, "port": 8085,
+#     "offline_endpoints": {"141030191094": "192.168.18.75:52901"}}
+
+# 3. Serve.
+python3 ziot_rtp_bridge.py --config ziot_offline.json --offline \
+    --bind-ip 192.168.18.45
+```
+
+Caveats, all inherent to cutting out the directory:
+
+* **Re-probe after every camera reboot.** The listen port is ephemeral
+  (`…:55271` became `…:52901` across one power cycle here) — a stale port
+  just punches silence until you update it.
+* **No `online`/`media` flags on `/health`** — those come from the device
+  list. `rx_datagrams`, `streaming`, and `fps` still tell the truth.
+* **No relay fallback** — the relay address also comes from the cloud.
+* **If the probe finds nothing**, the camera needs a cloud `notify` to wake
+  and cannot be run offline. That is a per-camera fact worth knowing, not a
+  bridge bug: run the probe once and you know which side you are on.
 
 ### Docker (recommended)
 
@@ -589,12 +625,13 @@ reliability improvements were added during deployment:
 ---
 
 ## Limitations
-
-* **Cloud-dependent at runtime.** The 2-second keepalive is required for as
+* **Cloud-dependent at runtime — unless `--offline`.** The 2-second keepalive is required for as
   long as you want the stream, so this stops working if the vendor shuts down
-  `ipc.gps555.net`. Media is local; control is not.
+  `ipc.gps555.net`. Media is local; control is not. If the probe finds your
+  cameras (see "Running without the cloud"), neither the keepalive nor the
+  ~15-day token refresh applies.
 * **Token expiry ~15 days**, manual re-capture. This is the main operational
-  chore.
+  chore (not needed with `--offline`, which uses no token at all).
 * **Hardware ceiling: 640×480, ~6-8 fps, MJPEG.** The TXW817 has no hardware
   H.264 encoder. No amount of software gets 1080p out of it, regardless of
   what the listing claimed.

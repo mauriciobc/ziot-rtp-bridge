@@ -889,10 +889,11 @@ class RelayStream:
 
 
 class ZiotCamera:
-    def __init__(self, api: GPS555, cam: dict, bind_ip: str,
+    def __init__(self, api: "GPS555 | None", cam: dict, bind_ip: str,
                  force_relay: bool = False, relay_user: str = None,
-                 relay_pass: str = None):
+                 relay_pass: str = None, static_addr: tuple = None):
         self.api = api
+        self._static_addr = static_addr  # offline mode: (ip, port) from the probe
         self.uid = cam["uid"]
         self.bind_ip = bind_ip
         # Cloud-reported state from the device list (raw, as the app sees them).
@@ -1014,6 +1015,10 @@ class ZiotCamera:
 
     def _fetch_endpoint(self):
         """One STUN lookup: fetch, freshness-check, then select an address."""
+        if self._static_addr is not None:
+            # Offline mode: no broker. The probe already located the camera
+            # on the LAN, so there is nothing to freshness-check against.
+            return self._static_addr[0], self._static_addr[1], "static"
         d = self.api.get_stun_addr(self.uid)
         if not self._accept_stun(d):
             return None
@@ -1044,6 +1049,19 @@ class ZiotCamera:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((self.bind_ip, 0))
         port = sock.getsockname()[1]
+
+        if self._static_addr is not None:
+            # Offline mode: the probe already located the camera, so there
+            # is no broker to register with, nothing to wake, and no STUN
+            # conversation to freshness-check. Punch straight at it.
+            addr = (self._static_addr[0], self._static_addr[1])
+            with self._sock_lock:
+                self.sock = sock
+                self.addr = addr
+            self._note_endpoint("static")
+            log.info("[%s] camera at %s:%d (we are %s:%d) [offline]",
+                     self.uid, addr[0], addr[1], self.bind_ip, port)
+            return True
 
         # Register our port with the cloud. No send-cmd here: the CameraCMDType
         # enum has no live-view command, and the "20" this used to send is
@@ -1261,10 +1279,11 @@ class ZiotCamera:
 
     def _keepalive(self):
         while not self._stop.is_set():
-            try:
-                self.api.notify(self.uid, EVENT_KEEPALIVE)
-            except Exception:
-                pass
+            if self.api is not None:
+                try:
+                    self.api.notify(self.uid, EVENT_KEEPALIVE)
+                except Exception:
+                    pass
             self._stop.wait(KEEPALIVE_INTERVAL)
 
     def _resolve(self) -> None:
@@ -1848,6 +1867,10 @@ def main():
     ap.add_argument("--force-relay", action="store_true",
                     help="skip the direct path and stream via the vendor RTSP "
                          "relay (for exercising that path on demand)")
+    ap.add_argument("--offline", action="store_true",
+                    help="no cloud calls at all: punch the ip:port pairs in "
+                         "offline_endpoints (found with ziot_offline_probe.py). "
+                         "No token needed; re-probe after each camera reboot")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -1890,7 +1913,24 @@ def main():
         interval = default_interval
     PUNCH_INTERVAL = interval
 
-    api = GPS555(cfg["token"])
+    offline = bool(args.offline or cfg.get("offline"))
+    static: dict = {}
+    if offline:
+        for uid, ep in (cfg.get("offline_endpoints") or {}).items():
+            ip, _, port = str(ep).rpartition(":")
+            try:
+                static[str(uid)] = (ip.strip("[] "), int(port))
+            except ValueError:
+                ap.error(f"offline endpoint for {uid} must be ip:port, "
+                         f"got {ep!r}")
+        if not static:
+            ap.error("offline mode needs offline_endpoints "
+                     "{uid: ip:port} in the config")
+        if args.list_cameras:
+            ap.error("--list-cameras needs the cloud; drop --offline")
+        api = None
+    else:
+        api = GPS555(cfg["token"])
 
     if args.list_cameras:
         # One-shot and interactive: no fleet to strand and nobody watching
@@ -1901,7 +1941,7 @@ def main():
     boot = BootState()
     live: dict[str, ZiotCamera] = {}
     lock = threading.Lock()
-    cloud = CloudState(api, cfg["user_id"], boot)
+    cloud = None if offline else CloudState(api, cfg["user_id"], boot)
     stopping = threading.Event()
 
     def bring_up(cams) -> bool:
@@ -1911,8 +1951,10 @@ def main():
         rather than a transient one, so the caller stops instead of retrying.
         """
         wanted = set(cfg.get("cameras") or [])
-        cams = [c for c in cams if not wanted or c["uid"] in wanted]
         only_online = bool(cfg.get("only_online"))
+        if offline and only_online:
+            log.warning("only_online needs cloud flags; ignoring in offline mode")
+            only_online = False
         if only_online:
             skipped = [c["uid"] for c in cams if not cloud_is_on(c)]
             cams = [c for c in cams if cloud_is_on(c)]
@@ -1929,14 +1971,15 @@ def main():
         # Probe with the camera's LAN address so the default bind lands on its
         # subnet; the per-camera choice between LAN and public happens later, in
         # ZiotCamera._pick_endpoint.
-        try:
-            probe = api.get_stun_addr(cams[0]["uid"]).get("IpcPrivateIP")
-        except Exception as e:
-            # The other unguarded cloud call that used to abort the whole boot.
-            # The default-route fallback below is exactly the right answer here.
-            log.warning("could not ask the broker where %s is (%s) — falling "
-                        "back to the default route", cams[0]["uid"], e)
-            probe = None
+        probe = None
+        if not offline:
+            try:
+                probe = api.get_stun_addr(cams[0]["uid"]).get("IpcPrivateIP")
+            except Exception as e:
+                # The other unguarded cloud call that used to abort the whole boot.
+                # The default-route fallback below is exactly the right answer here.
+                log.warning("could not ask the broker where %s is (%s) — falling "
+                            "back to the default route", cams[0]["uid"], e)
         if args.bind_ip:
             bind_ip = args.bind_ip
         elif probe:
@@ -1956,7 +1999,8 @@ def main():
                 z = ZiotCamera(api, cam_rec, bind_ip,
                                force_relay=args.force_relay,
                                relay_user=cfg.get("relay_user"),
-                               relay_pass=cfg.get("relay_pass"))
+                               relay_pass=cfg.get("relay_pass"),
+                               static_addr=static.get(uid))
             except Exception:
                 # Nothing to register or recover if we could not even build it.
                 log.exception("%s: could not be constructed — skipping", uid)
@@ -1981,7 +2025,8 @@ def main():
                 live[uid] = z
                 if not started:
                     cold.append(uid)
-            cloud.register(z)
+            if cloud is not None:
+                cloud.register(z)
 
         threads = [threading.Thread(target=boot_one, args=(c,)) for c in cams]
         for t in threads:
@@ -1998,7 +2043,8 @@ def main():
                         "the cloud but often never open a session; /health will "
                         "show mode=down until one does.")
 
-        cloud.start()
+        if cloud is not None:
+            cloud.start()
         boot.set("ready", None)
         return True
 
@@ -2035,19 +2081,24 @@ def main():
             bring_up(cams)
             return
 
-    try:
-        cams = api.list_cameras(cfg["user_id"])
-    except Exception as e:
-        if is_auth_failure(e):
-            # Nothing is serving yet and no token un-expires itself, so this is
-            # a config error in the same sense as an unreadable config file.
-            log.error("cloud rejected the token (%s) — check \"token\" in %s; "
-                      "it is a JWT and they expire", e, args.config)
-            raise SystemExit(2)
-        log.warning("device list unavailable at startup (%s) — serving /health "
-                    "and retrying in the background", e)
-        boot.set("retrying", f"device list unavailable: {e}", 1)
-        cams = None
+    if offline:
+        cams = [{"uid": uid} for uid in static]
+        log.info("offline mode: %d static endpoint(s), no cloud calls",
+                 len(static))
+    else:
+        try:
+            cams = api.list_cameras(cfg["user_id"])
+        except Exception as e:
+            if is_auth_failure(e):
+                # Nothing is serving yet and no token un-expires itself, so this is
+                # a config error in the same sense as an unreadable config file.
+                log.error("cloud rejected the token (%s) — check \"token\" in %s; "
+                          "it is a JWT and they expire", e, args.config)
+                raise SystemExit(2)
+            log.warning("device list unavailable at startup (%s) — serving /health "
+                        "and retrying in the background", e)
+            boot.set("retrying", f"device list unavailable: {e}", 1)
+            cams = None
 
     if cams is not None:
         if not bring_up(cams):
@@ -2073,7 +2124,8 @@ def main():
     finally:
         stopping.set()
         server.shutdown()
-        cloud.stop()
+        if cloud is not None:
+            cloud.stop()
         with lock:
             stopping_cams = list(live.values())
         for z in stopping_cams:
