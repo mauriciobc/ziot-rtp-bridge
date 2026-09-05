@@ -752,7 +752,24 @@ class StubCam:
 
 
 class HandlerConcurrencyTests(unittest.TestCase):
-    """Registering cameras mid-serve must not break in-flight /health."""
+    """Registering cameras mid-serve must not break in-flight /health.
+
+    The obvious version of this test -- register 50 cameras in a tight loop,
+    then join the fetchers -- passes against the *unfixed* handler, because the
+    loop finishes long before the first request is served and the two never
+    overlap. Two things are needed to reproduce the real failure:
+    registration has to run while requests are in flight, and the switch
+    interval has to be short enough for the GIL to yield mid-iteration.
+    Otherwise the whole iteration completes inside one slice and the bug hides.
+
+    Verified: with `snapshot()` reverted to iterating the live dict, this fails
+    with "dictionary changed size during iteration"; with the fix, it passes.
+    """
+
+    def setUp(self):
+        old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        self.addCleanup(sys.setswitchinterval, old)
 
     def test_health_and_index_survive_concurrent_registration(self):
         cameras = {}
@@ -765,30 +782,59 @@ class HandlerConcurrencyTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
-        errors = []
 
-        def fetch_forever(n):
-            try:
-                for _ in range(n):
-                    for endpoint in ("health", ""):
+        stop = threading.Event()
+        errors = []
+        served = []
+
+        def register():
+            i = 0
+            while not stop.is_set():
+                with lock:
+                    cameras[f"cam{i}"] = StubCam(f"cam{i}")
+                i += 1
+                time.sleep(0.0002)
+
+        def fetch():
+            while not stop.is_set():
+                for endpoint in ("health", ""):
+                    try:
                         with urllib.request.urlopen(
                                 f"http://127.0.0.1:{port}/{endpoint}",
                                 timeout=5) as r:
                             json.loads(r.read())
-            except Exception as e:  # noqa: BLE001 — collected, asserted below
-                errors.append(e)
+                        served.append(endpoint)
+                    except Exception as e:      # noqa: BLE001 -- asserted below
+                        errors.append(repr(e))
+                        return
 
-        getters = [threading.Thread(target=fetch_forever, args=(25,))
-                   for _ in range(4)]
-        for t in getters:
+        writer = threading.Thread(target=register, daemon=True)
+        writer.start()
+        readers = [threading.Thread(target=fetch, daemon=True) for _ in range(6)]
+        for t in readers:
             t.start()
-        for i in range(50):
+
+        # Run until both sides have done enough to have overlapped, then stop.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not errors:
             with lock:
-                cameras[f"cam{i}"] = StubCam(f"cam{i}")
-        for t in getters:
-            t.join(timeout=30)
+                registered = len(cameras)
+            if registered > 400 and len(served) > 60:
+                break
+            time.sleep(0.02)
+        stop.set()
+        writer.join(timeout=5)
+        for t in readers:
+            t.join(timeout=5)
+
         self.assertEqual(errors, [])
-        self.assertEqual(len(cameras), 50)
+        # Assert the test actually exercised the condition. Without this the
+        # test can silently stop overlapping and go on passing forever, which
+        # is exactly how the version it replaces came to protect nothing.
+        with lock:
+            registered = len(cameras)
+        self.assertGreater(registered, 400, "registration never got going")
+        self.assertGreater(len(served), 60, "no requests were served")
 
 
 class CloudAuthParkTests(unittest.TestCase):
@@ -814,6 +860,43 @@ class CloudAuthParkTests(unittest.TestCase):
         cloud = bridge.CloudState(api, 1, boot)
         cloud.poll()
         self.assertEqual(boot.snapshot()["phase"], "ready")
+
+    def test_a_park_lifts_when_the_cloud_accepts_the_token_again(self):
+        """Latching for the process lifetime would leave /health reporting
+        "failed" -- and the watchdog shouting -- for a bridge that is
+        demonstrably working again."""
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+
+        api.list_cameras.side_effect = None
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        cloud.poll()
+        self.assertEqual(boot.snapshot(), {"phase": "ready"})
+
+        # And a later rejection parks -- and logs -- again, rather than being
+        # swallowed by a latch that was never reset.
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        with self.assertLogs(bridge.log, "ERROR") as logs:
+            cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+        self.assertTrue(any("rejected the token" in line
+                            for line in logs.output), logs.output)
+
+    def test_a_park_is_not_lifted_for_a_state_we_did_not_set(self):
+        """Only ever undo a park we made ourselves -- a successful poll must
+        not promote a startup phase to ready behind bring_up's back."""
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        boot = bridge.BootState()
+        boot.set("retrying", "device list unavailable: timed out", 2)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "retrying")
 
 
 if __name__ == "__main__":

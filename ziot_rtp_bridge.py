@@ -1576,7 +1576,8 @@ class CloudState:
     are handed their own row.
     """
 
-    def __init__(self, api: GPS555, user_id: int, boot: "BootState" = None):
+    def __init__(self, api: GPS555, user_id: int,
+                 boot: "BootState | None" = None):
         self.api = api
         self.user_id = user_id
         self.boot = boot
@@ -1628,6 +1629,16 @@ class CloudState:
         if self._fails >= STATUS_FAIL_WARN:
             log.info("cloud state refresh recovered after %d failures", self._fails)
         self._fails = 0
+        if self._auth_failed:
+            # A 401 we parked on has stopped happening. Latching it for the
+            # process lifetime would leave /health reporting "failed" -- and
+            # the watchdog shouting -- for a bridge that is demonstrably
+            # working again. Only ever undo a park we made ourselves.
+            self._auth_failed = False
+            log.info("cloud accepted the token again — clearing the parked "
+                     "auth failure")
+            if self.boot is not None:
+                self.boot.set("ready", None)
         by_uid = {r.get("uid"): r for r in rows}
         with self._lock:
             cams = list(self._cams.values())
@@ -1816,6 +1827,7 @@ sound until you interact &mdash; press play if silent.</p>
                 pass
 
     return Handler
+
 
 def local_ip_for(target: str) -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
