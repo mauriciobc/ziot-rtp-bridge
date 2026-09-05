@@ -705,6 +705,21 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertIn(path, "\n".join(logs.output))
         gps.assert_not_called()
 
+    def test_non_utf8_config_exits_2_with_the_mount_hint(self):
+        with tempfile.NamedTemporaryFile(suffix=".json",
+                                         delete=False) as f:
+            f.write(b'{"token": "\xff\xfe not utf-8"}')
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(path, "\n".join(logs.output))
+        gps.assert_not_called()
+
 
 class StubCam:
     def __init__(self, uid):

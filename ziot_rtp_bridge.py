@@ -1844,7 +1844,7 @@ def main():
     try:
         with open(args.config) as fh:
             cfg = json.load(fh)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
         # The image ships no config, so this is what a forgotten -v looks like.
         # Under --restart unless-stopped a bare traceback here just loops.
         # Malformed JSON lands here too: same exit, same actionable path.
