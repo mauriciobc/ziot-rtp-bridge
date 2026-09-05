@@ -117,7 +117,8 @@ def main() -> int:
     hellos = (PUNCH, HEART)
     t0 = time.monotonic()
     try:
-        for p in ports:
+        total = len(ports)
+        for i, p in enumerate(ports):
             for h in hellos:
                 try:
                     sock.sendto(h, (target_ip, p))
@@ -125,6 +126,8 @@ def main() -> int:
                     pass
             if gap > 0:
                 time.sleep(gap)
+            if (i + 1) % 2000 == 0:
+                print(f"... {i + 1}/{total} ports", flush=True)
     except KeyboardInterrupt:
         pass
     sweep_s = time.monotonic() - t0
@@ -151,7 +154,7 @@ def main() -> int:
         print(f"{mark}RESPONDER {ip}:{port}  {e['n']} pkts  {info}")
         hits += wanted
     with lock:
-        foreign = [(s, e["n"]) for s, e in seen.items() if s[0] != args.target]
+        foreign = [(s, e["n"]) for s, e in seen.items() if s[0] != target_ip]
     for (ip, port), n in foreign:
         print(f"note: {n} pkts also arrived from {ip}:{port} "
               f"(not the target; another camera answering?)")
@@ -161,7 +164,9 @@ def main() -> int:
               f"and run the bridge with --offline")
         return 0
     print("nothing answered. The camera either is not at this IP, "
-          "needs a cloud notify to wake, or drops unsolicited hellos.")
+          "needs a cloud notify to wake, or drops unsolicited hellos. "
+          "If the sweep crawled, the target is probably off the LAN: "
+          "no ARP reply stalls every hello — check `ip neigh show` first.")
     return 1
 
 
