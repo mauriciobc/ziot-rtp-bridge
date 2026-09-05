@@ -416,6 +416,78 @@ class PunchIntervalTests(unittest.TestCase):
             gps.return_value.list_cameras.assert_called_once_with(1)
 
 
+class PunchLoopTests(unittest.TestCase):
+    """Every tick sends exactly one hello to the camera. The starved branch
+    exists to re-resolve the endpoint, not to punch a second time -- the
+    app's punch loop is Timer.periodic(1s), one hello per tick."""
+
+    def make_punching_camera(self, starved):
+        fake_cam = bind_loopback()
+        self.addCleanup(fake_cam.close)
+        sender = bind_loopback()
+        self.addCleanup(sender.close)
+        cam = make_camera()
+        cam.sock = sender
+        cam.addr = ("127.0.0.1", fake_cam.getsockname()[1])
+        cam._resolve = mock.Mock()
+        cam._last_rx = (0.0 if starved else time.monotonic())
+        return cam, fake_cam
+
+    def drive(self, cam, ticks):
+        """Run `_punch` for exactly `ticks` loop iterations: `_stop.wait`
+        is the loop's heartbeat, so it is where the tick counter lives."""
+        waited = []
+
+        def wait(_t):
+            waited.append(1)
+            if len(waited) >= ticks:
+                cam._stop.set()
+            return True
+
+        cam._stop.wait = wait
+        cam._punch()
+        self.assertEqual(len(waited), ticks)
+
+    def drain(self, sock):
+        got = []
+        sock.settimeout(0.05)
+        try:
+            while True:
+                got.append(sock.recvfrom(65535)[0])
+        except socket.timeout:
+            return got
+
+    def test_a_starved_tick_punches_exactly_once(self):
+        cam, fake_cam = self.make_punching_camera(starved=True)
+        self.drive(cam, 1)
+        self.assertEqual(self.drain(fake_cam), [bridge.PUNCH])
+        cam._resolve.assert_called_once_with()
+
+    def test_a_normal_tick_punches_exactly_once(self):
+        cam, fake_cam = self.make_punching_camera(starved=False)
+        self.drive(cam, 1)
+        self.assertEqual(self.drain(fake_cam), [bridge.PUNCH])
+        cam._resolve.assert_not_called()
+
+    def test_the_heart_rides_the_nth_tick(self):
+        cam, fake_cam = self.make_punching_camera(starved=False)
+        with mock.patch.object(bridge, "HEART_EVERY_N_PUNCHES", 3):
+            self.drive(cam, 3)
+        self.assertEqual(self.drain(fake_cam),
+                         [bridge.PUNCH, bridge.PUNCH,
+                          bridge.PUNCH, bridge.HEART])
+
+    def test_a_relayed_or_force_relay_camera_punches_nothing(self):
+        for relayed, force in ((True, False), (False, True)):
+            with self.subTest(relayed=relayed, force_relay=force):
+                cam, fake_cam = self.make_punching_camera(starved=False)
+                if relayed:
+                    cam._relay = mock.Mock()
+                cam.force_relay = force
+                self.drive(cam, 2)
+                self.assertEqual(self.drain(fake_cam), [])
+
+
 class UidSsrcTests(unittest.TestCase):
     def test_last_eight_digits_read_as_hex(self):
         self.assertEqual(bridge.uid_ssrc("141030191094"), 0x30191094)
@@ -709,12 +781,14 @@ class EndpointParseTests(unittest.TestCase):
             bridge.parse_static_endpoints(
                 {"A": "192.168.18.75:52901", "B": "10.0.0.5:9"}),
             {"A": ("192.168.18.75", 52901), "B": ("10.0.0.5", 9)})
+        self.assertEqual(
+            bridge.parse_static_endpoints({"A": "192.168.18.75"}),
+            {"A": ("192.168.18.75", 0)})
 
     def test_unsendable_values_raise(self):
         for bad in ("52901",                    # bare port -> 0.0.0.0
                     "1.2.3.4:99999",            # sendto OverflowError
                     "1.2.3.4:-1",
-                    "1.2.3.4:0",
                     "not-an-endpoint",
                     "1.2.3.4:notaport",
                     "[fe80::1]:5000"):          # AF_INET socket, never sends
@@ -949,7 +1023,7 @@ class CloudAuthParkTests(unittest.TestCase):
 
 
 class OfflineModeTests(unittest.TestCase):
-    """--offline punches probe-found endpoints with zero cloud calls."""
+    """--offline takes the roster from offline_endpoints; token still signals."""
 
     def setUp(self):
         self.old_argv = sys.argv[:]
@@ -1039,6 +1113,101 @@ class OfflineModeTests(unittest.TestCase):
                 bridge.main()
         self.assertEqual(cm.exception.code, 2)
         gps.assert_not_called()
+
+    def test_parse_static_allows_ip_only(self):
+        got = bridge.parse_static_endpoints({CAM_UID: "192.168.18.75"})
+        self.assertEqual(got, {CAM_UID: ("192.168.18.75", 0)})
+        got = bridge.parse_static_endpoints(
+            {CAM_UID: "192.168.18.75:52901"})
+        self.assertEqual(got, {CAM_UID: ("192.168.18.75", 52901)})
+
+    def test_hello_is_not_rtp_media(self):
+        self.assertFalse(bridge.is_rtp_media(bridge.PUNCH))
+        self.assertFalse(bridge.is_rtp_media(bridge.HEART))
+        pkt = rtp_packet(26, jpeg_payload())
+        self.assertTrue(bridge.is_rtp_media(pkt, CAM_SSRC))
+        self.assertFalse(bridge.is_rtp_media(pkt, CAM_SSRC + 1))
+
+    def test_offline_with_token_keeps_cloud_for_notify(self):
+        path = self.write_cfg(
+            {"token": "t", "user_id": 1,
+             "offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        gps.assert_called_once_with("t")
+        args, kwargs = cam.call_args
+        self.assertIs(args[0], gps.return_value)
+        self.assertEqual(kwargs["static_addr"], ("127.0.0.1", 56061))
+        server.assert_called_once()
+
+    def test_fetch_endpoint_pins_lan_ip_and_private_port(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "192.168.18.6",
+                                static_addr=("192.168.18.75", 0))
+        self.assertEqual(cam._fetch_endpoint(),
+                         ("192.168.18.75", 55040, "static-lan"))
+
+    def test_punch_only_recovery_keeps_socket(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        self.assertTrue(cam._rendezvous())
+        sock = cam.sock
+        self.addCleanup(cam.stop)
+        with mock.patch.object(bridge, "LAN_SWEEP_LO", 9), \
+                mock.patch.object(bridge, "LAN_SWEEP_HI", 9), \
+                mock.patch.object(bridge, "LAN_SWEEP_RATE", 10000):
+            cam._last_re_rendezvous = 0.0
+            cam._recovery_tick()
+        self.assertIs(cam.sock, sock)
+
+    def test_punch_dest_follows_media_source(self):
+        cam = make_camera()  # has a cloud api: STUN addr wins
+        cam.addr = ("192.168.18.75", 1)
+        cam._media_source = ("192.168.18.75", 55040)
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 1))
+        cam.api = None
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 55040))
+        cam._media_source = None
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 1))
+
+    def test_online_transition_kicks_wake(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0", "mediaState": "0"})
+        cam._wake_now = False
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})
+        self.assertTrue(cam._wake_now)
+        self.assertEqual(cam._backoff, 0.0)
+
+    def test_cloud_offline_recovery_keeps_socket(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 0,
+        }
+        cam = bridge.ZiotCamera(
+            api, {"uid": CAM_UID, "onlineState": "0"}, "127.0.0.1")
+        self.assertTrue(cam._rendezvous())
+        sock = cam.sock
+        self.addCleanup(cam.stop)
+        api.send_stun_addr.reset_mock()
+        api.notify.reset_mock()
+        cam._last_re_rendezvous = 0.0
+        cam._backoff = 0.0
+        cam._recovery_tick()
+        self.assertIs(cam.sock, sock)
+        api.send_stun_addr.assert_called()
+        api.notify.assert_called_with(CAM_UID, bridge.EVENT_START)
 
 
 if __name__ == "__main__":

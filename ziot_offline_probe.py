@@ -14,11 +14,14 @@ Usage:
 A hit looks like:
     RESPONDER 192.168.18.75:52901  12 pkts  ssrc=0x30191094 pt=26,0
 
-Take the responder's ip:port into the bridge's offline config:
-    {"offline_endpoints": {"141030191094": "192.168.18.75:52901"}}
+On TXW817 firmware, unsolicited hellos are ignored — a silent sweep is
+normal, not a probe bug. Those cameras still need a token in the bridge
+config so `--offline` can send notify/keepalive; put the LAN IP only:
 
-and start the bridge with --offline. Re-probe after every camera reboot:
-the listen port is ephemeral and changes per boot.
+    {"token": "eyJ…", "offline_endpoints": {"141030191094": "192.168.18.75"}}
+
+If a HIT does appear, that camera will punch without a token. Re-probe
+after every reboot: the listen port is ephemeral.
 
 Exit code is 0 when at least one responder (or the expected UID's SSRC)
 is seen, 1 when nothing answers.
@@ -33,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ziot_rtp_bridge import PUNCH, HEART, uid_ssrc
+from ziot_rtp_bridge import PUNCH, HEART, uid_ssrc, is_rtp_media
 
 DEFAULT_PORTS = "32768-61000"  # Linux ephemeral range; camera ports land here
 
@@ -53,8 +56,12 @@ def parse_ports(spec: str) -> list:
 
 
 def describe(payload: bytes) -> str:
-    if len(payload) < 12:
-        return f"{len(payload)}B non-RTP"
+    if not is_rtp_media(payload):
+        if len(payload) < 12:
+            return f"{len(payload)}B non-RTP"
+        pt = payload[1] & 0x7F
+        ssrc = struct.unpack("!I", payload[8:12])[0]
+        return f"non-RTP (v{(payload[0] >> 6)} pt={pt} ssrc=0x{ssrc:08x})"
     pt = payload[1] & 0x7F
     ssrc = struct.unpack("!I", payload[8:12])[0]
     return f"ssrc=0x{ssrc:08x} pt={pt}"
@@ -147,9 +154,7 @@ def main() -> int:
         if ip != target_ip:
             continue
         info = describe(e["sample"])
-        ssrc = struct.unpack("!I", e["sample"][8:12])[0] \
-            if len(e["sample"]) >= 12 else None
-        wanted = (want_ssrc is None) or (ssrc == want_ssrc)
+        wanted = is_rtp_media(e["sample"], want_ssrc)
         mark = "HIT " if wanted else "other "
         print(f"{mark}RESPONDER {ip}:{port}  {e['n']} pkts  {info}")
         hits += wanted

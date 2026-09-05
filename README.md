@@ -5,7 +5,9 @@ TXW817, sold as "X5" / "A9"), so they can be consumed by go2rtc, Frigate,
 Home Assistant, or a plain browser instead of the vendor phone app.
 
 Verified working on hardware 2026-08-29 with three cameras streaming
-simultaneously (video + audio), firmware `TXW817_A_V1.0.12.32`.
+simultaneously (video + audio), firmware `TXW817_A_V1.0.12.32`. `--offline`
+verified 2026-09-05 on the same firmware: LAN RTP from the camera, cloud
+used only for signalling.
 
 ---
 
@@ -22,17 +24,21 @@ ONVIF. The usual tricks do not work:
 | `cam-reverse` / `aiopppp` / iLnk-PPPP tools | ✗ wrong protocol family for this generation |
 | `rtsp://relay_ip:554/` (server root) | ✗ empty `DESCRIBE` — the path matters, see below |
 
-What **does** work: perform the vendor cloud's rendezvous yourself, then send
-the camera a plaintext UDP hello. It replies by streaming **unencrypted RTP**
-directly to your socket. This script does that and re-serves it as MJPEG.
+What **does** work: register this host with the vendor cloud
+(`send-stun-addr` + `notify(start)`), then keep the session alive with
+`notify(keepAlive)` every 2 s. The camera replies by streaming **unencrypted
+RTP from its own UDP socket to yours**. This script does that and re-serves
+it as MJPEG over HTTP. Hellos (`App send hello`) keep NAT warm; they do not
+start the session on this firmware.
 
 The `relay_ip` server *is* usable, but only at the app's own paths —
 `rtsp://<relay_ip>/live/<uid>` or `/rtp/<last 8 of uid>`, not the root. The
 bridge falls back to it automatically when the direct path stays down.
 
-> **Media flows LAN-direct.** The cloud is used only to wake the camera and
-> learn its address — video and audio never traverse the vendor's relay.
-> It is *local media*, but not *cloud-independent*; see Limitations.
+> **Media is captured on the LAN, from the camera.** Video and audio never
+> traverse `ipc.gps555.net`. The cloud is only signalling: publish our
+> address, wake the camera, keepalive. `--offline` skips the device-list
+> roster; it does not skip that handshake. See Limitations.
 
 ---
 
@@ -44,7 +50,9 @@ bridge falls back to it automatically when the direct path stays down.
   private IP. A NAT'd container (Docker bridge networking, Waydroid, a VM on
   NAT) will register an unroutable address and receive nothing.
   → Run on the host network, or use `network_mode: host`.
-* A **valid account JWT** (see Configuration).
+* A **valid account JWT** (see Configuration). Required on these TXW817
+  cameras even with `--offline` — unsolicited hellos are ignored, and the
+  session dies in ~12 s without `notify(keepAlive)`.
 * `ffmpeg` — *not* needed by the bridge itself, only by go2rtc/Frigate
   downstream.
 
@@ -59,20 +67,26 @@ Create `ziot_config.json` next to the script:
   "token":   "eyJhbGciOiJIUzI1NiIs…",
   "user_id": 3132031,
   "port":    8085,
-  "cameras": []
+  "cameras": [],
+  "offline_endpoints": {
+    "141030191094": "192.168.18.75",
+    "140979857781": "192.168.18.29"
+  }
 }
 ```
 
+`offline_endpoints` is unused unless `--offline` or `"offline": true`.
+
 | Key | Required | Meaning |
 |---|---|---|
-| `token` | yes | Account JWT, sent as `Authorization: Bearer …` |
-| `user_id` | yes | Numeric account id (`user_id` claim inside the JWT) |
+| `token` | yes* | Account JWT, sent as `Authorization: Bearer …`. Required on TXW817 even with `--offline`. Omit only if `ziot_offline_probe.py` reports a HIT (punch-only cameras) |
+| `user_id` | no | Numeric account id. Taken from the JWT `user_id` claim when omitted. Needed for the device-list roster and `--list-cameras` |
 | `port` | no | HTTP listen port, default `8085` |
-| `cameras` | no | Allow-list of UIDs. `[]` or omitted = every camera on the account |
-| `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state |
+| `cameras` | no | Allow-list of UIDs. `[]` or omitted = every camera on the account (or every key in `offline_endpoints` when `--offline`) |
+| `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state. Ignored under `--offline` |
 | `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
 | `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Unset by default — the relay is not known to authenticate, and the bridge fails loudly rather than guessing |
-| `offline` / `offline_endpoints` | no | Skip the cloud entirely: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75:52901"}}` with `--offline`. No token needed. See "Running without the cloud" |
+| `offline` / `offline_endpoints` | no | Roster from LAN targets instead of `GET /v1/ipc`: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75"}}`. IP only is enough — the listen port rotates and comes from STUN. A token in the same file still does notify/keepalive. See "Running without the device list" |
 
 ```bash
 chmod 600 ziot_config.json    # it holds an account credential
@@ -122,8 +136,8 @@ print(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))))" "<TOKEN>"
 ```
 
 **The token expires after ~15 days.** When it does, every camera stops — the
-rendezvous is entirely token-gated. Re-capture and restart. There is no
-refresh-token flow implemented here.
+rendezvous and the 2 s keepalive are token-gated, including `--offline`.
+Re-capture and restart. There is no refresh-token flow implemented here.
 
 ---
 
@@ -140,45 +154,71 @@ python3 ziot_rtp_bridge.py                  # serve on :8085
 |---|---|
 | `--config PATH` | config file (default `ziot_config.json`) |
 | `--port N` | override listen port |
-| `--list-cameras` | print cameras on the account and exit |
-| `--bind-ip IP` | LAN IP to stream from. Set this on multi-homed hosts |
-| `--offline` | No cloud calls at all — punch `offline_endpoints` directly (see below) |
+| `--list-cameras` | print cameras on the account and exit (needs the cloud; incompatible with `--offline`) |
+| `--bind-ip IP` | LAN IP the camera will send RTP to. Set this on multi-homed hosts |
+| `--offline` | Roster from `offline_endpoints` instead of the device list. Token (if present) still does notify/keepalive |
+| `--force-relay` | Skip the direct path and play the vendor RTSP relay (for exercising that path) |
 
-Cameras start in parallel; expect all of them live within ~10 s.
+Cameras start in parallel; an awake camera is usually live within ~10 s. A
+battery camera with `onlineState=0` stays dark until it next checks in —
+LAN hellos will not wake it.
 
-### Running without the cloud
+### Running without the device list (`--offline`)
 
-Media is plain UDP RTP; the cloud is only signalling (device list, STUN
-address, wake/keepalive). If the camera answers a hello on the LAN, the
-bridge can stream it with no account and no token:
+`--offline` takes the camera roster from `offline_endpoints` instead of
+`GET /v1/ipc`. Media is still LAN RTP from the camera. It does **not**
+make TXW817 cameras independent of the vendor cloud. Measured on firmware
+`TXW817_A_V1.0.12.32` (2026-09-05):
 
-```bash
-# 1. Find where each camera listens (run on the bridge host, same LAN).
-#    No token, no cloud — just UDP hellos and listening for RTP.
-python3 ziot_offline_probe.py 192.168.18.75 --uid 141030191094
-#    HIT RESPONDER 192.168.18.75:52901  12 pkts  ssrc=0x30191094 pt=26,0
+* Unsolicited `App send hello` is ignored, including a full ephemeral-port
+  sweep and a hello at the current STUN port from a fresh socket.
+* `send-stun-addr` + `notify(start)` is what starts the session. The camera
+  then sends RTP to the registered viewer address, not to whoever punches.
+* Without `notify(keepAlive)` every 2 s the session dies at ~12 s, hellos
+  notwithstanding. The listen port also rotates (several times a minute).
 
-# 2. Put the hits in the config. Nothing else cloud-related is needed.
-#    ziot_offline.json:
-#    {"offline": true, "port": 8085,
-#     "offline_endpoints": {"141030191094": "192.168.18.75:52901"}}
+So keep the account token in the same config. The LAN IP is enough — the
+bridge pins that IP, follows the STUN private port, and does not need a
+probed listen port:
 
-# 3. Serve.
-python3 ziot_rtp_bridge.py --config ziot_offline.json --offline \
-    --bind-ip 192.168.18.45
+```json
+{
+  "token": "eyJ…",
+  "user_id": 3132031,
+  "offline": true,
+  "port": 8085,
+  "offline_endpoints": {
+    "141030191094": "192.168.18.75",
+    "140979857781": "192.168.18.29"
+  }
+}
 ```
 
-Caveats, all inherent to cutting out the directory:
+```bash
+python3 ziot_rtp_bridge.py --config ziot_config.json --offline \
+    --bind-ip 192.168.18.6
+```
 
-* **Re-probe after every camera reboot.** The listen port is ephemeral
-  (`…:55271` became `…:52901` across one power cycle here) — a stale port
-  just punches silence until you update it.
-* **No `online`/`media` flags on `/health`** — those come from the device
-  list. `rx_datagrams`, `streaming`, and `fps` still tell the truth.
-* **No relay fallback** — the relay address also comes from the cloud.
-* **If the probe finds nothing**, the camera needs a cloud `notify` to wake
-  and cannot be run offline. That is a per-camera fact worth knowing, not a
-  bridge bug: run the probe once and you know which side you are on.
+A camera the cloud marks `onlineState=0` is usually asleep (these TXW817
+units are battery-powered). Punching its last LAN IP does nothing while
+the radio is down. Keep the token: while the camera is cloud-offline the
+bridge **reannounces the same local UDP port** (no rebind — a new source
+port is a miss when it next checks in) and sends `notify(start)`. When
+`onlineState` flips 0→1, rendezvous runs immediately instead of waiting
+out a 60 s backoff. Device-list flags are polled every 5 s while any
+camera is cloud-offline (otherwise 30 s).
+
+Omit the token only if `ziot_offline_probe.py` reports a HIT. Then the
+bridge punches that host, hello-sweeps when starved, and will not rebind
+the local socket (a new source port would miss replies aimed at the old
+one). The probe requires RTP v2 with PT 0 or 26, so an echo of
+`App send hello` is not a hit.
+
+```bash
+python3 ziot_offline_probe.py 192.168.18.75 --uid 141030191094
+```
+
+A silent sweep on this firmware is normal, not a probe bug.
 
 ### Docker (recommended)
 
@@ -252,7 +292,7 @@ should come back up rather than sit dead.
       "uid": "141030191094",
       "mode": "direct",
       "relay_url": null,
-      "endpoint_kind": "private",
+      "endpoint_kind": "static-lan",
       "stun_seq": 42,
       "online_state": "1",
       "media_state": "1",
@@ -267,10 +307,12 @@ should come back up rather than sit dead.
       "rx_datagrams": 9012,
       "rx_errors": 0,
       "foreign_ssrc": 0,
-      "media_source": "192.168.1.73:49201",
+      "media_source": "192.168.18.75:53296",
       "endpoint_moves": 2,
+      "re_rendezvous_count": 1,
+      "backoff_s": 5.0,
       "last_rx_ago_s": 0.1,
-      "addr": "192.168.1.73:49201"
+      "addr": "192.168.18.75:53296"
     }
   ]
 }
@@ -284,11 +326,15 @@ help), `no-cameras` (the device list held nothing matching your allow-list), or
 `"error"` for "could not reach the bridge at all", so a new value here would be
 indistinguishable from a dead bridge.
 
-`addr` is where the STUN broker says the camera is — where punches and hellos
-go. `media_source` is where media actually arrives from. They normally match;
-a lasting disagreement means the broker's answer is stale and the direct path
-is one-way. `foreign_ssrc` counts datagrams dropped for carrying another
-camera's SSRC, `rx_errors` counts packets whose handling raised.
+`addr` is where punches and hellos go (STUN, or the pinned LAN IP under
+`--offline`). `media_source` is where RTP actually arrives from. They
+normally match; a lasting disagreement means the broker's answer is stale
+and the direct path is one-way. `endpoint_kind` is `private` or `public`
+from the app's /24 rule, or `static-lan` when `--offline` pins the
+configured IP and takes only the STUN private port. `re_rendezvous_count`
+and `backoff_s` are the recovery loop. `foreign_ssrc` counts datagrams
+dropped for carrying another camera's SSRC, `rx_errors` counts packets
+whose handling raised.
 
 `rx_datagrams` counts every datagram that arrived on the direct socket, before
 any filtering. It is the one number that separates *"the camera is silent"*
@@ -327,39 +373,55 @@ Run via cron every 5 minutes:
 
 ## go2rtc
 
-The cameras emit MJPEG, which Frigate cannot record to mp4 — so transcode to
-h264 in go2rtc. Video and audio are separate URLs; listing both under one
-stream name makes go2rtc merge the tracks.
+A ready-to-run config is in [`go2rtc.yaml`](go2rtc.yaml). The cameras emit
+MJPEG (no H.264 on the TXW817), which Frigate cannot record to mp4, and
+the HTTP audio is a separate WAV. go2rtc merges them:
+
+* Native MJPEG from `/cam/<uid>` — live view is instant (no keyframe wait).
+* H.264 transcode only for clients that need it (Frigate, WebRTC, MSE),
+  with a 1 s GOP (`-g 8`) instead of go2rtc's default `-g 50` (6–8 s at
+  these frame rates).
+* AAC for Frigate + Opus for WebRTC, `#async` so JPEG and WAV clocks
+  do not have to agree.
 
 ```yaml
 streams:
   cat_cam_1:
-    - "ffmpeg:http://127.0.0.1:8085/cam/141030191094#video=h264"
-    - "ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac"
-  cat_cam_2:
-    - "ffmpeg:http://127.0.0.1:8085/cam/140979857781#video=h264"
-    - "ffmpeg:http://127.0.0.1:8085/audio/140979857781#audio=aac"
-  cat_cam_3:
-    - "ffmpeg:http://127.0.0.1:8085/cam/140996632758#video=h264"
-    - "ffmpeg:http://127.0.0.1:8085/audio/140996632758#audio=aac"
+    - http://127.0.0.1:8085/cam/141030191094
+    - ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac#audio=opus#async
+    - ffmpeg:cat_cam_1#video=h264
+
+ffmpeg:
+  h264: "-c:v libx264 -g:v 8 -bf:v 0 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p"
 ```
 
 If the bridge runs outside the go2rtc container, replace `127.0.0.1` with the
 host IP — and remember the bridge itself still needs host networking.
+Standalone:
+
+```bash
+docker run -d --name go2rtc --network host --restart unless-stopped \
+  -v /path/to/go2rtc.yaml:/config/go2rtc.yaml \
+  alexxit/go2rtc
+```
+
+`--network host` is required for WebRTC UDP. UI: `http://<host>:1984/` —
+pick MJPEG for a first-frame-now preview, or WebRTC/MSE for the transcode.
+
+Append `#hardware` to the h264 line for VAAPI / NVENC / VideoToolbox.
 
 ### WebRTC (optional, LAN only)
 
-For lower-latency live view, add WebRTC candidates to `go2rtc.yaml`:
-
 ```yaml
 webrtc:
+  listen: ":8555"
   candidates:
-    - "stun:192.168.1.100:8555"
-    - "stun:192.168.1.100:3478"
+    - stun:8555
 ```
 
-WebRTC does not work through Cloudflare tunnels without TURN — MSE fallback
-is used automatically.
+`stun:8555` advertises the host's own address. Pin a LAN IP instead
+(`192.168.18.6:8555`) on a multi-homed box. WebRTC does not work through
+Cloudflare tunnels without TURN — MSE fallback is used automatically.
 
 ---
 
@@ -368,12 +430,20 @@ is used automatically.
 Consume the go2rtc restream. Match `detect` to the camera's real output
 (**640×480**); claiming more resolution than exists only wastes CPU.
 
+If go2rtc is **nested in Frigate**, paste `streams` / `ffmpeg` / `webrtc`
+from `go2rtc.yaml` under `go2rtc:` (do not also run a second go2rtc).
+If go2rtc is **standalone**, omit the `go2rtc:` block and point Frigate
+at `rtsp://127.0.0.1:8554/<name>`.
+
 ```yaml
 go2rtc:
   streams:
     cat_cam_1:
-      - "ffmpeg:http://127.0.0.1:8085/cam/141030191094#video=h264"
-      - "ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac"
+      - http://127.0.0.1:8085/cam/141030191094
+      - ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac#audio=opus#async
+      - ffmpeg:cat_cam_1#video=h264
+  ffmpeg:
+    h264: "-c:v libx264 -g:v 8 -bf:v 0 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p"
 
 cameras:
   cat_cam_1:
@@ -382,6 +452,9 @@ cameras:
         - path: rtsp://127.0.0.1:8554/cat_cam_1
           input_args: preset-rtsp-restream
           roles: [detect, record]
+    live:
+      streams:
+        cat_cam_1: cat_cam_1
     detect:
       width: 640
       height: 480
@@ -389,10 +462,8 @@ cameras:
 ```
 
 The cameras deliver ~6-8 fps; setting `detect.fps` above that gains nothing.
-
-**Note:** Frigate's `go2rtc:` config section configures Frigate's internal
-go2rtc instance. If go2rtc is deployed separately, put the `streams:` section
-in its own `go2rtc.yaml` instead.
+`live.streams` makes Frigate's live view use go2rtc (WebRTC/MSE/MJPEG)
+instead of opening a third ffmpeg on the restream.
 
 ---
 
@@ -409,9 +480,24 @@ Wi-Fi airtime on the camera side.
 **A camera shows `streaming: false`.**
 Normal for the first few seconds. If it persists: confirm the host is on the
 camera's subnet (`ping` its LAN IP) and that `--bind-ip` is an address on that
-subnet. The bridge re-resolves a starved camera's endpoint automatically once
-media has been absent for 2 s, at most once every 5 s — watch for
-`endpoint moved …` lines, which are expected and healthy.
+subnet. A battery camera with `onlineState=0` and no ARP is asleep — hellos
+cannot wake it; wait for the 0→1 flip. The bridge re-resolves a starved
+camera's endpoint automatically once media has been absent for 2 s, at most
+once every 5 s — watch for `endpoint moved …` lines, which are expected and
+healthy. A 2–3 s gap on a STUN port rotate is not a dead camera; recovery
+only rebinds after ~10 s of silence.
+
+**`--offline` boots but nothing streams.**
+The roster came from LAN IPs; signalling still needs a token on this
+firmware. A punch-only run (no token) dies at ~12 s if a session ever
+starts at all. Check the boot log for `using token for notify/keepalive`
+versus `punch-only`. Sleeping cameras (`onlineState=0`) stay dark until
+they check in with the vendor.
+
+**`ziot_offline_probe.py` reports nothing.**
+Normal on TXW817 firmware — unsolicited hellos are ignored. Put the LAN
+IP in `offline_endpoints` and run the bridge with a token. A HIT means
+that camera will punch without a token.
 
 **Everything says `mode: down` and nothing streams.**
 The bridge stays up and retries rather than exiting, so this is a report, not a
@@ -433,7 +519,7 @@ streaming to us".
 
 **Everything stops at once, all cameras dead.**
 Almost certainly an expired JWT. Re-run `--list-cameras`; an HTTP 401 confirms
-it. Capture a fresh token.
+it. Capture a fresh token. `--offline` is token-gated on these cameras too.
 
 **`Address already in use` on startup.**
 A previous instance is still holding the port:
@@ -448,9 +534,11 @@ networking (`--network host` in Docker, or run on the host directly).
 
 **Live view in Frigate shows "offline" but thumbnails work.**
 This is usually a WebRTC issue. If you're accessing via Cloudflare tunnel,
-WebRTC won't work without TURN. Frigate falls back to MSE, which takes
-~5-10s to buffer. The stream is working — just slow to start. You can verify
-by checking `http://<host>:1984/api/streams` for active consumers.
+WebRTC won't work without TURN. Frigate falls back to MSE. With the shipped
+`go2rtc.yaml` (1 s GOP) that starts in about a second; the old default
+`-g 50` needed 5–10 s. Or open the go2rtc UI and pick MJPEG — that is the
+camera's JPEG, no transcode. You can verify by checking
+`http://<host>:1984/api/streams` for active consumers.
 
 **ffmpeg logs `overread 8`.**
 Cosmetic. The camera's entropy data has a few trailing bytes ffmpeg's MJPEG
@@ -465,8 +553,10 @@ near 241 of 255, so it discards most color information. Luma detail is fine.
 ## How it works
 
 1. `GET /api/v1/ipc?terminalFamilyId=<user_id>` — enumerate cameras.
+   `--offline` skips this: the roster is `offline_endpoints` (LAN IP,
+   optional port). Signalling below still runs when a token is present.
 2. `GET /api/v1/ipc/send-stun-addr?...` — register **the exact UDP port the
-   bridge will stream from**.
+   camera will send RTP to**.
 3. `GET /api/v1/ipc/notify-live-event?eventType=1` — wake the camera.
    `eventType` is a `CameraEventType`: `0` keepAlive, `1` start, `2` pause,
    `3` stop, `4` connected, `5` relay.
@@ -475,13 +565,22 @@ near 241 of 255, so it discards most color information. Luma detail is fine.
    (`IpcPublicIP:IpcPublicPort`), plus a `seqNo`. The bridge picks the LAN pair
    when the camera shares its `/24` and the public pair otherwise — the same
    rule as the app's `DeviceStunItem.ipAddress` — and ignores any reply whose
-   `seqNo` went backwards.
+   `seqNo` went backwards. Under `--offline` the configured LAN IP is pinned
+   and only the STUN private port is taken (`endpoint_kind: static-lan`).
 5. Send the literal UDP bytes `App send hello` to that address (plus
-   `App send heart for stun` every fifth punch, as the app does).
-6. The camera streams plain RTP back: **PT 26** = JPEG (RFC 2435), 640×480
-   ~6-8 fps; **PT 0** = PCMU G.711 audio, 8 kHz mono.
+   `App send heart for stun` every fifth punch, as the app does). On this
+   firmware that keeps NAT warm; it does not start the session.
+6. The camera streams plain RTP **from its LAN socket to the registered
+   viewer address**: **PT 26** = JPEG (RFC 2435), 640×480 ~6-8 fps;
+   **PT 0** = PCMU G.711 audio, 8 kHz mono. `/cam/<uid>` and `/audio/<uid>`
+   are that RTP re-served locally — not a pull from the vendor relay.
 7. `notify-live-event?eventType=0` (keepAlive) every 2 s keeps it alive;
    `eventType=3` (stop) is sent on shutdown.
+
+While `onlineState=0` the bridge reannounces the same local UDP port
+instead of rebinding — a sleeping battery camera checks in for a few
+seconds, and a new source port is a miss. When the flag flips 0→1,
+rendezvous runs immediately instead of waiting out the 60 s backoff.
 
 **There is no "start live" command.** An earlier version of this bridge sent
 `POST /api/v1/cmd/send-cmd {"cmdType":"20"}` before the rendezvous, believing it
@@ -511,13 +610,14 @@ of time cloud-offline; a bridge that gave up at startup would stay down until
 someone noticed.
 
 Cloud device-list state (`onlineState`, `mediaState`, `relay_ip`, `commTime`)
-is refreshed every 30 s by a single account-wide poller — the device-list
-endpoint returns every camera, so one request serves all of them — and exposed
-on `/`, `/health`, and `--list-cameras`. `/health` also carries `cloud_age_s`,
-the age of those flags; if the poller starts failing (an expired JWT, say) the
-last-known values are kept, `cloud_age_s` climbs, and the log warns after three
-consecutive failures. A large `cloud_age_s` means the flags are stale, not that
-the camera is unwell.
+is refreshed every 30 s by a single account-wide poller (every 5 s while any
+camera is cloud-offline, so a battery camera's short awake window is not
+missed) — the device-list endpoint returns every camera, so one request
+serves all of them — and exposed on `/`, `/health`, and `--list-cameras`.
+`/health` also carries `cloud_age_s`, the age of those flags; if the poller
+starts failing (an expired JWT, say) the last-known values are kept,
+`cloud_age_s` climbs, and the log warns after three consecutive failures. A
+large `cloud_age_s` means the flags are stale, not that the camera is unwell.
 
 Alongside the raw flags, `/` and `/health` carry `online` and `media_free`,
 which are the app's own readings of them: `online` is `onlineState == "1"` and
@@ -605,9 +705,9 @@ reliability improvements were added during deployment:
 * **Re-punch on endpoint move** — immediately re-punches after re-resolving a
   moved endpoint, not just at the next interval.
 * **Watchdog script** (`ziot_watchdog.py`) — checks bridge + go2rtc health,
-  auto-restarts Frigate when streams die but bridge is alive. Reports a camera
-  that has never received RTP (previously silent), and flags a camera running
-  on the relay rather than directly.
+  auto-restarts Frigate when a stream is dead **while that camera is live**.
+  An asleep battery camera is idle, not a Frigate restart. Reports a camera
+  that has never received RTP, and flags a camera running on the relay.
 * **Docker support** — Dockerfile included, tested with `--network host`.
 * **Cloud online/media state** — device-list `onlineState`/`mediaState` shown
   in `--list-cameras`, `/`, and `/health`; refreshed every 30 s so a wedged
@@ -621,24 +721,42 @@ reliability improvements were added during deployment:
   with a stale `seqNo`; report `online`/`media_free` using the app's own tests.
 * **RTSP relay fallback** — plays the vendor forwarding server when the direct
   path stays down, and returns to direct as soon as it recovers.
+* **`--offline`** — roster from `offline_endpoints` instead of the device
+  list; a token in the same config still does notify/keepalive (required
+  on TXW817). Pins the LAN IP and follows the STUN private port.
+* **No-rebind recovery** — while a camera is cloud-offline the same local
+  UDP port is reannounced instead of rebound (a 176-rendezvous loop used
+  to close the socket the camera would send to). Punch-only cameras
+  hello-sweep from the existing socket.
+* **Wake on 0→1** — full rendezvous the moment `onlineState` flips, rather
+  than sitting in a 60 s backoff through a battery camera's awake window.
+* **Probe requires RTP v2 PT 0/26** — an echo of `App send hello` is not a
+  hit.
+* **`go2rtc.yaml`** — native MJPEG producer (instant live), H.264 only for
+  Frigate/WebRTC with a 1 s GOP, AAC+Opus audio. Watchdog matches streams
+  by UID in the producer URL.
 
 ---
 
 ## Limitations
-* **Cloud-dependent at runtime — unless `--offline`.** The 2-second keepalive is required for as
-  long as you want the stream, so this stops working if the vendor shuts down
-  `ipc.gps555.net`. Media is local; control is not. If the probe finds your
-  cameras (see "Running without the cloud"), neither the keepalive nor the
-  ~15-day token refresh applies.
+* **Cloud-dependent at runtime.** The 2-second `notify(keepAlive)` is required
+  for as long as you want the stream on these cameras — the session dies in
+  ~12 s without it. Media is local RTP from the camera; control is not.
+  `--offline` only skips the device list; it still uses the token for
+  signalling when one is present.
+* **Sleeping battery cameras** cannot be woken from the LAN. `onlineState=0`
+  and no ARP means the radio is off; the bridge waits for the next vendor
+  check-in.
 * **Token expiry ~15 days**, manual re-capture. This is the main operational
-  chore (not needed with `--offline`, which uses no token at all).
+  chore (including `--offline`).
 * **Hardware ceiling: 640×480, ~6-8 fps, MJPEG.** The TXW817 has no hardware
   H.264 encoder. No amount of software gets 1080p out of it, regardless of
   what the listing claimed.
 * **Audio is quiet** — a low-gain electret on a cheap board. It decodes
   correctly; there is simply not much level.
-* **Live view startup delay** — go2rtc needs ~5-10s to buffer keyframes when
-  transcoding MJPEG→H264. Thumbnails are instant.
+* **H.264 is a transcode.** The camera has no encoder; go2rtc (or Frigate)
+  must make it. Native MJPEG live view is instant; the shipped `go2rtc.yaml`
+  uses a 1 s GOP so WebRTC/MSE start in about a second instead of 5–10 s.
 * Untested beyond three cameras on one host.
 
 ---

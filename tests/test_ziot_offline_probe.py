@@ -96,6 +96,36 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("nothing answered", out)
 
+    def test_hello_echo_is_not_a_hit(self):
+        """A UDP echo of `App send hello` used to parse as RTP v1 and exit 0."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        stop = threading.Event()
+
+        def echo():
+            sock.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    data, src = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                try:
+                    sock.sendto(data, src)
+                except OSError:
+                    return
+
+        threading.Thread(target=echo, daemon=True).start()
+        self.addCleanup(stop.set)
+        self.addCleanup(sock.close)
+        rc, out = self.run_probe(
+            "127.0.0.1", "--ports", str(port),
+            "--rate", "5000", "--listen", "1")
+        self.assertEqual(rc, 1)
+        self.assertNotIn("HIT ", out)
+
 
 if __name__ == "__main__":
     unittest.main()

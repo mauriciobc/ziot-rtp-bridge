@@ -94,5 +94,124 @@ class BootPhaseTests(unittest.TestCase):
         self.assertNotIn("BRIDGE NOT SERVING CAMERAS", out)
 
 
+class Go2rtcStreamTests(unittest.TestCase):
+    def test_uid_from_producer_url(self):
+        info = {"producers": [
+            {"url": "http://127.0.0.1:8085/cam/141030191094"},
+        ]}
+        self.assertEqual(
+            watchdog.go2rtc_stream_uid("cat_cam_1", info), "141030191094")
+
+    def test_uid_from_stream_name(self):
+        self.assertEqual(
+            watchdog.go2rtc_stream_uid("140979857781", {"producers": []}),
+            "140979857781")
+
+    def test_asleep_camera_is_idle_not_dead(self):
+        cams = {"141030191094": {"uid": "141030191094", "streaming": False}}
+        info = {"producers": [
+            {"url": "http://127.0.0.1:8085/cam/141030191094",
+             "bytes_recv": 0},
+        ]}
+        self.assertEqual(
+            watchdog.go2rtc_stream_state("cat_cam_1", info, cams), "idle")
+
+    def test_live_camera_with_no_bytes_is_dead(self):
+        cams = {"141030191094": {"uid": "141030191094", "streaming": True}}
+        info = {"producers": [
+            {"url": "http://127.0.0.1:8085/cam/141030191094",
+             "bytes_recv": 0},
+        ]}
+        self.assertEqual(
+            watchdog.go2rtc_stream_state("cat_cam_1", info, cams), "dead")
+
+
+class IdleCameraDoesNotRestartTests(unittest.TestCase):
+    def run_main(self, bridge, go2rtc):
+        out = io.StringIO()
+        with mock.patch.object(watchdog, "check_bridge", return_value=bridge), \
+                mock.patch.object(watchdog, "check_go2rtc",
+                                  return_value=go2rtc), \
+                mock.patch.object(watchdog, "restart_frigate",
+                                  return_value=True) as restart, \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                watchdog.main()
+        return cm.exception.code, out.getvalue(), restart
+
+    def test_asleep_camera_does_not_restart_frigate(self):
+        bridge = {
+            "status": "degraded", "boot": {"phase": "ready"},
+            "cameras": [{
+                "uid": "141030191094", "streaming": False, "fps": 0.0,
+                "endpoint_moves": 0, "last_rx_ago_s": None, "mode": "direct",
+            }],
+        }
+        go2rtc = {"cat_cam_1": {"producers": [
+            {"url": "http://127.0.0.1:8085/cam/141030191094",
+             "bytes_recv": 0},
+        ], "consumers": []}}
+        code, out, restart = self.run_main(bridge, go2rtc)
+        self.assertEqual(code, 1)
+        self.assertIn("[IDLE]", out)
+        restart.assert_not_called()
+
+    def test_unprefixed_stream_name_is_still_watched(self):
+        bridge = {"status": "ok", "cameras": [], "boot": {"phase": "ready"}}
+        go2rtc = {"front_yard": {"producers": [], "consumers": []}}
+        code, out, restart = self.run_main(bridge, go2rtc)
+        self.assertEqual(code, 1)
+        self.assertIn("go2rtc/front_yard", out)
+        restart.assert_called_once()
+
+
+class RestartPolicyTests(unittest.TestCase):
+    """When Frigate gets restarted, and when it must not be.
+
+    A restart can only fix a go2rtc that is up but streamless. A go2rtc that
+    is itself unreachable, a down bridge, or a relay-mode note cannot be
+    fixed by restarting anything.
+    """
+
+    def run_main(self, bridge, go2rtc):
+        out = io.StringIO()
+        with mock.patch.object(watchdog, "check_bridge", return_value=bridge), \
+                mock.patch.object(watchdog, "check_go2rtc",
+                                  return_value=go2rtc), \
+                mock.patch.object(watchdog, "restart_frigate",
+                                  return_value=True) as restart, \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                watchdog.main()
+        return cm.exception.code, out.getvalue(), restart
+
+    def test_an_unreachable_go2rtc_does_not_restart_frigate(self):
+        """Restarting Frigate cannot revive a go2rtc that is itself down."""
+        code, out, restart = self.run_main(
+            {"status": "ok", "cameras": [], "boot": {"phase": "ready"}},
+            None)
+        self.assertEqual(code, 1)
+        self.assertIn("go2rtc unreachable", out)
+        restart.assert_not_called()
+
+    def test_a_down_bridge_does_not_restart_frigate(self):
+        code, out, restart = self.run_main(
+            {"status": "error", "error": "refused", "cameras": []},
+            {"cat_cam1": {"producers": [], "consumers": []}})
+        self.assertEqual(code, 1)
+        restart.assert_not_called()
+
+    def test_a_relay_camera_is_reported_without_restarting(self):
+        bridge = {
+            "status": "ok", "boot": {"phase": "ready"},
+            "cameras": [{"uid": "141030191094", "streaming": True,
+                         "fps": 6.0, "endpoint_moves": 0, "mode": "relay"}],
+        }
+        code, out, restart = self.run_main(bridge, HEALTHY_GO2RTC)
+        self.assertEqual(code, 1)
+        self.assertIn("streaming via relay", out)
+        restart.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
