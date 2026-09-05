@@ -585,9 +585,11 @@ class BootStateTests(unittest.TestCase):
 class HealthEndpointTests(unittest.TestCase):
     """The watchdog reads this payload, so its shape is a contract."""
 
-    def serve(self, cameras, boot):
+    def serve(self, cameras, boot, lock=None):
         server = ThreadingHTTPServer(("127.0.0.1", 0),
-                                     bridge.make_handler(cameras, boot))
+                                     bridge.make_handler(
+                                         cameras, boot,
+                                         lock or threading.Lock()))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
@@ -687,6 +689,99 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("-v /host/path/ziot_config.json", "\n".join(logs.output))
         gps.assert_not_called()
+
+    def test_malformed_config_exits_2_with_the_mount_hint(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            f.write("{not valid json")
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(path, "\n".join(logs.output))
+        gps.assert_not_called()
+
+
+class StubCam:
+    def __init__(self, uid):
+        self.uid = uid
+        self.cloud = {}
+        self.mode = "direct"
+        self.is_streaming = False
+        self.fps = 0.0
+        self.stats = {}
+
+    def health(self):
+        return {"uid": self.uid}
+
+
+class HandlerConcurrencyTests(unittest.TestCase):
+    """Registering cameras mid-serve must not break in-flight /health."""
+
+    def test_health_and_index_survive_concurrent_registration(self):
+        cameras = {}
+        lock = threading.Lock()
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler(cameras, boot, lock))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        errors = []
+
+        def fetch_forever(n):
+            try:
+                for _ in range(n):
+                    for endpoint in ("health", ""):
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{port}/{endpoint}",
+                                timeout=5) as r:
+                            json.loads(r.read())
+            except Exception as e:  # noqa: BLE001 — collected, asserted below
+                errors.append(e)
+
+        getters = [threading.Thread(target=fetch_forever, args=(25,))
+                   for _ in range(4)]
+        for t in getters:
+            t.start()
+        for i in range(50):
+            with lock:
+                cameras[f"cam{i}"] = StubCam(f"cam{i}")
+        for t in getters:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(cameras), 50)
+
+
+class CloudAuthParkTests(unittest.TestCase):
+    def test_revoked_token_after_boot_parks_failed_once(self):
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        with self.assertLogs(bridge.log) as logs:
+            cloud.poll()
+            cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+        rejection_lines = [line for line in logs.output
+                           if "rejected the token" in line]
+        self.assertEqual(len(rejection_lines), 1)
+
+    def test_ordinary_outage_does_not_park_failed(self):
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = ConnectionError("down")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "ready")
 
 
 if __name__ == "__main__":

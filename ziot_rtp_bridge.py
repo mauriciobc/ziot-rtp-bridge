@@ -1576,13 +1576,15 @@ class CloudState:
     are handed their own row.
     """
 
-    def __init__(self, api: GPS555, user_id: int):
+    def __init__(self, api: GPS555, user_id: int, boot: "BootState" = None):
         self.api = api
         self.user_id = user_id
+        self.boot = boot
         self._cams: dict[str, "ZiotCamera"] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._fails = 0
+        self._auth_failed = False
 
     def register(self, cam: "ZiotCamera") -> None:
         with self._lock:
@@ -1606,6 +1608,15 @@ class CloudState:
             rows = self.api.list_cameras(self.user_id)
         except Exception as e:
             self._fails += 1
+            if is_auth_failure(e) and not self._auth_failed:
+                # A revoked token after boot: no retry will fix it, and the
+                # retry_boot path that parks "failed" only covers startup.
+                # Latch so this logs once; a new token needs a restart anyway.
+                self._auth_failed = True
+                log.error("cloud rejected the token (%s) — serving from "
+                          "last-known state; update \"token\" and restart", e)
+                if self.boot is not None:
+                    self.boot.set("failed", "the cloud rejected the token")
             # Stale flags served as if fresh are worse than no flags at all, so
             # say something once we've missed enough polls to matter.
             if self._fails == STATUS_FAIL_WARN:
@@ -1672,7 +1683,14 @@ def print_camera_table(cams: list[dict]) -> None:
               f"{str(c.get('relay_ip','')):<22}  {c.get('wifiSsid','')}")
 
 
-def make_handler(cameras: dict, boot: "BootState"):
+def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
+    def snapshot() -> list:
+        # The retry-boot path registers cameras while these threads serve:
+        # iterating the shared map directly can raise "dictionary changed
+        # size during iteration" mid-/health. Copy under the lock instead.
+        with lock:
+            return list(cameras.values())
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
@@ -1702,11 +1720,12 @@ def make_handler(cameras: dict, boot: "BootState"):
             self.wfile.write(body)
 
         def _index(self):
+            cams = snapshot()
             self._send(json.dumps([{
-                "uid": u,
-                "view": f"/view/{u}",
-                "video": f"/cam/{u}",
-                "audio": f"/audio/{u}",
+                "uid": c.uid,
+                "view": f"/view/{c.uid}",
+                "video": f"/cam/{c.uid}",
+                "audio": f"/audio/{c.uid}",
                 "online_state": c.cloud.get("onlineState"),
                 "media_state": c.cloud.get("mediaState"),
                 "online": cloud_is_on(c.cloud),
@@ -1715,7 +1734,7 @@ def make_handler(cameras: dict, boot: "BootState"):
                 "streaming": c.is_streaming,
                 "fps": round(c.fps, 1),
                 "stats": c.stats,
-            } for u, c in cameras.items()], indent=2).encode(),
+            } for c in cams], indent=2).encode(),
                 "application/json")
 
         def _health(self):
@@ -1723,10 +1742,11 @@ def make_handler(cameras: dict, boot: "BootState"):
             # "error" for "could not reach the bridge at all", and a new value
             # here would be indistinguishable from that. The reason lives in
             # `boot` instead, which old readers simply ignore.
+            cams = snapshot()
             data = {
-                "status": "ok" if any(c.is_streaming for c in cameras.values()) else "degraded",
+                "status": "ok" if any(c.is_streaming for c in cams) else "degraded",
                 "boot": boot.snapshot(),
-                "cameras": [c.health() for c in cameras.values()],
+                "cameras": [c.health() for c in cams],
             }
             self._send(json.dumps(data, indent=2).encode(), "application/json")
 
@@ -1797,7 +1817,6 @@ sound until you interact &mdash; press play if silent.</p>
 
     return Handler
 
-
 def local_ip_for(target: str) -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -1825,9 +1844,10 @@ def main():
     try:
         with open(args.config) as fh:
             cfg = json.load(fh)
-    except OSError as e:
+    except (OSError, json.JSONDecodeError) as e:
         # The image ships no config, so this is what a forgotten -v looks like.
         # Under --restart unless-stopped a bare traceback here just loops.
+        # Malformed JSON lands here too: same exit, same actionable path.
         log.error("cannot read config %s: %s -- mount it into the container "
                   "with  -v /host/path/ziot_config.json:%s:ro",
                   args.config, e, args.config)
@@ -1861,7 +1881,7 @@ def main():
     boot = BootState()
     live: dict[str, ZiotCamera] = {}
     lock = threading.Lock()
-    cloud = CloudState(api, cfg["user_id"])
+    cloud = CloudState(api, cfg["user_id"], boot)
     stopping = threading.Event()
 
     def bring_up(cams) -> bool:
@@ -2017,9 +2037,11 @@ def main():
 
     # 8085 is what the README, the go2rtc examples and the watchdog assume.
     port = args.port or cfg.get("port", 8085)
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(live, boot))
+    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(live, boot, lock))
     log.info("serving on http://0.0.0.0:%d/", port)
-    for uid in live:
+    with lock:
+        serving = list(live)
+    for uid in serving:
         log.info("  view  http://localhost:%d/view/%s", port, uid)
         log.info("  video http://localhost:%d/cam/%s", port, uid)
         log.info("  audio http://localhost:%d/audio/%s", port, uid)
@@ -2032,7 +2054,9 @@ def main():
         stopping.set()
         server.shutdown()
         cloud.stop()
-        for z in live.values():
+        with lock:
+            stopping_cams = list(live.values())
+        for z in stopping_cams:
             z.stop()
 
 
