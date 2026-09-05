@@ -449,31 +449,6 @@ def parse_static_endpoints(raw: dict) -> dict:
 
 
 
-def _sweep_camera_port(ip: str) -> int:
-    """Sweep LAN ports for a camera responding to the vendor hello.
-
-    Sends the App send hello to each port in the ephemeral range and
-    returns the first port that sends back RTP data. Returns 0 if no
-    responder is found.
-    """
-    import socket as _socket
-    PUNCH = b"App send hello"
-    LO, HI = 32768, 61000
-    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-    sock.settimeout(0.2)
-    try:
-        for port in range(LO, HI + 1):
-            try:
-                sock.sendto(PUNCH, (ip, port))
-                data, _ = sock.recvfrom(65535)
-                if len(data) >= 12 and (data[0] >> 1 & 0x7F) == 26:
-                    return port
-            except _socket.timeout:
-                continue
-    finally:
-        sock.close()
-    return 0
-
 class GPS555:
     def __init__(self, token: str):
         self._h = {
@@ -1216,25 +1191,28 @@ class ZiotCamera:
                 except Exception:
                     pass
                 return False
-            # Discover the camera's listen port if not specified
-            punch_port = self._static_addr[1]
-            if punch_port == 0:
-                punch_port = _sweep_camera_port(self._static_addr[0])
-                if punch_port == 0:
-                    log.error("[%s] could not discover camera port for %s, try specifying ip:port in offline_endpoints",
-                     self.uid, self._static_addr[0])
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    return False
-            addr = (self._static_addr[0], punch_port)
+            # Install the socket before anything is sent. The camera, if it
+            # answers at all, sends RTP back to the source port of the hello,
+            # so the socket that sweeps must be the socket that receives — a
+            # probe socket that found the port and then closed it would be a
+            # new source port afterwards, and the reply would miss us. The
+            # receive thread (started by start() once this returns) reads the
+            # reply, sets `_media_source`, and `_punch_dest` follows it — no
+            # port number ever needs to be correlated with a hello.
             with self._sock_lock:
                 self.sock = sock
-                self.addr = addr
+                self.addr = self._static_addr
             self._note_endpoint("static")
-            log.info("[%s] camera at %s:%d (we are %s:%d) [offline, no token]",
-                     self.uid, addr[0], addr[1], self.bind_ip, port)
+            if self._static_addr[1] == 0:
+                log.info("[%s] sweeping %s for the listen port (we are "
+                         "%s:%d) [offline, no token]",
+                         self.uid, self._static_addr[0], self.bind_ip, port)
+                self._lan_resweep()
+            else:
+                log.info("[%s] camera at %s:%d (we are %s:%d) "
+                         "[offline, no token]",
+                         self.uid, self._static_addr[0], self._static_addr[1],
+                         self.bind_ip, port)
             self._last_re_rendezvous = time.monotonic()
             return True
 
@@ -1575,11 +1553,14 @@ class ZiotCamera:
     def _lan_resweep(self) -> None:
         """Hello-sweep the camera LAN IP from the existing socket.
 
-        Punch-only recovery must not rebind: the camera, if it answers at
-        all, sends RTP back to the source port of the hello. A new socket
-        would be a different source and the reply would miss us. The
-        receive thread is already running, so a matching SSRC sets
-        `_media_source` and `is_streaming` as packets arrive.
+        Punch-only must never rebind: the camera, if it answers at all, sends
+        RTP back to the source port of the hello. A new socket would be a
+        different source and the reply would miss us. Whatever `_media_source`
+        the sweep produces is set by the receive path as packets arrive —
+        during recovery the receive thread is already running; during the
+        first rendezvous the replies sit in the socket buffer until
+        `start()` starts it. No reply is ever correlated with a hello:
+        knowing the port number is not needed, only the packets are.
         """
         ip = (self._static_addr or (None, 0))[0]
         if not ip:
@@ -1613,7 +1594,13 @@ class ZiotCamera:
             self._consec_failures = 0
         else:
             self._consec_failures += 1
-        self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+        # The floor is what keeps a wake from killing the gate for good:
+        # update_cloud sets _backoff to 0.0 on a 0->1 online flip (the
+        # one-shot bypass is _last_re_rendezvous = 0.0, not the backoff),
+        # and min(0 * 2, MAX) would stay 0 forever — recovery would then
+        # hammer a full rendezvous every tick.
+        self._backoff = min(max(self._backoff, RECOVERY_INITIAL_BACKOFF) * 2,
+                            RECOVERY_MAX_BACKOFF)
 
     def _recovery_tick(self):
         """One pass of the recovery loop. `return` here means "done for now"."""
@@ -1744,16 +1731,31 @@ class ZiotCamera:
             addr = self.addr
         if len(packet) < 12:
             return False
+        # RTP v2 only — the same gate is_rtp_media applies. Everything below,
+        # SSRC learning included, must never see a non-RTP datagram: a hello
+        # echo (14 bytes that parse as RTP-ish) would otherwise be remembered
+        # as the camera's SSRC, after which the camera's real packets are
+        # dropped as foreign forever.
+        if packet[0] >> 6 != 2:
+            return False
+        # Payload type decides the kind here; the relay decides by channel.
+        # Both feed the same pipeline (ingest_rtp_media). The kind gate runs
+        # before SSRC learning for the same reason: it is the second thing a
+        # datagram must prove before any state is learned from it.
+        kind = {26: "video", 0: "audio"}.get(packet[1] & 0x7f)
+        if kind is None:
+            return False
         if self._ssrc is not None:
             ssrc = struct.unpack("!I", packet[8:12])[0]
-            # In offline mode without a token, learn the SSRC from the first valid
-            # camera packet rather than strictly matching the UID-mapped value,
-            # which the camera may not use when operating punch-only.
+            # In offline mode without a token, learn the SSRC from the first
+            # packet that passed the gates above rather than strictly
+            # matching the UID-mapped value, which the camera may not use
+            # when operating punch-only.
             if self.api is None and self._learned_ssrc is None:
                 self._learned_ssrc = ssrc
-            elif self._ssrc is not None and ssrc != self._ssrc:
+            elif ssrc != self._ssrc:
                 # If we have a learned SSRC (from offline mode), use that instead
-                if self.api is None and self._learned_ssrc is not None and ssrc == self._learned_ssrc:
+                if self.api is None and ssrc == self._learned_ssrc:
                     pass  # Accept packet with learned SSRC
                 else:
                     self.stats["foreign_ssrc"] += 1
@@ -1767,11 +1769,6 @@ class ZiotCamera:
             log.info("[%s] media arriving from %s while the broker says %s",
                      self.uid, source, addr)
         self._media_source = source
-        # Payload type decides the kind here; the relay decides by channel.
-        # Both feed the same pipeline (ingest_rtp_media).
-        kind = {26: "video", 0: "audio"}.get(packet[1] & 0x7f)
-        if kind is None:
-            return False
         return ingest_rtp_media(kind, packet, asm, self._on_frame,
                                 self._on_direct_audio, self._mark_rx)
 
@@ -2244,26 +2241,43 @@ def main():
     else:
         api = GPS555(cfg["token"])
 
+    # The device list needs an account id. The config may carry it, or the
+    # JWT's user_id claim does. Resolved once, here, because every use site
+    # below needs the resolved value, not the raw config key: with a
+    # token-only config, indexing cfg["user_id"] raised KeyError, which the
+    # boot retry loop caught and re-attempted forever as a fake cloud outage.
+    user_id = cfg.get("user_id")
+    if user_id is None and cfg.get("token"):
+        user_id = jwt_user_id(cfg["token"])
+
     if args.list_cameras:
         # One-shot and interactive: no fleet to strand and nobody watching
-        # /health, so let a cloud failure surface as it always has.
-        print_camera_table(api.list_cameras(cfg["user_id"]))
+        # /health, so let a cloud failure surface as it always has. But a
+        # missing user_id is not a cloud failure -- retrying cannot invent
+        # one -- so it is a config error like an unreadable file.
+        if user_id is None:
+            log.error("no user_id in %s and the token carries none -- add "
+                      "\"user_id\" (or use a token that has one); the device "
+                      "list cannot be fetched without it", args.config)
+            raise SystemExit(2)
+        print_camera_table(api.list_cameras(user_id))
         return
 
     boot = BootState()
     live: dict[str, ZiotCamera] = {}
     lock = threading.Lock()
-    user_id = cfg.get("user_id")
-    if user_id is None and cfg.get("token"):
-        user_id = jwt_user_id(cfg["token"])
     if api is None:
         cloud = None
     elif user_id is None:
-        cloud = None
         if not offline:
-            # Online path requires user_id for the device list; CloudState
-            # would not have an id to poll with either.
-            log.warning("no user_id in config or token — cloud flags disabled")
+            # Same two-tier rule as the rejected token at startup: nothing is
+            # serving yet and no retry can help, so this is a config error.
+            log.error("no user_id in %s and the token carries none -- add "
+                      "\"user_id\" (or use a token that has one); the device "
+                      "list cannot be fetched without it", args.config)
+            raise SystemExit(2)
+        # --offline needs no roster from the cloud; the token still signals.
+        cloud = None
     else:
         cloud = CloudState(api, user_id, boot)
     stopping = threading.Event()
@@ -2396,7 +2410,7 @@ def main():
                 return
             attempt += 1
             try:
-                cams = api.list_cameras(cfg["user_id"])
+                cams = api.list_cameras(user_id)
             except Exception as e:
                 if is_auth_failure(e):
                     # We are already serving, so park and say so on /health
@@ -2425,7 +2439,7 @@ def main():
                      "notify/keepalive", len(static))
     else:
         try:
-            cams = api.list_cameras(cfg["user_id"])
+            cams = api.list_cameras(user_id)
         except Exception as e:
             if is_auth_failure(e):
                 # Nothing is serving yet and no token un-expires itself, so this is

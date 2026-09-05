@@ -86,7 +86,7 @@ Create `ziot_config.json` next to the script:
 | `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state. Ignored under `--offline` |
 | `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
 | `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Unset by default — the relay is not known to authenticate, and the bridge fails loudly rather than guessing |
-| `offline` / `offline_endpoints` | no | Roster from LAN targets instead of `GET /v1/ipc`: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75"}}`. IP only is enough — the listen port rotates and comes from STUN. A token in the same file still does notify/keepalive. See "Running without the device list" |
+| `offline` / `offline_endpoints` | no | Roster from LAN targets instead of `GET /v1/ipc`: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75"}}`. With a token, IP only is enough — the listen port rotates and comes from STUN. Punch-only (no token), IP only makes the bridge hello-sweep the ephemeral range from its own socket; `ip:port` from a probe HIT skips the sweep. A token in the same file still does notify/keepalive. See "Running without the device list" |
 
 ```bash
 chmod 600 ziot_config.json    # it holds an account credential
@@ -212,7 +212,13 @@ Omit the token only if `ziot_offline_probe.py` reports a HIT. Then the
 bridge punches that host, hello-sweeps when starved, and will not rebind
 the local socket (a new source port would miss replies aimed at the old
 one). The probe requires RTP v2 with PT 0 or 26, so an echo of
-`App send hello` is not a hit.
+`App send hello` is not a hit. The bridge does not need the probe's port
+number, though: give `offline_endpoints` the IP only and the bridge
+hello-sweeps the ephemeral range **from its own listening socket** — a
+reply is RTP arriving on that socket, and the punch loop follows the
+source. The sweep is paced (~2000 hellos/s, ~14 s over the Linux
+ephemeral range) and runs on the rendezvous socket, never on a throwaway
+probe socket that would close before the reply lands.
 
 ```bash
 python3 ziot_offline_probe.py 192.168.18.75 --uid 141030191094
@@ -723,11 +729,22 @@ reliability improvements were added during deployment:
   path stays down, and returns to direct as soon as it recovers.
 * **`--offline`** — roster from `offline_endpoints` instead of the device
   list; a token in the same config still does notify/keepalive (required
-  on TXW817). Pins the LAN IP and follows the STUN private port.
+  on TXW817). Pins the LAN IP and follows the STUN private port. Punch-only
+  entries accept an IP only: the rendezvous socket itself hello-sweeps the
+  ephemeral range, and the camera's RTP identifies the port.
 * **No-rebind recovery** — while a camera is cloud-offline the same local
   UDP port is reannounced instead of rebound (a 176-rendezvous loop used
   to close the socket the camera would send to). Punch-only cameras
-  hello-sweep from the existing socket.
+  hello-sweep from the existing socket, at rendezvous and on recovery
+  alike; SSRC learning accepts only RTP v2 with PT 0/26, so a hello echo
+  cannot poison it.
+* **Config errors that retrying cannot fix** — a token-only config
+  (no `user_id` in the file or the JWT) used to surface as a `KeyError`
+  the boot retry loop caught and repeated forever as a fake cloud outage;
+  it now exits 2 naming the fix, and `--list-cameras` says so instead of
+  tracebacking. A failed attempt after a wake keeps its backoff: the wake
+  sets `_backoff` to 0 for its one-shot bypass, and doubling from 0 had
+  pinned recovery at zero interval.
 * **Wake on 0→1** — full rendezvous the moment `onlineState` flips, rather
   than sitting in a 60 s backoff through a battery camera's awake window.
 * **Probe requires RTP v2 PT 0/26** — an echo of `App send hello` is not a
