@@ -49,18 +49,28 @@ def parse_ports(spec: str) -> list:
             continue
         if "-" in part:
             lo, hi = part.split("-", 1)
-            ports.update(range(int(lo), int(hi) + 1))
+            lo, hi = int(lo), int(hi)
+            if not (1 <= lo <= 65535 and 1 <= hi <= 65535):
+                raise ValueError(f"port out of range 1-65535: {lo}-{hi}")
+            if lo > hi:
+                raise ValueError(f"inverted range: {lo}-{hi}")
+            ports.update(range(lo, hi + 1))
         else:
-            ports.add(int(part))
+            p = int(part)
+            if not 1 <= p <= 65535:
+                raise ValueError(f"port out of range 1-65535: {p}")
+            ports.add(p)
     return sorted(ports)
 
 
 def describe(payload: bytes) -> str:
+    # Length first: a 0/1-byte datagram must not index payload[1] here --
+    # an IndexError in the report loop kills the probe before it prints.
+    if len(payload) < 12:
+        return f"{len(payload)}B non-RTP"
     pt = payload[1] & 0x7F
-    ssrc = struct.unpack("!I", payload[8:12])[0] if len(payload) >= 12 else 0
+    ssrc = struct.unpack("!I", payload[8:12])[0]
     if not is_rtp_media(payload):
-        if len(payload) < 12:
-            return f"{len(payload)}B non-RTP"
         return f"non-RTP (v{(payload[0] >> 6)} pt={pt} ssrc=0x{ssrc:08x})"
     return f"ssrc=0x{ssrc:08x} pt={pt}"
 
@@ -73,7 +83,8 @@ def main() -> int:
     ap.add_argument("--uid", default=None,
                     help="camera UID: only its SSRC counts as a hit")
     ap.add_argument("--rate", type=float, default=2000,
-                    help="hellos per second (default 2000)")
+                    help="ports per second; each port gets a hello and a "
+                         "heart, so the wire rate is 2x this (default 2000)")
     ap.add_argument("--listen", type=float, default=5.0,
                     help="seconds to keep listening after the sweep")
     ap.add_argument("--bind-ip", default=None,

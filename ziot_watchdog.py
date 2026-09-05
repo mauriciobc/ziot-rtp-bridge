@@ -99,6 +99,16 @@ def go2rtc_has_video(info) -> bool:
     )
 
 
+# Consecutive dead observations before a stream counts as dead and a restart
+# is allowed. go2rtc right after a Frigate restart has no producers yet; a
+# restart triggered on the first zero-byte observation self-triggers on the
+# startup transient it caused. It also softens a wrong field-name guess:
+# a schema mismatch degrades to "never restarts" instead of a restart loop.
+DEAD_GRACE_TICKS = 2
+# dead streaks per stream name, across cron runs. Cleared on ok/idle.
+_DEAD_STREAK: dict = {}
+
+
 def go2rtc_stream_state(name, info, cams_by_uid) -> str:
     """`ok`, `idle` (camera is dark — not a go2rtc fault), or `dead`."""
     producers = info.get("producers") or []
@@ -171,7 +181,16 @@ def main():
                 # directly — worth surfacing, not worth restarting anything.
                 issues.append(f"{uid}: streaming via relay, not direct")
 
-            status = "OK" if streaming and fps >= MIN_FPS else "DEGRADED"
+            if streaming and fps >= MIN_FPS:
+                status = "OK"
+            elif not streaming and last_rx is not None and last_rx <= 30:
+                # Tolerated blip, might recover: not an issue, but it must
+                # not print as OK either -- DEGRADED would imply trouble
+                # worth acting on, and this line used to be followed by
+                # "ALL HEALTHY" with no way to tell the two apart.
+                status = "BLIP"
+            else:
+                status = "DEGRADED"
             state = f"online={online}, free={free}" if online is not None else \
                     f"online={cam.get('online_state')}, media={cam.get('media_state')}"
             seen = "never" if last_rx is None else f"{last_rx}s ago"
@@ -193,14 +212,24 @@ def main():
             consumers = info.get("consumers", []) or []
             state = go2rtc_stream_state(name, info, cams_by_uid)
             if state == "ok":
+                _DEAD_STREAK.pop(name, None)
                 print(f"  [OK] go2rtc/{name}: {len(producers)} producers, "
                       f"{len(consumers)} consumers")
             elif state == "idle":
+                _DEAD_STREAK.pop(name, None)
                 uid = go2rtc_stream_uid(name, info)
                 print(f"  [IDLE] go2rtc/{name}: camera {uid} not streaming")
             else:
-                go2rtc_dead = True
+                streak = _DEAD_STREAK.get(name, 0) + 1
+                _DEAD_STREAK[name] = streak
                 why = "no producers" if not producers else "0 video bytes"
+                if streak < DEAD_GRACE_TICKS:
+                    issues.append(f"go2rtc/{name}: {why} "
+                                  f"(blip {streak}/{DEAD_GRACE_TICKS})")
+                    print(f"  [BLIP] go2rtc/{name}: {why} ({streak} of "
+                          f"{DEAD_GRACE_TICKS} ticks — not restarting yet)")
+                    continue
+                go2rtc_dead = True
                 issues.append(f"go2rtc/{name}: {why}")
                 print(f"  [DEAD] go2rtc/{name}: {why}")
 

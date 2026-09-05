@@ -1,6 +1,5 @@
 """Behavior regressions for direct/relay RTP acceptance and startup validation."""
 import http.client
-import inspect
 import json
 import queue
 import socket
@@ -1798,12 +1797,9 @@ class HttpTokenTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.get(port, path).status, 200)
 
-    def test_handler_stream_timeout_is_set(self):
-        """The class attribute becomes the connection socket's timeout: a
-        client that stops reading must not pin its handler thread forever."""
-        Handler = bridge.make_handler({}, bridge.BootState(),
-                                      threading.Lock())
-        self.assertEqual(Handler.timeout, 30)
+    # (The 30s connection-timeout value itself is deliberately not pinned --
+    # it is a tuning constant. The behavioral pin is the stalled-write test
+    # below: a TimeoutError on write must end the pump like a hangup.)
 
     def test_a_stalled_write_ends_the_pump(self):
         """The 30s connection timeout surfaces as TimeoutError on write;
@@ -1875,10 +1871,15 @@ class NotifyTimeoutTests(unittest.TestCase):
         self.assertEqual(stun_timeout, bridge.STUN_ADDR_TIMEOUT)
 
     def test_the_device_list_keeps_the_leisurely_default(self):
-        # list_cameras passes no timeout: it rides _get's default.
-        default = inspect.signature(bridge.GPS555._get).\
-            parameters["timeout"].default
-        self.assertEqual(default, bridge.CLOUD_TIMEOUT)
+        """Behavioral, at the urlopen boundary: the device list passes no
+        short timeout of its own, so it rides _get's 10s default."""
+        api = bridge.GPS555("t")
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = b'{"data": {"list": []}}'
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               return_value=cm) as uo:
+            api.list_cameras(1)
+        self.assertEqual(uo.call_args.kwargs["timeout"], bridge.CLOUD_TIMEOUT)
 
 
 class DigestRelayTests(unittest.TestCase):
@@ -2073,6 +2074,190 @@ class ReannounceBackoffTests(unittest.TestCase):
         # The wake goes straight at a full re-rendezvous, not a reannounce.
         cam._open_transport.assert_called_once()
         cam._reannounce.assert_not_called()
+
+
+class StunSeqTests(unittest.TestCase):
+    """The hard constraint: a STUN answer with a lower seqNo than the last
+    one taken is stale and must be rejected (the app's
+    _isValidStunResponse). Nothing pinned this, so it could regress green."""
+
+    def make_cam(self):
+        return make_camera()
+
+    def accept(self, cam, d):
+        return cam._accept_stun(d)
+
+    def test_a_lower_seqno_is_rejected_and_does_not_move_state(self):
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertEqual(cam._stun_seq, 10)
+        with self.assertLogs(bridge.log, "WARNING") as logs:
+            self.assertFalse(self.accept(cam, {"seqNo": 9}))
+        self.assertEqual(cam._stun_seq, 10)
+        self.assertIn("stale stun rejected", "\n".join(logs.output))
+
+    def test_equal_and_higher_seqno_are_accepted(self):
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertTrue(self.accept(cam, {"seqNo": 11}))
+        self.assertEqual(cam._stun_seq, 11)
+
+    def test_a_missing_or_unreadable_seqno_is_accepted(self):
+        """No usable seqNo must not stall us: accept rather than wedge."""
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {}))
+        self.assertTrue(self.accept(cam, {"seqNo": None}))
+        self.assertTrue(self.accept(cam, {"seqNo": "nope"}))
+
+    def test_a_reannounce_forgets_the_sequence(self):
+        """A camera that rebooted restarts seqNo at the bottom; the last
+        taken seqNo would reject every fresh answer as stale until the
+        sequence was forgotten."""
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1")
+        cam.sock = bind_loopback()
+        self.addCleanup(cam.sock.close)
+        cam.addr = ("1.2.3.4", 9)
+        self.assertTrue(cam._accept_stun({"seqNo": 99}))
+        self.assertEqual(cam._stun_seq, 99)
+        cam._reannounce()
+        self.assertEqual(cam._stun_seq, 1)      # fresh answer accepted
+        self.assertEqual(cam.addr, ("1.2.3.4", 9))
+        cam.stop()
+
+
+class KeepaliveCadenceTests(unittest.TestCase):
+    """The session dies ~12s without notify(keepAlive) every 2s. Nothing
+    pinned the cadence, so raising the interval past the death window would
+    kill sessions silently."""
+
+    def test_the_interval_leaves_room_inside_the_death_window(self):
+        self.assertLess(bridge.KEEPALIVE_INTERVAL + bridge.NOTIFY_TIMEOUT, 12)
+
+    def test_keepalive_notifies_every_interval(self):
+        cam = make_camera()
+        intervals = []
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+
+        def wait(t):
+            intervals.append(t)
+            if len(intervals) >= 3:
+                cam._stop.is_set.return_value = True
+            return True
+
+        cam._stop.wait = wait
+        cam._keepalive()
+        self.assertEqual(intervals, [bridge.KEEPALIVE_INTERVAL] * 3)
+        self.assertEqual(cam.api.notify.call_count, 3)
+        cam.api.notify.assert_called_with(CAM_UID, bridge.EVENT_KEEPALIVE)
+
+
+class RendezvousOrderTests(unittest.TestCase):
+    """Rendezvous is send-stun-addr -> notify(start) -> poll, in that order,
+    and never a send-cmd (its "20" is speakOff, not a live-view command)."""
+
+    def test_register_then_wake_then_poll_and_never_send_cmd(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9", "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1")
+        self.addCleanup(cam.stop)
+        self.assertTrue(cam._rendezvous())
+        api.assert_has_calls([
+            mock.call.send_stun_addr(CAM_UID, "127.0.0.1", mock.ANY),
+            mock.call.notify(CAM_UID, bridge.EVENT_START),
+        ], any_order=False)
+        api.send_cmd.assert_not_called()
+        self.assertEqual(cam.addr, ("1.2.3.4", 9))
+
+
+class NotifyBodyTests(unittest.TestCase):
+    """notify() rides _data() like every other cloud call: a 200 + {"code":
+    401} body must raise CloudError, not vanish. Verified live, a success is
+    {"code": 200, "msg": "OK", "data": "ok"}."""
+
+    def test_a_rejected_notify_raises(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(api, "_get",
+                               return_value={"code": 401, "msg": "Erro"}):
+            with self.assertRaises(bridge.CloudError) as cm:
+                api.notify("u", bridge.EVENT_START)
+        self.assertEqual(cm.exception.code, 401)
+
+    def test_a_successful_notify_returns_the_data(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(
+                api, "_get",
+                return_value={"code": 200, "msg": "OK", "data": "ok"}):
+            self.assertEqual(api.notify("u", bridge.EVENT_KEEPALIVE), "ok")
+
+
+class CloudPollerFanoutTests(unittest.TestCase):
+    """The poller daemon thread must survive a device list that carries
+    garbage: one non-dict row used to kill _run silently and every camera
+    served stale flags forever with nothing on /health saying why."""
+
+    def test_a_non_dict_row_does_not_kill_the_poll(self):
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [
+            "garbage", {"uid": CAM_UID, "onlineState": "1"}, 42]
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cam = make_camera()
+        cam.update_cloud = mock.Mock()
+        cloud.register(cam)
+        cloud.poll()                     # must not raise
+        cam.update_cloud.assert_called_once()
+        self.assertEqual(boot.snapshot()["phase"], "ready")
+
+    def test_a_failing_fanout_counts_as_a_poll_failure(self):
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cam = make_camera()
+        cam.update_cloud = mock.Mock(side_effect=RuntimeError("boom"))
+        cloud.register(cam)
+        cloud.poll()        # must not raise -- the failure is accounted
+        self.assertEqual(cloud._fails, 1)   # stale flags get the warning path
+
+
+class RecoveryWakeDuringBackoffTests(unittest.TestCase):
+    """update_cloud's 0->1 wake must not wait out a post-attempt backoff
+    sleep: the sleep used to be one monolithic _stop.wait(self._backoff) of
+    up to 60s, and a battery camera's awake window does not survive that."""
+
+    def test_a_wake_during_the_backoff_sleep_interrupts_it(self):
+        cam = make_camera()
+        cam._backoff = 30.0
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._open_transport = mock.Mock(return_value=True)
+        done = threading.Event()
+
+        def tick():
+            cam._recovery_tick()
+            done.set()
+
+        worker = threading.Thread(target=tick, daemon=True)
+        worker.start()
+        time.sleep(1.5)                 # the tick is now inside its 30s sleep
+        cam._wake_now = True            # what update_cloud does on a 0->1
+        self.assertTrue(done.wait(10), "recovery slept through the wake")
+        worker.join(timeout=5)
+        cam._open_transport.assert_called_once()
+        self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":

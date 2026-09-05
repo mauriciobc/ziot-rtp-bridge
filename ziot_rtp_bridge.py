@@ -501,10 +501,20 @@ class GPS555:
 
     def notify(self, uid, event_type: int):
         """GET /v1/ipc/notify-live-event — event_type is a CameraEventType value
-        (EVENT_START, EVENT_KEEPALIVE, EVENT_STOP, EVENT_RELAY, ...)."""
-        self._get("/v1/ipc/notify-live-event",
-                  timeout=NOTIFY_TIMEOUT,
-                  appId=APP_ID, eventType=event_type, uid=uid)
+        (EVENT_START, EVENT_KEEPALIVE, EVENT_STOP, EVENT_RELAY, ...).
+
+        Routed through _data() like every other cloud call: the API reports
+        rejections as 200 + {"code": ...} and only _data turns those into
+        CloudError. Verified live: a success is
+        {"code": 200, "msg": "OK", "data": "ok"} -- it carries "data", so
+        cloud_error_code passes it. Discarding the body here used to swallow
+        a rejected notify(start), leaving rendezvous waiting ~5s for an
+        address the camera was never woken to send.
+        """
+        return self._data(self._get(
+            "/v1/ipc/notify-live-event",
+            timeout=NOTIFY_TIMEOUT,
+            appId=APP_ID, eventType=event_type, uid=uid))
 
     def _post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
@@ -999,9 +1009,13 @@ class RelayStream:
                     self._cseq += 1
                     if sock is not self._sock or self._sock is None:
                         return          # closed under us; never send on it
-                    sock.sendall(
-                        f"OPTIONS {self.url} RTSP/1.0\r\nCSeq: {self._cseq}\r\n"
-                        f"Session: {self._session}\r\n\r\n".encode())
+                    req = (f"OPTIONS {self.url} RTSP/1.0\r\n"
+                           f"CSeq: {self._cseq}\r\n")
+                    if self._session:
+                        # SETUP that never issued a session must not get a
+                        # literal "Session: None".
+                        req += f"Session: {self._session}\r\n"
+                    sock.sendall((req + "\r\n").encode())
         except (ConnectionError, OSError) as e:
             log.warning("[%s] relay stream ended: %s", self.tag, e)
 
@@ -1579,6 +1593,11 @@ class ZiotCamera:
             self.api.notify(self.uid, EVENT_START)
         except Exception as e:
             log.warning("[%s] notify(start): %s", self.uid, e)
+        # A camera that rebooted restarts its seqNo at the bottom; the last
+        # seqNo we hold would reject every fresh answer as stale until a
+        # full re-rendezvous reset it. A reannounce is itself a restart of
+        # the STUN conversation, so forget the sequence like _rendezvous does.
+        self._stun_seq = None
         self._last_resolve = float("-inf")
         self._resolve()
 
@@ -1720,8 +1739,17 @@ class ZiotCamera:
             log.error("[%s] %s failed", self.uid, what)
         # Either way the attempt costs one backoff, after which the attempt
         # is accounted exactly once: streaming resets the count, failure
-        # counts and doubles.
-        self._stop.wait(self._backoff)
+        # counts and doubles. The wait is sliced: update_cloud's 0->1 wake
+        # sets _wake_now, and a battery camera's awake window does not
+        # survive a 60s monolithic sleep.
+        waited = 0.0
+        while (waited < self._backoff and not self._stop.is_set()
+                and not self._wake_now):
+            step = min(1.0, self._backoff - waited)
+            self._stop.wait(step)
+            # _stop.wait's return value is not to be trusted under a mock;
+            # is_set plus the wall clock own the exit.
+            waited += self._backoff if self._stop.is_set() else step
         self._record_attempt(ok and self.is_streaming)
 
         # The direct path is not coming back — try the vendor relay, which
@@ -1966,6 +1994,18 @@ class CloudState:
     def poll(self) -> None:
         try:
             rows = self.api.list_cameras(self.user_id)
+            # The whole fan-out lives under this try, not just the fetch:
+            # one non-dict row (or a "list" that is not a list) raising here
+            # would kill the poller daemon thread silently, and every camera
+            # would serve stale flags forever with nothing on /health saying
+            # why.
+            by_uid = {r.get("uid"): r for r in rows if isinstance(r, dict)}
+            with self._lock:
+                cams = list(self._cams.values())
+            for cam in cams:
+                row = by_uid.get(cam.uid)
+                if row:
+                    cam.update_cloud(row)
         except Exception as e:
             self._fails += 1
             if is_auth_failure(e) and not self._auth_failed:
@@ -1998,13 +2038,6 @@ class CloudState:
                      "auth failure")
             if self.boot is not None:
                 self.boot.set("ready", None)
-        by_uid = {r.get("uid"): r for r in rows}
-        with self._lock:
-            cams = list(self._cams.values())
-        for cam in cams:
-            row = by_uid.get(cam.uid)
-            if row:
-                cam.update_cloud(row)
 
 
 class BootState:
@@ -2498,7 +2531,22 @@ def main():
             return
 
     # 8085 is what the README, the go2rtc examples and the watchdog assume.
-    port = args.port or cfg.get("port", 8085)
+    # --port is argparse-validated as an int; a config port is anything the
+    # file said, so it gets the loud-default treatment punch_interval gets.
+    # 0 is legitimate: it binds an ephemeral port.
+    if args.port is not None and not 0 <= args.port <= 65535:
+        ap.error(f"--port {args.port} must be between 0 and 65535")
+    port = args.port
+    if port is None:
+        raw_port = cfg.get("port", 8085)
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            port = None
+        if port is None or not 0 <= port <= 65535:
+            log.error("port %r must be an integer between 0 and 65535 -- "
+                      "using 8085", raw_port)
+            port = 8085
     # Bind before bring_up: BootState exists precisely so /health can answer
     # "starting" while cameras are still rendezvousing, and the watchdog's
     # boot-phase logic depends on that -- a bridge that binds only after a

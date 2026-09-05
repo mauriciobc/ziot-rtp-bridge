@@ -243,6 +243,9 @@ docker run -d --name ziot-bridge \
   ziot-bridge
 ```
 
+If the config's `port` is not `8085`, keep the image's HEALTHCHECK in sync
+with `-e BRIDGE_PORT=<port>` — the Dockerfile defaults it to `8085`.
+
 The runtime configuration is deliberately excluded from the build context and
 image and must be supplied through the shown read-only mount. Forget it and the
 bridge exits 2 with a log line naming the mount it wanted, rather than a bare
@@ -432,12 +435,13 @@ Append `#hardware` to the h264 line for VAAPI / NVENC / VideoToolbox.
 ```yaml
 webrtc:
   listen: ":8555"
+  # Candidates are host:port pairs, not URIs. "stun:8555" parses as host
+  # "stun" and never answers.
   candidates:
-    - stun:8555
+    - 192.168.18.6:8555
 ```
 
-`stun:8555` advertises the host's own address. Pin a LAN IP instead
-(`192.168.18.6:8555`) on a multi-homed box. WebRTC does not work through
+Pin the host's own LAN IP (`192.168.18.6:8555` here) on a multi-homed box. WebRTC does not work through
 Cloudflare tunnels without TURN — MSE fallback is used automatically.
 
 ---
