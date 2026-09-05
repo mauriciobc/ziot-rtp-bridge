@@ -1515,12 +1515,18 @@ sound until you interact &mdash; press play if silent.</p>
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             try:
+                idle = 0
                 with cam.video.subscribe() as q:
                     while True:
                         try:
                             frame = q.get(timeout=10)
                         except queue.Empty:
+                            idle += 1
+                            if idle >= 3:
+                                log.warning("[%s] viewer idle timeout", cam.uid)
+                                break
                             continue
+                        idle = 0
                         self.wfile.write(
                             b"--frame\r\nContent-Type: image/jpeg\r\n"
                             b"Content-Length: " + str(len(frame)).encode()
@@ -1537,12 +1543,18 @@ sound until you interact &mdash; press play if silent.</p>
             try:
                 self.wfile.write(wav_header())
                 self.wfile.flush()
+                idle = 0
                 with cam.audio.subscribe() as q:
                     while True:
                         try:
                             chunk = q.get(timeout=10)
                         except queue.Empty:
+                            idle += 1
+                            if idle >= 3:
+                                log.warning("[%s] audio viewer idle timeout", cam.uid)
+                                break
                             continue
+                        idle = 0
                         self.wfile.write(chunk)
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
