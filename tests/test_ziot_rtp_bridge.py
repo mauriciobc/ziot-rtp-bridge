@@ -690,35 +690,52 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertIn("-v /host/path/ziot_config.json", "\n".join(logs.output))
         gps.assert_not_called()
 
-    def test_malformed_config_exits_2_with_the_mount_hint(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json",
-                                         delete=False) as f:
-            f.write("{not valid json")
-            path = f.name
-        self.addCleanup(Path(path).unlink, missing_ok=True)
+    def run_main_on(self, path):
         sys.argv = ["ziot_rtp_bridge.py", "--config", path]
         with mock.patch.object(bridge, "GPS555") as gps:
             with self.assertLogs(bridge.log, "ERROR") as logs:
                 with self.assertRaises(SystemExit) as cm:
                     bridge.main()
-        self.assertEqual(cm.exception.code, 2)
-        self.assertIn(path, "\n".join(logs.output))
         gps.assert_not_called()
+        return cm.exception.code, "\n".join(logs.output)
 
-    def test_non_utf8_config_exits_2_with_the_mount_hint(self):
-        with tempfile.NamedTemporaryFile(suffix=".json",
+    def write_config(self, data, mode="w"):
+        with tempfile.NamedTemporaryFile(mode, suffix=".json",
                                          delete=False) as f:
-            f.write(b'{"token": "\xff\xfe not utf-8"}')
+            f.write(data)
             path = f.name
         self.addCleanup(Path(path).unlink, missing_ok=True)
-        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
-        with mock.patch.object(bridge, "GPS555") as gps:
-            with self.assertLogs(bridge.log, "ERROR") as logs:
-                with self.assertRaises(SystemExit) as cm:
-                    bridge.main()
-        self.assertEqual(cm.exception.code, 2)
-        self.assertIn(path, "\n".join(logs.output))
-        gps.assert_not_called()
+        return path
+
+    def test_malformed_config_blames_the_file_not_the_mount(self):
+        """The file was read, so the mount is already right. Pointing at it
+        sends whoever is reading the logs to check the wrong thing."""
+        path = self.write_config("{not valid json")
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertIn(path, out)
+        self.assertIn("is not valid JSON", out)
+        self.assertNotIn("-v /host/path/ziot_config.json", out)
+
+    def test_malformed_config_keeps_the_parser_position(self):
+        path = self.write_config('{"token": "t",\n')
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r"line \d+ column \d+")
+
+    def test_non_utf8_config_blames_the_file_not_the_mount(self):
+        path = self.write_config(b'{"token": "\xff\xfe not utf-8"}', mode="wb")
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertIn(path, out)
+        self.assertIn("is not valid JSON", out)
+        self.assertNotIn("-v /host/path/ziot_config.json", out)
+
+    def test_an_unreadable_config_still_names_the_mount(self):
+        code, out = self.run_main_on("/nonexistent/dir/ziot_config.json")
+        self.assertEqual(code, 2)
+        self.assertIn("-v /host/path/ziot_config.json", out)
+        self.assertNotIn("is not valid JSON", out)
 
 
 class StubCam:

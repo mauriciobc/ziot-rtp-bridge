@@ -80,10 +80,13 @@ chmod 600 ziot_config.json    # it holds an account credential
 **Startup failures are deliberately two-tier.** The rule is whether retrying
 could ever help.
 
-*Fatal, exits `2`:* a config the bridge cannot read (nothing to run), and a
-token the cloud rejects on the very first call (no token un-expires itself, and
-nothing is serving yet, so this is a config error like any other). Both name
-what to fix.
+*Fatal, exits `2`:* a config the bridge cannot read or cannot parse (nothing to
+run), and a token the cloud rejects on the very first call (no token un-expires
+itself, and nothing is serving yet, so this is a config error like any other).
+Each names what to fix, and the two config cases are told apart deliberately —
+an unreadable file names the mount, while a file that read fine but is not
+valid JSON says so and gives the parser's line and column, because sending you
+to check a mount that is already correct wastes the first thing you try.
 
 *Never fatal:* a bad config *value* is logged and replaced with its default; an
 unreachable cloud binds the HTTP port anyway and retries the device list in the

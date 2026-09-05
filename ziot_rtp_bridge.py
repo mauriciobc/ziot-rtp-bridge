@@ -1844,13 +1844,21 @@ def main():
     try:
         with open(args.config) as fh:
             cfg = json.load(fh)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        # The image ships no config, so this is what a forgotten -v looks like.
-        # Under --restart unless-stopped a bare traceback here just loops.
-        # Malformed JSON lands here too: same exit, same actionable path.
+    except OSError as e:
+        # The file is not there or not readable. The image ships no config, so
+        # this is what a forgotten -v looks like, and under
+        # --restart unless-stopped a bare traceback here just loops.
         log.error("cannot read config %s: %s -- mount it into the container "
                   "with  -v /host/path/ziot_config.json:%s:ro",
                   args.config, e, args.config)
+        raise SystemExit(2)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # Read fine, parsed badly. Naming the mount here would send whoever is
+        # reading the logs to check a mount that is already correct; the file
+        # itself is what needs editing, and the parser already said where.
+        log.error("config %s is not valid JSON: %s -- the file was read, so "
+                  "the mount is fine; fix the file at that position",
+                  args.config, e)
         raise SystemExit(2)
 
     global PUNCH_INTERVAL
