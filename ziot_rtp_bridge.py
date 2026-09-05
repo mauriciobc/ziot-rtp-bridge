@@ -30,6 +30,7 @@ import socket
 import struct
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
@@ -77,6 +78,14 @@ PUNCH_INTERVAL = 1.0
 HEART_EVERY_N_PUNCHES = 5
 # Must stay above PUNCH_INTERVAL -- if you retune one, look at the other.
 STARVED_THRESHOLD = 2.0        # re-resolve after 2s of silence
+# Floor between two STUN lookups. get_stun_addr blocks for up to 10s and the
+# punch loop asks for one on every tick without media, so an unfloored resolve
+# stretches the 1s punch cadence to 10s and hits the STUN endpoint once a
+# second per camera -- starving the NAT mapping the punches exist to keep warm.
+RESOLVE_MIN_INTERVAL = 5.0
+# Per-packet conditions log at most this often. At 15 fps a line per packet
+# buries every other log the bridge writes, indefinitely.
+LOG_THROTTLE_INTERVAL = 60.0
 FPS_LOG_INTERVAL = 30           # log fps every 30s
 RECOVERY_DEAD_THRESHOLD = 10.0  # start recovery after 10s dead
 RECOVERY_MAX_BACKOFF = 60.0     # max wait between re-rendezvous attempts
@@ -200,6 +209,66 @@ def same_subnet(a: str, b: str, mask: str = STUN_SUBNET_MASK) -> bool:
     return (ia & im) == (ib & im)
 
 
+class CloudError(Exception):
+    """An error the cloud reported in the body of a 200 OK.
+
+    This API does not use HTTP status codes for its own failures: a rejected
+    token comes back as 200 with {"code": 401, "msg": "Erro comum"} and no
+    "data" key, so the body is the only place the rejection appears. Reading
+    ["data"] straight off that answer raises KeyError('data'), which says
+    nothing about what actually went wrong.
+    """
+
+    def __init__(self, code: int, msg: str):
+        super().__init__(f"cloud error {code}: {msg or 'no message'}")
+        self.code = code
+        self.msg = msg
+
+
+def cloud_error_code(body: dict) -> int | None:
+    """The error code in a cloud response, or None if it carried data.
+
+    A response with "data" is a success by definition -- every caller here
+    indexes it -- so this can only ever fire on an answer that was going to
+    raise KeyError anyway.
+    """
+    if not isinstance(body, dict) or "data" in body:
+        return None
+    try:
+        return int(body.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_auth_failure(e: BaseException) -> bool:
+    """True for a cloud rejection no amount of retrying will fix.
+
+    The token is a JWT and they expire, so 401/403 is a config error dressed
+    as a network error -- worth separating from a cloud outage, which is
+    exactly the kind of thing retrying does fix. Both spellings count: the
+    HTTP status, and the code this API actually uses, in the body.
+    """
+    if isinstance(e, CloudError):
+        return e.code in (401, 403)
+    return isinstance(e, urllib.error.HTTPError) and e.code in (401, 403)
+
+
+def uid_ssrc(uid: str) -> int | None:
+    """The SSRC this camera stamps on its RTP, or None if the UID is not the
+    form the mapping assumes.
+
+    The UID's last 8 decimal digits are reused as the SSRC's hex digits:
+    141030191094 -> 0x30191094. This is the only per-camera identifier in the
+    media path, and the only sound way to tell our camera's packets from
+    anyone else's -- the source address cannot do it, since the address the
+    STUN broker reports and the address the camera actually sends from
+    routinely disagree.
+    """
+    if not uid or not uid.isascii() or not uid.isdigit() or len(uid) < 8:
+        return None
+    return int(uid[-8:], 16)
+
+
 _VERSION_RE = re.compile(r"V?(\d+(?:\.\d+)+)")
 
 
@@ -299,16 +368,24 @@ class GPS555:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
 
+    @staticmethod
+    def _data(body: dict) -> dict:
+        """The "data" payload, or a CloudError naming what the cloud said."""
+        code = cloud_error_code(body)
+        if code is not None:
+            raise CloudError(code, str(body.get("msg", "")))
+        return body["data"]
+
     def list_cameras(self, user_id: int) -> list[dict]:
-        return self._get("/v1/ipc", terminalFamilyId=user_id)["data"]["list"]
+        return self._data(self._get("/v1/ipc", terminalFamilyId=user_id))["list"]
 
     def send_stun_addr(self, uid, ip, port):
-        return self._get("/v1/ipc/send-stun-addr", appId=APP_ID, uid=uid,
-                         publicIp=ip, publicPort=port,
-                         privateIp=ip, privatePort=port)["data"]
+        return self._data(self._get("/v1/ipc/send-stun-addr", appId=APP_ID,
+                                    uid=uid, publicIp=ip, publicPort=port,
+                                    privateIp=ip, privatePort=port))
 
     def get_stun_addr(self, uid):
-        return self._get(f"/v1/ipc/stun-addr/{uid}")["data"]
+        return self._data(self._get(f"/v1/ipc/stun-addr/{uid}"))
 
     def notify(self, uid, event_type: int):
         """GET /v1/ipc/notify-live-event — event_type is a CameraEventType value
@@ -399,10 +476,16 @@ class RtpJpegReassembler:
         self._frags.clear()
         self._meta.clear()
 
-    def feed(self, pkt: bytes) -> None:
+    def feed(self, pkt: bytes) -> bool:
+        """Store one structurally valid RFC 2435 fragment.
+
+        Returns True when one fragment was accepted and stored (not when a
+        complete JPEG was emitted). Returns False without touching `_frags`
+        or `_meta` for malformed input.
+        """
         p = rtp_payload(pkt)
         if p is None or len(p) < 8:
-            return
+            return False
         marker = pkt[1] >> 7
         ts = struct.unpack(">I", pkt[4:8])[0]
         frag_off = struct.unpack(">I", b"\x00" + p[1:4])[0]
@@ -410,10 +493,16 @@ class RtpJpegReassembler:
         width, height = p[6] * 8, p[7] * 8
         off, dri = 8, 0
         if jtype >= 64:
+            if len(p) < 12:
+                return False
             dri = struct.unpack(">H", p[8:10])[0]
             off = 12
         if q >= 128 and frag_off == 0:
+            if len(p) < off + 4:
+                return False
             qlen = struct.unpack(">H", p[off + 2:off + 4])[0]
+            if len(p) < off + 4 + qlen:
+                return False
             self._meta[ts] = (width, height, p[off + 4:off + 4 + qlen], jtype, dri)
             off += 4 + qlen
         self._frags[ts][frag_off] = p[off:]
@@ -426,6 +515,7 @@ class RtpJpegReassembler:
             for old in sorted(self._frags)[:-4]:
                 self._frags.pop(old, None)
                 self._meta.pop(old, None)
+        return True
 
 
 class RelayStream:
@@ -604,13 +694,14 @@ class RelayStream:
         kind = self._channels.get(channel)
         if not kind or len(packet) < 12:
             return
-        self._on_rx()
         if kind == "video":
-            self._asm.feed(packet)
-        else:
+            if self._asm.feed(packet):
+                self._on_rx()
+        elif kind == "audio":
             payload = rtp_payload(packet)
             if payload:
                 self._on_audio(ulaw_to_pcm16(payload))
+                self._on_rx()
 
     # ---- SDP ----------------------------------------------------------------
 
@@ -815,14 +906,20 @@ class ZiotCamera:
         self.addr = None
         self.sock = None
         self._sock_lock = threading.Lock()  # guards socket swap
-        self.stats = {"frames": 0, "audio_pkts": 0}
+        self.stats = {"frames": 0, "audio_pkts": 0, "rx_errors": 0,
+                      "foreign_ssrc": 0, "rx_datagrams": 0}
         self._last_rx = 0.0
+        # Media identity. None means this UID carries no usable SSRC, so the
+        # direct path can only check which socket a datagram arrived on.
+        self._ssrc = uid_ssrc(self.uid)
+        self._media_source = None       # where media actually comes from
+        self._log_throttle: dict = {}
         # FPS tracking
         self._frame_times: deque = deque(maxlen=120)
         self._last_fps_log = time.monotonic()
         # Endpoint move tracking
         self._endpoint_moves = 0
-        self._last_resolve = 0.0
+        self._last_resolve = float("-inf")
         # Recovery tracking
         self._re_rendezvous_count = 0
         self._backoff = RECOVERY_INITIAL_BACKOFF
@@ -839,6 +936,10 @@ class ZiotCamera:
         self._relay_user = relay_user
         self._relay_pass = relay_pass
         self._relay_last_direct_try = 0.0
+        if self._ssrc is None:
+            log.warning("[%s] UID is not the 8+ decimal digit form the SSRC "
+                        "mapping assumes -- direct media cannot be "
+                        "identity-checked", self.uid)
 
     def _load_cloud(self, cam: dict) -> None:
         keys = ["onlineState", "mediaState", "connectionState", "natType",
@@ -1009,6 +1110,18 @@ class ZiotCamera:
     def _mark_rx(self) -> None:
         self._last_rx = time.monotonic()
 
+    def _log_throttled(self, key: str, level: int, msg: str, *args, **kw) -> None:
+        """Log at most once per LOG_THROTTLE_INTERVAL per key.
+
+        Both callers sit in the per-packet path, where the condition being
+        reported either holds for one packet or holds for every packet.
+        """
+        now = time.monotonic()
+        if now - self._log_throttle.get(key, float("-inf")) < LOG_THROTTLE_INTERVAL:
+            return
+        self._log_throttle[key] = now
+        log.log(level, msg, *args, **kw)
+
     def _on_relay_audio(self, pcm: bytes) -> None:
         self.stats["audio_pkts"] += 1
         self.audio.publish(pcm)
@@ -1155,6 +1268,13 @@ class ZiotCamera:
             self._stop.wait(KEEPALIVE_INTERVAL)
 
     def _resolve(self) -> None:
+        """Re-ask the broker where the camera is, no more often than
+        RESOLVE_MIN_INTERVAL -- the lookup blocks, and the punch loop asks for
+        one on every tick where media is absent."""
+        now = time.monotonic()
+        if now - self._last_resolve < RESOLVE_MIN_INTERVAL:
+            return
+        self._last_resolve = now
         try:
             picked = self._fetch_endpoint()
         except Exception:
@@ -1164,11 +1284,16 @@ class ZiotCamera:
         ip, prt, kind = picked
         self._note_endpoint(kind)
         addr = (ip, prt)
-        if addr != self.addr:
-            log.info("[%s] endpoint moved %s -> %s", self.uid, self.addr, addr)
-            self.addr = addr
-            self._endpoint_moves += 1
-        self._last_resolve = time.monotonic()
+        moved = False
+        old = None
+        with self._sock_lock:
+            if addr != self.addr:
+                old = self.addr
+                self.addr = addr
+                self._endpoint_moves += 1
+                moved = True
+        if moved:
+            log.info("[%s] endpoint moved %s -> %s", self.uid, old, addr)
 
     def _punch(self):
         tick = 0
@@ -1288,6 +1413,52 @@ class ZiotCamera:
         self._frame_times.append(time.monotonic())
         self.video.publish(jpeg)
 
+    def _handle_direct_packet(self, sock: socket.socket, source: tuple[str, int], packet: bytes, asm: RtpJpegReassembler) -> bool:
+        """Accept one datagram from the direct socket.
+
+        Identity is the RTP SSRC, not the source address. The camera's real
+        sending address and the endpoint the STUN broker reports routinely
+        disagree -- it rebinds a UDP port per session, our /24 subnet test
+        picks the public pair on a wider LAN, and symmetric NAT maps us
+        differently -- so matching on the address would drop every packet of a
+        stream that is working, permanently.
+        """
+        with self._sock_lock:
+            if self.sock is not sock:
+                return False
+            addr = self.addr
+        if len(packet) < 12:
+            return False
+        if self._ssrc is not None:
+            ssrc = struct.unpack("!I", packet[8:12])[0]
+            if ssrc != self._ssrc:
+                self.stats["foreign_ssrc"] += 1
+                self._log_throttled(
+                    "foreign_ssrc", logging.WARNING,
+                    "[%s] dropping RTP with ssrc 0x%08x, expected 0x%08x "
+                    "(%d so far)", self.uid, ssrc, self._ssrc,
+                    self.stats["foreign_ssrc"])
+                return False
+        if source != addr and source != self._media_source:
+            log.info("[%s] media arriving from %s while the broker says %s",
+                     self.uid, source, addr)
+        self._media_source = source
+        pt = packet[1] & 0x7f
+        if pt == 26:
+            if asm.feed(packet):
+                self._mark_rx()
+                return True
+            return False
+        elif pt == 0:
+            payload = rtp_payload(packet)
+            if not payload:
+                return False
+            self.stats["audio_pkts"] += 1
+            self.audio.publish(ulaw_to_pcm16(payload))
+            self._mark_rx()
+            return True
+        return False
+
     def _receive(self):
         asm = RtpJpegReassembler(self._on_frame)
         while not self._stop.is_set():
@@ -1302,24 +1473,26 @@ class ZiotCamera:
                 continue
             sock.settimeout(0.5)
             try:
-                data, _ = sock.recvfrom(65535)
+                data, source = sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError:
                 # Socket was closed (re-rendezvous in progress)
                 self._stop.wait(0.5)
                 continue
-            if len(data) < 12:
-                continue
-            self._last_rx = time.monotonic()
-            pt = data[1] & 0x7f
-            if pt == 26:
-                asm.feed(data)
-            elif pt == 0:
-                payload = rtp_payload(data)
-                if payload:
-                    self.stats["audio_pkts"] += 1
-                    self.audio.publish(ulaw_to_pcm16(payload))
+            # Counted before any filtering, so "nothing is on the wire" and
+            # "packets arrive but we reject them" cannot look alike on /health.
+            # Everything below this line can drop a packet for a good reason;
+            # this is the only number that says one showed up at all.
+            self.stats["rx_datagrams"] += 1
+            try:
+                self._handle_direct_packet(sock, source, data, asm)
+            except Exception:
+                self.stats["rx_errors"] += 1
+                self._log_throttled(
+                    "rx_error", logging.ERROR,
+                    "[%s] direct RTP packet failed (%d so far)",
+                    self.uid, self.stats["rx_errors"], exc_info=True)
 
     def _fps_logger(self):
         while not self._stop.is_set():
@@ -1334,8 +1507,14 @@ class ZiotCamera:
                 log.info("[%s] %.1f fps, %d frames total, %d endpoint moves, %d re-rendezvous",
                          self.uid, fps, self.stats["frames"], moves, rr)
             else:
-                log.warning("[%s] NO STREAM — last rx %.0fs ago, %d moves, %d re-rendezvous",
-                            self.uid, time.monotonic() - self._last_rx if self._last_rx else 0,
+                # "0s ago" for a camera that has never sent anything reads as
+                # "a packet just landed", which is the opposite of the truth
+                # and the worst case to misreport. Say so instead.
+                last_rx = (f"{time.monotonic() - self._last_rx:.0f}s ago"
+                           if self._last_rx else "never")
+                log.warning("[%s] NO STREAM — last rx %s, %d datagrams in, "
+                            "%d moves, %d re-rendezvous",
+                            self.uid, last_rx, self.stats["rx_datagrams"],
                             moves, rr)
 
     def health(self) -> dict:
@@ -1358,6 +1537,11 @@ class ZiotCamera:
             "fps": round(self.fps, 1),
             "frames_total": self.stats["frames"],
             "audio_pkts": self.stats["audio_pkts"],
+            "rx_datagrams": self.stats["rx_datagrams"],
+            "rx_errors": self.stats["rx_errors"],
+            "foreign_ssrc": self.stats["foreign_ssrc"],
+            "media_source": (f"{self._media_source[0]}:{self._media_source[1]}"
+                             if self._media_source else None),
             "endpoint_moves": self._endpoint_moves,
             "re_rendezvous_count": self._re_rendezvous_count,
             "backoff_s": round(self._backoff, 1),
@@ -1442,7 +1626,53 @@ class CloudState:
                 cam.update_cloud(row)
 
 
-def make_handler(cameras: dict):
+class BootState:
+    """Why the bridge is not serving cameras yet.
+
+    /health answers from the moment the socket is bound, so a monitor can tell
+    "still coming up" and "the cloud is unreachable" apart from "the process is
+    dead" -- which a bridge that binds only after a successful device-list
+    fetch cannot, because it is not listening yet.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._phase = "starting"
+        self._detail = None
+        self._attempts = 0
+
+    def set(self, phase: str, detail: str | None, attempts: int = 0) -> None:
+        with self._lock:
+            self._phase = phase
+            self._detail = detail
+            self._attempts = attempts
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            out = {"phase": self._phase}
+            if self._detail:
+                out["detail"] = self._detail
+            if self._attempts:
+                out["attempts"] = self._attempts
+            return out
+
+
+def print_camera_table(cams: list[dict]) -> None:
+    print(f"\n{'UID':<16}  {'Online':<6}  {'Media':<5}  {'Free':<5}  "
+          f"{'State':<6}  {'NAT':<6}  {'Relay':<22}  WiFi")
+    print("-" * 98)
+    for c in cams:
+        # str() everything: the API is not consistent about quoting these.
+        # Online/Free are the app's own isOn/isFree readings of the two flags.
+        print(f"{c['uid']:<16}  {str(c.get('onlineState','?')):<6}  "
+              f"{str(c.get('mediaState','?')):<5}  "
+              f"{('yes' if cloud_is_free(c) else 'no'):<5}  "
+              f"{str(c.get('connectionState','?')):<6}  "
+              f"{str(c.get('natType','?')):<6}  "
+              f"{str(c.get('relay_ip','')):<22}  {c.get('wifiSsid','')}")
+
+
+def make_handler(cameras: dict, boot: "BootState"):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
@@ -1489,8 +1719,13 @@ def make_handler(cameras: dict):
                 "application/json")
 
         def _health(self):
+            # `status` stays exactly "ok"/"degraded": the watchdog reserves
+            # "error" for "could not reach the bridge at all", and a new value
+            # here would be indistinguishable from that. The reason lives in
+            # `boot` instead, which old readers simply ignore.
             data = {
                 "status": "ok" if any(c.is_streaming for c in cameras.values()) else "degraded",
+                "boot": boot.snapshot(),
                 "cameras": [c.health() for c in cameras.values()],
             }
             self._send(json.dumps(data, indent=2).encode(), "application/json")
@@ -1587,121 +1822,202 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-    cfg = json.load(open(args.config))
+    try:
+        with open(args.config) as fh:
+            cfg = json.load(fh)
+    except OSError as e:
+        # The image ships no config, so this is what a forgotten -v looks like.
+        # Under --restart unless-stopped a bare traceback here just loops.
+        log.error("cannot read config %s: %s -- mount it into the container "
+                  "with  -v /host/path/ziot_config.json:%s:ro",
+                  args.config, e, args.config)
+        raise SystemExit(2)
 
     global PUNCH_INTERVAL
-    PUNCH_INTERVAL = float(cfg.get("punch_interval", PUNCH_INTERVAL))
-    if PUNCH_INTERVAL >= STARVED_THRESHOLD:
-        log.warning("punch_interval %.1fs is not below STARVED_THRESHOLD %.1fs — "
-                    "starved-stream detection will be sluggish",
-                    PUNCH_INTERVAL, STARVED_THRESHOLD)
+    default_interval = PUNCH_INTERVAL
+    raw = cfg.get("punch_interval", default_interval)
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        interval = None
+    # A bad interval is not worth refusing to boot over: exiting here puts
+    # every camera in the fleet dark in a restart loop. Clamp loudly instead.
+    # (nan and inf fail the range test, so this covers them too.)
+    if interval is None or not 0 < interval < STARVED_THRESHOLD:
+        log.error("punch_interval %r must be a finite number greater than 0 "
+                  "and less than %g -- using %g instead",
+                  raw, STARVED_THRESHOLD, default_interval)
+        interval = default_interval
+    PUNCH_INTERVAL = interval
 
     api = GPS555(cfg["token"])
-    cams = api.list_cameras(cfg["user_id"])
 
     if args.list_cameras:
-        print(f"\n{'UID':<16}  {'Online':<6}  {'Media':<5}  {'Free':<5}  "
-              f"{'State':<6}  {'NAT':<6}  {'Relay':<22}  WiFi")
-        print("-" * 98)
-        for c in cams:
-            # str() everything: the API is not consistent about quoting these.
-            # Online/Free are the app's own isOn/isFree readings of the two flags.
-            print(f"{c['uid']:<16}  {str(c.get('onlineState','?')):<6}  "
-                  f"{str(c.get('mediaState','?')):<5}  "
-                  f"{('yes' if cloud_is_free(c) else 'no'):<5}  "
-                  f"{str(c.get('connectionState','?')):<6}  "
-                  f"{str(c.get('natType','?')):<6}  "
-                  f"{str(c.get('relay_ip','')):<22}  {c.get('wifiSsid','')}")
+        # One-shot and interactive: no fleet to strand and nobody watching
+        # /health, so let a cloud failure surface as it always has.
+        print_camera_table(api.list_cameras(cfg["user_id"]))
         return
 
-    wanted = set(cfg.get("cameras") or [])
-    cams = [c for c in cams if not wanted or c["uid"] in wanted]
-    only_online = bool(cfg.get("only_online"))
-    if only_online:
-        skipped = [c["uid"] for c in cams if not cloud_is_on(c)]
-        cams = [c for c in cams if cloud_is_on(c)]
-        if skipped:
-            log.info("only_online: skipping %d offline camera(s), not retried "
-                     "until restart: %s", len(skipped), ", ".join(skipped))
-    if not cams:
-        log.error("no cameras matched (allow-list: %s, only_online: %s)",
-                  ", ".join(sorted(wanted)) if wanted else "none", only_online)
-        return
-
-    # Probe with the camera's LAN address so the default bind lands on its
-    # subnet; the per-camera choice between LAN and public happens later, in
-    # ZiotCamera._pick_endpoint.
-    probe = api.get_stun_addr(cams[0]["uid"]).get("IpcPrivateIP")
-    if args.bind_ip:
-        bind_ip = args.bind_ip
-    elif probe:
-        bind_ip = local_ip_for(probe)
-    else:
-        bind_ip = local_ip_for("8.8.8.8")
-        log.warning("no IpcPrivateIP from the broker — binding on %s by default "
-                    "route; pass --bind-ip if that is the wrong interface", bind_ip)
-    log.info("binding on %s (camera LAN %s), punch every %.1fs",
-             bind_ip, probe or "unknown", PUNCH_INTERVAL)
-
+    boot = BootState()
     live: dict[str, ZiotCamera] = {}
     lock = threading.Lock()
-
     cloud = CloudState(api, cfg["user_id"])
+    stopping = threading.Event()
 
-    def boot(cam_rec):
-        uid = cam_rec["uid"]
+    def bring_up(cams) -> bool:
+        """Filter one device list down to our cameras and start them.
+
+        False means the list held nothing for us. That is a settled answer
+        rather than a transient one, so the caller stops instead of retrying.
+        """
+        wanted = set(cfg.get("cameras") or [])
+        cams = [c for c in cams if not wanted or c["uid"] in wanted]
+        only_online = bool(cfg.get("only_online"))
+        if only_online:
+            skipped = [c["uid"] for c in cams if not cloud_is_on(c)]
+            cams = [c for c in cams if cloud_is_on(c)]
+            if skipped:
+                log.info("only_online: skipping %d offline camera(s), not retried "
+                         "until restart: %s", len(skipped), ", ".join(skipped))
+        if not cams:
+            log.error("no cameras matched (allow-list: %s, only_online: %s)",
+                      ", ".join(sorted(wanted)) if wanted else "none", only_online)
+            boot.set("no-cameras",
+                     "the device list held no camera we were asked for")
+            return False
+
+        # Probe with the camera's LAN address so the default bind lands on its
+        # subnet; the per-camera choice between LAN and public happens later, in
+        # ZiotCamera._pick_endpoint.
         try:
-            z = ZiotCamera(api, cam_rec, bind_ip,
-                           force_relay=args.force_relay,
-                           relay_user=cfg.get("relay_user"),
-                           relay_pass=cfg.get("relay_pass"))
-        except Exception:
-            # Nothing to register or recover if we could not even build it.
-            log.exception("%s: could not be constructed — skipping", uid)
+            probe = api.get_stun_addr(cams[0]["uid"]).get("IpcPrivateIP")
+        except Exception as e:
+            # The other unguarded cloud call that used to abort the whole boot.
+            # The default-route fallback below is exactly the right answer here.
+            log.warning("could not ask the broker where %s is (%s) — falling "
+                        "back to the default route", cams[0]["uid"], e)
+            probe = None
+        if args.bind_ip:
+            bind_ip = args.bind_ip
+        elif probe:
+            bind_ip = local_ip_for(probe)
+        else:
+            bind_ip = local_ip_for("8.8.8.8")
+            log.warning("no IpcPrivateIP from the broker — binding on %s by default "
+                        "route; pass --bind-ip if that is the wrong interface", bind_ip)
+        log.info("binding on %s (camera LAN %s), punch every %.1fs",
+                 bind_ip, probe or "unknown", PUNCH_INTERVAL)
+
+        cold: list[str] = []
+
+        def boot_one(cam_rec):
+            uid = cam_rec["uid"]
+            try:
+                z = ZiotCamera(api, cam_rec, bind_ip,
+                               force_relay=args.force_relay,
+                               relay_user=cfg.get("relay_user"),
+                               relay_pass=cfg.get("relay_pass"))
+            except Exception:
+                # Nothing to register or recover if we could not even build it.
+                log.exception("%s: could not be constructed — skipping", uid)
+                with lock:
+                    cold.append(uid)
+                return
+
+            try:
+                started = z.start()
+            except Exception:
+                # start() is not supposed to raise, but if it ever does, the camera
+                # must still be registered: an unregistered camera is invisible on
+                # /health and, with no threads and no CloudState entry, would never
+                # be retried either.
+                log.exception("%s: start() raised — keeping it for recovery", uid)
+                started = False
+
+            # Keep the camera either way: it retries in the background, and a
+            # camera that is merely offline right now must still appear on /health
+            # rather than vanishing from the bridge until someone restarts it.
             with lock:
-                cold.append(uid)
+                live[uid] = z
+                if not started:
+                    cold.append(uid)
+            cloud.register(z)
+
+        threads = [threading.Thread(target=boot_one, args=(c,)) for c in cams]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if cold:
+            log.warning("%d of %d camera(s) did not come up yet (%s) — the bridge "
+                        "is serving anyway and will keep retrying them",
+                        len(cold), len(cams), ", ".join(sorted(cold)))
+        if len(cold) == len(cams):
+            log.warning("no camera is streaming yet. These cameras register with "
+                        "the cloud but often never open a session; /health will "
+                        "show mode=down until one does.")
+
+        cloud.start()
+        boot.set("ready", None)
+        return True
+
+    def retry_boot():
+        """Wait out a cloud outage instead of dying into a restart loop.
+
+        Exiting here and letting Docker restart us is the same retry loop with
+        a worse duty cycle: every camera dark in between, and no /health
+        answering to say why.
+        """
+        backoff = RECOVERY_INITIAL_BACKOFF
+        attempt = 1
+        while not stopping.is_set():
+            stopping.wait(backoff)
+            if stopping.is_set():
+                return
+            attempt += 1
+            try:
+                cams = api.list_cameras(cfg["user_id"])
+            except Exception as e:
+                if is_auth_failure(e):
+                    # We are already serving, so park and say so on /health
+                    # rather than exiting into a loop that cannot help.
+                    log.error("cloud rejected the token (%s) — check \"token\" "
+                              "in %s; it is a JWT and they expire", e, args.config)
+                    boot.set("failed", "the cloud rejected the token")
+                    return
+                boot.set("retrying", f"device list unavailable: {e}", attempt)
+                log.warning("device list still unavailable (attempt %d): %s — "
+                            "retrying in %.0fs", attempt, e, backoff)
+                backoff = min(backoff * 2, RECOVERY_MAX_BACKOFF)
+                continue
+            log.info("reached the cloud after %d attempts", attempt)
+            bring_up(cams)
             return
 
-        try:
-            started = z.start()
-        except Exception:
-            # start() is not supposed to raise, but if it ever does, the camera
-            # must still be registered: an unregistered camera is invisible on
-            # /health and, with no threads and no CloudState entry, would never
-            # be retried either.
-            log.exception("%s: start() raised — keeping it for recovery", uid)
-            started = False
+    try:
+        cams = api.list_cameras(cfg["user_id"])
+    except Exception as e:
+        if is_auth_failure(e):
+            # Nothing is serving yet and no token un-expires itself, so this is
+            # a config error in the same sense as an unreadable config file.
+            log.error("cloud rejected the token (%s) — check \"token\" in %s; "
+                      "it is a JWT and they expire", e, args.config)
+            raise SystemExit(2)
+        log.warning("device list unavailable at startup (%s) — serving /health "
+                    "and retrying in the background", e)
+        boot.set("retrying", f"device list unavailable: {e}", 1)
+        cams = None
 
-        # Keep the camera either way: it retries in the background, and a
-        # camera that is merely offline right now must still appear on /health
-        # rather than vanishing from the bridge until someone restarts it.
-        with lock:
-            live[uid] = z
-            if not started:
-                cold.append(uid)
-        cloud.register(z)
-
-    cold: list[str] = []
-    threads = [threading.Thread(target=boot, args=(c,)) for c in cams]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    if cold:
-        log.warning("%d of %d camera(s) did not come up yet (%s) — the bridge "
-                    "is serving anyway and will keep retrying them",
-                    len(cold), len(cams), ", ".join(sorted(cold)))
-    if len(cold) == len(cams):
-        log.warning("no camera is streaming yet. These cameras register with "
-                    "the cloud but often never open a session; /health will "
-                    "show mode=down until one does.")
-
-    cloud.start()
+    if cams is not None:
+        if not bring_up(cams):
+            return
+    else:
+        threading.Thread(target=retry_boot, daemon=True).start()
 
     # 8085 is what the README, the go2rtc examples and the watchdog assume.
     port = args.port or cfg.get("port", 8085)
-    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(live))
+    server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(live, boot))
     log.info("serving on http://0.0.0.0:%d/", port)
     for uid in live:
         log.info("  view  http://localhost:%d/view/%s", port, uid)
@@ -1713,6 +2029,7 @@ def main():
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:
+        stopping.set()
         server.shutdown()
         cloud.stop()
         for z in live.values():

@@ -70,12 +70,34 @@ Create `ziot_config.json` next to the script:
 | `port` | no | HTTP listen port, default `8085` |
 | `cameras` | no | Allow-list of UIDs. `[]` or omitted = every camera on the account |
 | `only_online` | no | Only start cameras the app would call online (`onlineState == "1"`). Checked **once at startup** — a camera that is offline then stays skipped until you restart. Default `false` — cloud statuses fluctuate, so the bridge normally tries every camera and reports state |
-| `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must stay below the 2 s starvation threshold |
+| `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
 | `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Unset by default — the relay is not known to authenticate, and the bridge fails loudly rather than guessing |
 
 ```bash
 chmod 600 ziot_config.json    # it holds an account credential
 ```
+
+**Startup failures are deliberately two-tier.** The rule is whether retrying
+could ever help.
+
+*Fatal, exits `2`:* a config the bridge cannot read (nothing to run), and a
+token the cloud rejects on the very first call (no token un-expires itself, and
+nothing is serving yet, so this is a config error like any other). Both name
+what to fix.
+
+*Never fatal:* a bad config *value* is logged and replaced with its default; an
+unreachable cloud binds the HTTP port anyway and retries the device list in the
+background with backoff, so `/health` answers from the first second and says
+`boot.phase: retrying` with the error. Refusing to start in these cases puts
+every camera dark in a `--restart unless-stopped` loop — the same retry, with a
+worse duty cycle and nothing answering to say why — which is what commit
+b423ebc ("Never let a startup failure strand a camera") exists to prevent.
+
+A token rejected *later*, once the bridge is already serving, parks at
+`boot.phase: failed` rather than exiting: staying up and reporting the reason
+beats disappearing. If you want a typo caught before it reaches production,
+validate the config in your deploy pipeline — the bridge is not the place to
+fail that check.
 
 ### Getting the token
 
@@ -130,6 +152,11 @@ docker run -d --name ziot-bridge \
   ziot-bridge
 ```
 
+The runtime configuration is deliberately excluded from the build context and
+image and must be supplied through the shown read-only mount. Forget it and the
+bridge exits 2 with a log line naming the mount it wanted, rather than a bare
+`FileNotFoundError`.
+
 **`--network host` is mandatory.** The camera sends UDP directly to the
 bridge's IP — Docker bridge networking puts the container behind NAT and the
 camera sends to an unroutable address.
@@ -180,6 +207,7 @@ should come back up rather than sit dead.
 ```json
 {
   "status": "ok",
+  "boot": { "phase": "ready" },
   "cameras": [
     {
       "uid": "141030191094",
@@ -197,6 +225,10 @@ should come back up rather than sit dead.
       "fps": 6.5,
       "frames_total": 1234,
       "audio_pkts": 5678,
+      "rx_datagrams": 9012,
+      "rx_errors": 0,
+      "foreign_ssrc": 0,
+      "media_source": "192.168.1.73:49201",
       "endpoint_moves": 2,
       "last_rx_ago_s": 0.1,
       "addr": "192.168.1.73:49201"
@@ -204,6 +236,29 @@ should come back up rather than sit dead.
   ]
 }
 ```
+
+`boot` says why the bridge is not serving cameras, when it isn't: `starting`,
+`retrying` (with `detail` and `attempts` — the cloud is unreachable and the
+bridge is backing off), `failed` (the cloud rejected the token; retrying cannot
+help), `no-cameras` (the device list held nothing matching your allow-list), or
+`ready`. `status` deliberately stays `"ok"`/`"degraded"` — the watchdog reserves
+`"error"` for "could not reach the bridge at all", so a new value here would be
+indistinguishable from a dead bridge.
+
+`addr` is where the STUN broker says the camera is — where punches and hellos
+go. `media_source` is where media actually arrives from. They normally match;
+a lasting disagreement means the broker's answer is stale and the direct path
+is one-way. `foreign_ssrc` counts datagrams dropped for carrying another
+camera's SSRC, `rx_errors` counts packets whose handling raised.
+
+`rx_datagrams` counts every datagram that arrived on the direct socket, before
+any filtering. It is the one number that separates *"the camera is silent"*
+from *"packets arrive and we reject them all"* — two states that look identical
+on every other counter. `rx_datagrams: 0` means nothing reached us and the
+problem is upstream (camera asleep, not publishing, no L2 route). A climbing
+`rx_datagrams` with `frames_total` stuck at 0 means the media is arriving and
+being dropped — check `foreign_ssrc` next, and the `dropping RTP with ssrc …`
+log line names what it saw against what it expected.
 
 `status` is `"ok"` when at least one camera is streaming, `"degraded"` otherwise.
 Use `/health` for Docker HEALTHCHECK or external monitoring.
@@ -213,7 +268,10 @@ Use `/health` for Docker HEALTHCHECK or external monitoring.
 ### Watchdog
 
 `ziot_watchdog.py` checks both the bridge and go2rtc health, and auto-restarts
-Frigate if go2rtc streams die but the bridge is still alive.
+Frigate if go2rtc streams die but the bridge is still alive. It also reads
+`boot.phase`: a bridge that is up but serving an empty camera roster would
+otherwise walk a zero-length list in silence and be called healthy. An older
+bridge that does not send the field is tolerated.
 
 ```bash
 python3 ziot_watchdog.py
@@ -312,8 +370,9 @@ Wi-Fi airtime on the camera side.
 **A camera shows `streaming: false`.**
 Normal for the first few seconds. If it persists: confirm the host is on the
 camera's subnet (`ping` its LAN IP) and that `--bind-ip` is an address on that
-subnet. The bridge re-resolves a starved camera's endpoint automatically every
-2 s — watch for `endpoint moved …` lines, which are expected and healthy.
+subnet. The bridge re-resolves a starved camera's endpoint automatically once
+media has been absent for 2 s, at most once every 5 s — watch for
+`endpoint moved …` lines, which are expected and healthy.
 
 **Everything says `mode: down` and nothing streams.**
 The bridge stays up and retries rather than exiting, so this is a report, not a
@@ -432,13 +491,22 @@ Notes for anyone modifying the media path:
   entirely — punching alone will not sustain the stream.
 * **The camera binds a new UDP port for every session**, and `stun-addr` may
   briefly report the previous one. Punch a stale port and you receive nothing,
-  permanently. Hence the re-resolve-when-starved logic.
+  permanently. Hence the re-resolve-when-starved logic — floored to one lookup
+  per 5 s, since `stun-addr` blocks for up to 10 s and the punch loop would
+  otherwise ask on every tick without media.
 * **RFC 2435 traps:** type `0x41` ≥ 64 means a 4-byte Restart Marker header
   follows the 8-byte main header — *on every fragment*, not just the first.
   Quantization tables then sit at payload offset 16–144 on fragment 0, and the
   rebuilt JPEG needs a DRI segment (interval 40) or the decoder desyncs.
 * **RTP SSRC encodes the UID** — the last 8 decimal digits
-  (`141030191094` → SSRC `0x30191094`). Handy for demultiplexing.
+  (`141030191094` → SSRC `0x30191094`). This is load-bearing: it is what the
+  direct path accepts media on. **Do not filter on the source address**
+  instead — the address the broker reports and the address the camera sends
+  from routinely disagree (per-session rebind, a LAN wider than the /24 the
+  endpoint choice assumes, symmetric NAT), and dropping on that mismatch
+  strands a stream that is working. A UID that is not 8+ decimal digits yields
+  no SSRC; those cameras log a warning at startup and accept any RTP on their
+  own socket.
 * There is **no encryption and no obfuscation** anywhere in the media path.
 
 ---
