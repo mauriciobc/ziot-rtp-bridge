@@ -585,9 +585,11 @@ class BootStateTests(unittest.TestCase):
 class HealthEndpointTests(unittest.TestCase):
     """The watchdog reads this payload, so its shape is a contract."""
 
-    def serve(self, cameras, boot):
+    def serve(self, cameras, boot, lock=None):
         server = ThreadingHTTPServer(("127.0.0.1", 0),
-                                     bridge.make_handler(cameras, boot))
+                                     bridge.make_handler(
+                                         cameras, boot,
+                                         lock or threading.Lock()))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
@@ -687,6 +689,214 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("-v /host/path/ziot_config.json", "\n".join(logs.output))
         gps.assert_not_called()
+
+    def run_main_on(self, path):
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        gps.assert_not_called()
+        return cm.exception.code, "\n".join(logs.output)
+
+    def write_config(self, data, mode="w"):
+        with tempfile.NamedTemporaryFile(mode, suffix=".json",
+                                         delete=False) as f:
+            f.write(data)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        return path
+
+    def test_malformed_config_blames_the_file_not_the_mount(self):
+        """The file was read, so the mount is already right. Pointing at it
+        sends whoever is reading the logs to check the wrong thing."""
+        path = self.write_config("{not valid json")
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertIn(path, out)
+        self.assertIn("is not valid JSON", out)
+        self.assertNotIn("-v /host/path/ziot_config.json", out)
+
+    def test_malformed_config_keeps_the_parser_position(self):
+        path = self.write_config('{"token": "t",\n')
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertRegex(out, r"line \d+ column \d+")
+
+    def test_non_utf8_config_blames_the_file_not_the_mount(self):
+        path = self.write_config(b'{"token": "\xff\xfe not utf-8"}', mode="wb")
+        code, out = self.run_main_on(path)
+        self.assertEqual(code, 2)
+        self.assertIn(path, out)
+        self.assertIn("is not valid JSON", out)
+        self.assertNotIn("-v /host/path/ziot_config.json", out)
+
+    def test_an_unreadable_config_still_names_the_mount(self):
+        code, out = self.run_main_on("/nonexistent/dir/ziot_config.json")
+        self.assertEqual(code, 2)
+        self.assertIn("-v /host/path/ziot_config.json", out)
+        self.assertNotIn("is not valid JSON", out)
+
+
+class StubCam:
+    def __init__(self, uid):
+        self.uid = uid
+        self.cloud = {}
+        self.mode = "direct"
+        self.is_streaming = False
+        self.fps = 0.0
+        self.stats = {}
+
+    def health(self):
+        return {"uid": self.uid}
+
+
+class HandlerConcurrencyTests(unittest.TestCase):
+    """Registering cameras mid-serve must not break in-flight /health.
+
+    The obvious version of this test -- register 50 cameras in a tight loop,
+    then join the fetchers -- passes against the *unfixed* handler, because the
+    loop finishes long before the first request is served and the two never
+    overlap. Two things are needed to reproduce the real failure:
+    registration has to run while requests are in flight, and the switch
+    interval has to be short enough for the GIL to yield mid-iteration.
+    Otherwise the whole iteration completes inside one slice and the bug hides.
+
+    Verified: with `snapshot()` reverted to iterating the live dict, this fails
+    with "dictionary changed size during iteration"; with the fix, it passes.
+    """
+
+    def setUp(self):
+        old = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        self.addCleanup(sys.setswitchinterval, old)
+
+    def test_health_and_index_survive_concurrent_registration(self):
+        cameras = {}
+        lock = threading.Lock()
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler(cameras, boot, lock))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        stop = threading.Event()
+        errors = []
+        served = []
+
+        def register():
+            i = 0
+            while not stop.is_set():
+                with lock:
+                    cameras[f"cam{i}"] = StubCam(f"cam{i}")
+                i += 1
+                time.sleep(0.0002)
+
+        def fetch():
+            while not stop.is_set():
+                for endpoint in ("health", ""):
+                    try:
+                        with urllib.request.urlopen(
+                                f"http://127.0.0.1:{port}/{endpoint}",
+                                timeout=5) as r:
+                            json.loads(r.read())
+                        served.append(endpoint)
+                    except Exception as e:      # noqa: BLE001 -- asserted below
+                        errors.append(repr(e))
+                        return
+
+        writer = threading.Thread(target=register, daemon=True)
+        writer.start()
+        readers = [threading.Thread(target=fetch, daemon=True) for _ in range(6)]
+        for t in readers:
+            t.start()
+
+        # Run until both sides have done enough to have overlapped, then stop.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not errors:
+            with lock:
+                registered = len(cameras)
+            if registered > 400 and len(served) > 60:
+                break
+            time.sleep(0.02)
+        stop.set()
+        writer.join(timeout=5)
+        for t in readers:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        # Assert the test actually exercised the condition. Without this the
+        # test can silently stop overlapping and go on passing forever, which
+        # is exactly how the version it replaces came to protect nothing.
+        with lock:
+            registered = len(cameras)
+        self.assertGreater(registered, 400, "registration never got going")
+        self.assertGreater(len(served), 60, "no requests were served")
+
+
+class CloudAuthParkTests(unittest.TestCase):
+    def test_revoked_token_after_boot_parks_failed_once(self):
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        with self.assertLogs(bridge.log) as logs:
+            cloud.poll()
+            cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+        rejection_lines = [line for line in logs.output
+                           if "rejected the token" in line]
+        self.assertEqual(len(rejection_lines), 1)
+
+    def test_ordinary_outage_does_not_park_failed(self):
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = ConnectionError("down")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "ready")
+
+    def test_a_park_lifts_when_the_cloud_accepts_the_token_again(self):
+        """Latching for the process lifetime would leave /health reporting
+        "failed" -- and the watchdog shouting -- for a bridge that is
+        demonstrably working again."""
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+
+        api.list_cameras.side_effect = None
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        cloud.poll()
+        self.assertEqual(boot.snapshot(), {"phase": "ready"})
+
+        # And a later rejection parks -- and logs -- again, rather than being
+        # swallowed by a latch that was never reset.
+        api.list_cameras.side_effect = bridge.CloudError(401, "Expired")
+        with self.assertLogs(bridge.log, "ERROR") as logs:
+            cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "failed")
+        self.assertTrue(any("rejected the token" in line
+                            for line in logs.output), logs.output)
+
+    def test_a_park_is_not_lifted_for_a_state_we_did_not_set(self):
+        """Only ever undo a park we made ourselves -- a successful poll must
+        not promote a startup phase to ready behind bring_up's back."""
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        boot = bridge.BootState()
+        boot.set("retrying", "device list unavailable: timed out", 2)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        self.assertEqual(boot.snapshot()["phase"], "retrying")
 
 
 if __name__ == "__main__":
