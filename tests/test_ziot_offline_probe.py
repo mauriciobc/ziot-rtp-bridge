@@ -127,5 +127,14 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("HIT ", out)
 
 
+class DescribeTests(unittest.TestCase):
+    def test_rtp_hello_echo_and_short_payloads_are_described(self):
+        self.assertEqual(probe.describe(rtp()), f"ssrc=0x{CAM_SSRC:08x} pt=26")
+        self.assertEqual(probe.describe(rtp(pt=0)), f"ssrc=0x{CAM_SSRC:08x} pt=0")
+        self.assertEqual(probe.describe(b"App send hello"),
+                         "non-RTP (v1 pt=112 ssrc=0x2068656c)")
+        self.assertEqual(probe.describe(b"runt"), "4B non-RTP")
+
+
 if __name__ == "__main__":
     unittest.main()

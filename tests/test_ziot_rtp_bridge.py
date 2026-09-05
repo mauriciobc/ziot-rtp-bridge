@@ -1,5 +1,7 @@
 """Behavior regressions for direct/relay RTP acceptance and startup validation."""
+import http.client
 import json
+import queue
 import socket
 import struct
 import sys
@@ -371,6 +373,240 @@ class RelayConsumeTests(unittest.TestCase):
         on_rx.assert_not_called()
 
 
+class MediaIngestParityTests(unittest.TestCase):
+    """The direct and relay transports must produce identical media from
+    identical packets: one frame from a JPEG fragment pair, one PCM chunk
+    from a PCMU datagram, and liveness refreshed only by accepted packets.
+    Whatever pipeline change lands must keep the two paths indistinguishable
+    to a subscriber."""
+
+    QUANT = bytes(range(128))
+
+    def frame_pair(self):
+        return [
+            rtp_packet(26, jpeg_payload(frag_off=0, q=255, quant=self.QUANT),
+                       ts=500),
+            rtp_packet(26, jpeg_payload(frag_off=64, q=255), ts=500,
+                       marker=True),
+        ]
+
+    @staticmethod
+    def drain(q):
+        out = []
+        try:
+            while True:
+                out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+    def collect(self, cam, packets, transport):
+        """Feed `packets` to one camera over `transport` ('direct' or
+        'relay') and return (frames, pcm_chunks, stats_snapshot)."""
+        frames_q_ctx = cam.video.subscribe()
+        audio_q_ctx = cam.audio.subscribe()
+        with frames_q_ctx as vq, audio_q_ctx as aq:
+            if transport == "direct":
+                sock = bind_loopback()
+                self.addCleanup(sock.close)
+                cam.sock = sock
+                cam.addr = ("127.0.0.1", 9)
+                asm = bridge.RtpJpegReassembler(cam._on_frame)
+                for pkt in packets:
+                    cam._handle_direct_packet(sock, cam.addr, pkt, asm)
+            else:
+                stream = bridge.RelayStream(
+                    "rtsp://example/live/x", cam._on_frame,
+                    cam._on_relay_audio, cam._mark_rx, cam._stop, cam.uid)
+                stream._channels = {0: "video", 2: "audio"}
+                for pkt in packets:
+                    # The relay keys media on its negotiated interleaved
+                    # channel, not the payload type: 26 rides ch0, 0 rides ch2.
+                    channel = 2 if (pkt[1] & 0x7F) == 0 else 0
+                    hdr = b"$" + bytes([channel]) \
+                        + struct.pack("!H", len(pkt))
+                    with mock.patch.object(stream, "_read_exact",
+                                           side_effect=[hdr, pkt]):
+                        stream._consume_interleaved()
+            frames = self.drain(vq)
+            audio = self.drain(aq)
+        stats = dict(cam.stats)
+        return frames, audio, stats
+
+    def test_video_and_audio_reach_the_subscriber_identically(self):
+        packets = self.frame_pair() + [rtp_packet(0, b"\x7f" * 40, ts=600)]
+        direct = self.collect(make_camera(), packets, "direct")
+        relay = self.collect(make_camera(), packets, "relay")
+
+        self.assertEqual(direct[0], relay[0])
+        self.assertEqual(direct[1], relay[1])
+        for frames, audio, stats in (direct, relay):
+            self.assertEqual(len(frames), 1)
+            self.assertTrue(frames[0].startswith(b"\xff\xd8"))
+            self.assertTrue(frames[0].endswith(b"\xff\xd9"))
+            self.assertEqual(len(audio), 1)
+            self.assertEqual(stats["frames"], 1)
+            self.assertEqual(stats["audio_pkts"], 1)
+
+    def test_malformed_packets_produce_no_media_on_either_path(self):
+        # A payload type the direct path does not know (8) is deliberately
+        # divergent: the relay keys on its negotiated channel instead, so it
+        # is left to RxDatagramTests, not this parity check.
+        bad = [
+            rtp_packet(26, jpeg_payload(jtype=70)[:10], ts=81),
+            rtp_packet(0, b"", ts=82),
+        ]
+        direct = self.collect(make_camera(), bad, "direct")
+        relay = self.collect(make_camera(), bad, "relay")
+        for frames, audio, stats in (direct, relay):
+            self.assertEqual((frames, audio), ([], []))
+            self.assertEqual(stats["frames"], 0)
+            self.assertEqual(stats["audio_pkts"], 0)
+
+
+class CloudFlagTests(unittest.TestCase):
+    """The app's isOn/isFree, including its null and empty-string readings:
+    null -> False, "" -> "0" -> free, and every non-zero mediaState is busy."""
+
+    CASES = [
+        ({"onlineState": "1", "mediaState": "0"}, (True, True)),
+        ({"onlineState": "1", "mediaState": "2"}, (True, False)),
+        ({"onlineState": "1", "mediaState": "3"}, (True, False)),
+        ({"onlineState": "0", "mediaState": "0"}, (False, True)),
+        ({"onlineState": "", "mediaState": ""}, (False, True)),
+        ({}, (False, False)),
+        ({"onlineState": None, "mediaState": None}, (False, False)),
+        ({"onlineState": 1, "mediaState": 0}, (True, True)),
+    ]
+
+    def test_the_flags_read_exactly_like_the_app(self):
+        for row, (on, free) in self.CASES:
+            with self.subTest(row=row):
+                self.assertEqual(bridge.cloud_is_on(row), on)
+                self.assertEqual(bridge.cloud_is_free(row), free)
+
+
+class StreamEndpointTests(unittest.TestCase):
+    """The /cam and /audio endpoints stream real bytes over real HTTP: the
+    framing contracts (multipart part, WAV header) and the broken-client
+    path are pinned before the shared pump refactor."""
+
+    FRAME = b"\xff\xd8fake" + b"x" * 32 + b"\xff\xd9"
+
+    def serve(self, cam):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: cam}, boot, threading.Lock()))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def get(self, port, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", path)
+        return conn.getresponse()
+
+    def mjpeg_part(self, frame):
+        return (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+
+    def await_subscriber(self, cam, which="video", timeout=3.0):
+        """The handler subscribes after sending headers; a frame published
+        before that is dropped by the Fanout, so tests must wait for it."""
+        fanout = cam.video if which == "video" else cam.audio
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not len(fanout._subs):
+            time.sleep(0.01)
+        self.assertTrue(len(fanout._subs), "no subscriber arrived")
+
+    def test_mjpeg_streams_multipart_framing(self):
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/cam/{CAM_UID}")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("multipart/x-mixed-replace",
+                      resp.getheader("Content-Type"))
+        expected = self.mjpeg_part(self.FRAME)
+        self.await_subscriber(cam)
+        cam._on_frame(self.FRAME)
+        self.assertEqual(resp.read(len(expected)), expected)
+
+    def test_wav_streams_header_then_chunks(self):
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/audio/{CAM_UID}")
+        self.assertEqual(resp.status, 200)
+        header = bridge.wav_header()
+        self.assertEqual(resp.read(len(header)), header)
+        chunk = b"\x01\x02" * 40
+        self.await_subscriber(cam, which="audio")
+        cam.audio.publish(chunk)
+        self.assertEqual(resp.read(len(chunk)), chunk)
+
+    def test_a_dead_client_ends_the_stream_without_an_error(self):
+        """A viewer hanging up mid-stream is the normal way to stop
+        watching; the subscriber must leave cleanly, log nothing at ERROR,
+        and the camera must keep publishing."""
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/cam/{CAM_UID}")
+        expected = self.mjpeg_part(self.FRAME)
+        self.await_subscriber(cam)
+        cam._on_frame(self.FRAME)
+        resp.read(len(expected))
+        resp.close()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and len(cam.video._subs):
+            cam._on_frame(self.FRAME)   # the write that notices the hangup
+            time.sleep(0.05)
+        self.assertEqual(len(cam.video._subs), 0,
+                         "handler never noticed the dead client")
+        cam._on_frame(self.FRAME)       # camera keeps publishing
+
+
+class RouteTests(unittest.TestCase):
+    """Every URL shape the README promises answers; anything else is a 404
+    (including a known prefix with an unknown camera)."""
+
+    def serve(self):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: make_camera()}, boot,
+                                threading.Lock()))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_every_promised_path_answers(self):
+        port = self.serve()
+        for path, expect in ((f"/view/{CAM_UID}", 200),
+                             (f"/cam/{CAM_UID}", 200),
+                             (f"/audio/{CAM_UID}", 200),
+                             (f"/view/000000000000", 404),
+                             (f"/cam/000000000000", 404),
+                             ("/nope", 404),
+                             ("/view/", 404)):
+            with self.subTest(path=path):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                self.addCleanup(conn.close)
+                conn.request("GET", path)
+                self.assertEqual(conn.getresponse().status, expect)
+
+    def test_the_view_page_names_the_camera_not_the_object(self):
+        """A route-table refactor once passed the camera object where the
+        uid was expected, and the page rendered `ZiotCamera object at
+        0x...` — status 200, content garbage. Assert the bytes."""
+        port = self.serve()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", f"/view/{CAM_UID}")
+        body = conn.getresponse().read()
+        self.assertIn(CAM_UID.encode(), body)
+        self.assertNotIn(b"object at 0x", body)
+
+
 class PunchIntervalTests(unittest.TestCase):
     def setUp(self):
         self.old_interval = bridge.PUNCH_INTERVAL
@@ -486,6 +722,76 @@ class PunchLoopTests(unittest.TestCase):
                 cam.force_relay = force
                 self.drive(cam, 2)
                 self.assertEqual(self.drain(fake_cam), [])
+
+
+class RecoveryBookkeepingTests(unittest.TestCase):
+    """Every recovery attempt ends in exactly one of two accountings: a
+    streaming camera resets the failure count, a failed one increments it and
+    doubles the backoff. The backoff reset to the initial value belongs to the
+    top-of-tick is_streaming check, not to the attempt itself."""
+
+    @staticmethod
+    def make_cam():
+        cam = make_camera()
+        # No real sleeping: _stop.wait is the tick's sleep knob.
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        # A dead camera whose last re-rendezvous is long past.
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        return cam
+
+    def test_failed_transport_attempts_double_the_backoff(self):
+        cam = self.make_cam()
+        cam._open_transport = mock.Mock(return_value=False)
+        cam._start_relay = mock.Mock(return_value=False)
+        for expected in (10.0, 20.0, 40.0):
+            with self.subTest(backoff=expected):
+                cam._last_re_rendezvous = 0.0   # age out the backoff gate
+                cam._recovery_tick()
+                self.assertEqual(cam._backoff, expected)
+        self.assertEqual(cam._consec_failures, 3)
+
+    def test_a_streaming_transport_resets_the_failure_count(self):
+        cam = self.make_cam()
+        cam._open_transport = mock.Mock(return_value=True)
+        # Media arrives while the post-rendezvous wait elapses.
+        cam._stop.wait.side_effect = \
+            lambda _t: setattr(cam, "_last_rx", time.monotonic())
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 0)
+        # The backoff still grew on this success; resetting it to the
+        # initial value is the next tick's job, once it sees the stream.
+        self.assertEqual(cam._backoff, 10.0)
+        cam._recovery_tick()
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+
+    def test_a_punch_only_sweep_that_streams_resets_backoff_at_once(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._backoff = 20.0
+        cam._lan_resweep = mock.Mock(
+            side_effect=lambda: setattr(cam, "_last_rx", time.monotonic()))
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 0)
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+
+    def test_a_punch_only_sweep_failure_counts_and_doubles(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._backoff = 20.0
+        cam._lan_resweep = mock.Mock()
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 1)
+        self.assertEqual(cam._backoff, 40.0)
 
 
 class UidSsrcTests(unittest.TestCase):

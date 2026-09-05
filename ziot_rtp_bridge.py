@@ -195,6 +195,32 @@ def rtp_payload(pkt: bytes) -> bytes | None:
     return payload
 
 
+def ingest_rtp_media(kind: str, packet: bytes, asm, on_frame, on_audio,
+                     on_rx) -> bool:
+    """Run one accepted RTP packet through the media pipeline.
+
+    This is the whole media path, shared by every transport: video goes
+    through the JPEG reassembler, audio through µ-law decode, and liveness
+    (`on_rx`) is refreshed only by packets that actually produced media. The
+    transports differ only in how they decide `kind` — the direct path keys
+    on payload type, the relay on its negotiated interleaved channel — so
+    the per-kind work exists exactly once.
+    """
+    if kind == "video":
+        if asm.feed(packet):
+            on_rx()
+            return True
+        return False
+    if kind == "audio":
+        payload = rtp_payload(packet)
+        if payload:
+            on_audio(ulaw_to_pcm16(payload))
+            on_rx()
+            return True
+        return False
+    return False
+
+
 AUDIO_RATE = 8000
 
 
@@ -343,8 +369,7 @@ def _flag(row: dict, key: str) -> str:
 
 def cloud_is_on(row: dict) -> bool:
     """CameraInfoModel::isOn -- onlineState == "1", null being false."""
-    v = _flag(row, "onlineState")
-    return bool(v) and v == "1"
+    return _flag(row, "onlineState") == "1"
 
 
 def cloud_is_free(row: dict) -> bool:
@@ -353,8 +378,7 @@ def cloud_is_free(row: dict) -> bool:
     This is the app's *only* use of mediaState. It never distinguishes 1 from 3,
     so neither do we: the flag is free/busy and nothing finer.
     """
-    v = _flag(row, "mediaState")
-    return bool(v) and v == "0"
+    return _flag(row, "mediaState") == "0"
 
 
 def relay_urls(row: dict) -> list[str]:
@@ -423,6 +447,32 @@ def parse_static_endpoints(raw: dict) -> dict:
         out[str(uid)] = (str(addr), port)
     return out
 
+
+
+def _sweep_camera_port(ip: str) -> int:
+    """Sweep LAN ports for a camera responding to the vendor hello.
+
+    Sends the App send hello to each port in the ephemeral range and
+    returns the first port that sends back RTP data. Returns 0 if no
+    responder is found.
+    """
+    import socket as _socket
+    PUNCH = b"App send hello"
+    LO, HI = 32768, 61000
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.settimeout(0.2)
+    try:
+        for port in range(LO, HI + 1):
+            try:
+                sock.sendto(PUNCH, (ip, port))
+                data, _ = sock.recvfrom(65535)
+                if len(data) >= 12 and (data[0] >> 1 & 0x7F) == 26:
+                    return port
+            except _socket.timeout:
+                continue
+    finally:
+        sock.close()
+    return 0
 
 class GPS555:
     def __init__(self, token: str):
@@ -538,6 +588,14 @@ def build_jpeg_header(width, height, qtables, jtype, dri) -> bytes:
     return bytes(out)
 
 
+# Fragment-housekeeping bounds: never track more than _MAX_PENDING_TS
+# timestamps at once, and when over, keep only the _KEEP_NEWEST_TS newest.
+# At 15 fps a whole frame is 2-6 fragments, so 4 pending frames is already
+# a badly stalled stream worth discarding from the front.
+_MAX_PENDING_TS = 8
+_KEEP_NEWEST_TS = 4
+
+
 class RtpJpegReassembler:
     def __init__(self, emit):
         self._frags = defaultdict(dict)
@@ -583,8 +641,8 @@ class RtpJpegReassembler:
             parts = self._frags.pop(ts)
             body = b"".join(parts[o] for o in sorted(parts))
             self._emit(build_jpeg_header(w, h, qt, jt, dri) + body + b"\xff\xd9")
-        if len(self._frags) > 8:
-            for old in sorted(self._frags)[:-4]:
+        if len(self._frags) > _MAX_PENDING_TS:
+            for old in sorted(self._frags)[:-_KEEP_NEWEST_TS]:
                 self._frags.pop(old, None)
                 self._meta.pop(old, None)
         return True
@@ -766,14 +824,8 @@ class RelayStream:
         kind = self._channels.get(channel)
         if not kind or len(packet) < 12:
             return
-        if kind == "video":
-            if self._asm.feed(packet):
-                self._on_rx()
-        elif kind == "audio":
-            payload = rtp_payload(packet)
-            if payload:
-                self._on_audio(ulaw_to_pcm16(payload))
-                self._on_rx()
+        ingest_rtp_media(kind, packet, self._asm, self._on_frame,
+                         self._on_audio, self._on_rx)
 
     # ---- SDP ----------------------------------------------------------------
 
@@ -985,6 +1037,7 @@ class ZiotCamera:
         # Media identity. None means this UID carries no usable SSRC, so the
         # direct path can only check which socket a datagram arrived on.
         self._ssrc = uid_ssrc(self.uid)
+        self._learned_ssrc = None  # learned from first valid RTP packet in offline mode
         self._media_source = None       # where media actually comes from
         self._log_throttle: dict = {}
         # FPS tracking
@@ -997,6 +1050,7 @@ class ZiotCamera:
         self._re_rendezvous_count = 0
         self._backoff = RECOVERY_INITIAL_BACKOFF
         self._last_re_rendezvous = 0.0
+        self._last_reannounce = 0.0  # timestamp of last reannounce
         self._wake_now = False          # set when cloud onlineState goes 0→1
         # Endpoint selection + STUN freshness (mirrors DeviceStunItem)
         self._endpoint_kind = None      # "private" | "public"
@@ -1162,7 +1216,19 @@ class ZiotCamera:
                 except Exception:
                     pass
                 return False
-            addr = (self._static_addr[0], self._static_addr[1])
+            # Discover the camera's listen port if not specified
+            punch_port = self._static_addr[1]
+            if punch_port == 0:
+                punch_port = _sweep_camera_port(self._static_addr[0])
+                if punch_port == 0:
+                    log.error("[%s] could not discover camera port for %s, try specifying ip:port in offline_endpoints",
+                     self.uid, self._static_addr[0])
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    return False
+            addr = (self._static_addr[0], punch_port)
             with self._sock_lock:
                 self.sock = sock
                 self.addr = addr
@@ -1535,6 +1601,20 @@ class ZiotCamera:
             if gap:
                 time.sleep(gap)
 
+    def _record_attempt(self, ok: bool) -> None:
+        """Account one recovery attempt.
+
+        A streaming attempt resets the failure count; anything else counts
+        and doubles the backoff. Resetting the backoff to its initial value
+        is deliberately NOT here: the top-of-tick is_streaming check owns
+        that, so one attempt cannot both succeed and reset in the same tick.
+        """
+        if ok:
+            self._consec_failures = 0
+        else:
+            self._consec_failures += 1
+        self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+
     def _recovery_tick(self):
         """One pass of the recovery loop. `return` here means "done for now"."""
         if self.relayed:
@@ -1571,7 +1651,10 @@ class ZiotCamera:
                 return
 
         # Punch-only: keep the socket, sweep the LAN. Re-rendezvous would
-        # rebind and there is no relay without a device-list relay_ip.
+        # rebind and there is no relay without a device-list relay_ip. A
+        # sweep that produced media resets the backoff at once -- there is
+        # no transport attempt here whose success the next tick could
+        # rediscover, so the reset cannot be left to it.
         if self.api is None:
             log.warning("[%s] stream dead %.0fs — LAN resweep (backoff %.0fs)",
                         self.uid, dead_for, self._backoff)
@@ -1582,8 +1665,7 @@ class ZiotCamera:
                 self._consec_failures = 0
                 self._backoff = RECOVERY_INITIAL_BACKOFF
             else:
-                self._consec_failures += 1
-                self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+                self._record_attempt(False)
             return
 
         # Cloud says the camera is asleep. Rebinding here is how a 60s backoff
@@ -1594,6 +1676,7 @@ class ZiotCamera:
             self._last_re_rendezvous = time.monotonic()
             self._re_rendezvous_count += 1
             self._reannounce()
+            self._last_reannounce = time.monotonic()
             self._backoff = RECOVERY_INITIAL_BACKOFF
             return
 
@@ -1603,22 +1686,17 @@ class ZiotCamera:
         self._last_re_rendezvous = time.monotonic()
         self._re_rendezvous_count += 1
 
-        if self._open_transport():
+        ok = self._open_transport()
+        if ok:
             # Reset frame tracker
             self._frame_times.clear()
-            # After re-rendezvous, wait a bit before checking again
-            self._stop.wait(self._backoff)
-            if self.is_streaming:
-                self._consec_failures = 0
-            else:
-                self._consec_failures += 1
-            # Exponential backoff
-            self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
         else:
             log.error("[%s] %s failed", self.uid, what)
-            self._consec_failures += 1
-            self._stop.wait(self._backoff)
-            self._backoff = min(self._backoff * 2, RECOVERY_MAX_BACKOFF)
+        # Either way the attempt costs one backoff, after which the attempt
+        # is accounted exactly once: streaming resets the count, failure
+        # counts and doubles.
+        self._stop.wait(self._backoff)
+        self._record_attempt(ok and self.is_streaming)
 
         # The direct path is not coming back — try the vendor relay, which
         # is what the app does when it cannot reach the camera itself.
@@ -1646,6 +1724,10 @@ class ZiotCamera:
         self._frame_times.append(time.monotonic())
         self.video.publish(jpeg)
 
+    def _on_direct_audio(self, pcm: bytes) -> None:
+        self.stats["audio_pkts"] += 1
+        self.audio.publish(pcm)
+
     def _handle_direct_packet(self, sock: socket.socket, source: tuple[str, int], packet: bytes, asm: RtpJpegReassembler) -> bool:
         """Accept one datagram from the direct socket.
 
@@ -1664,33 +1746,34 @@ class ZiotCamera:
             return False
         if self._ssrc is not None:
             ssrc = struct.unpack("!I", packet[8:12])[0]
-            if ssrc != self._ssrc:
-                self.stats["foreign_ssrc"] += 1
-                self._log_throttled(
-                    "foreign_ssrc", logging.WARNING,
-                    "[%s] dropping RTP with ssrc 0x%08x, expected 0x%08x "
-                    "(%d so far)", self.uid, ssrc, self._ssrc,
-                    self.stats["foreign_ssrc"])
-                return False
+            # In offline mode without a token, learn the SSRC from the first valid
+            # camera packet rather than strictly matching the UID-mapped value,
+            # which the camera may not use when operating punch-only.
+            if self.api is None and self._learned_ssrc is None:
+                self._learned_ssrc = ssrc
+            elif self._ssrc is not None and ssrc != self._ssrc:
+                # If we have a learned SSRC (from offline mode), use that instead
+                if self.api is None and self._learned_ssrc is not None and ssrc == self._learned_ssrc:
+                    pass  # Accept packet with learned SSRC
+                else:
+                    self.stats["foreign_ssrc"] += 1
+                    self._log_throttled(
+                        "foreign_ssrc", logging.WARNING,
+                        "[%s] dropping RTP with ssrc 0x%08x, expected 0x%08x "
+                        "(%d so far)", self.uid, ssrc, self._ssrc,
+                        self.stats["foreign_ssrc"])
+                    return False
         if source != addr and source != self._media_source:
             log.info("[%s] media arriving from %s while the broker says %s",
                      self.uid, source, addr)
         self._media_source = source
-        pt = packet[1] & 0x7f
-        if pt == 26:
-            if asm.feed(packet):
-                self._mark_rx()
-                return True
+        # Payload type decides the kind here; the relay decides by channel.
+        # Both feed the same pipeline (ingest_rtp_media).
+        kind = {26: "video", 0: "audio"}.get(packet[1] & 0x7f)
+        if kind is None:
             return False
-        elif pt == 0:
-            payload = rtp_payload(packet)
-            if not payload:
-                return False
-            self.stats["audio_pkts"] += 1
-            self.audio.publish(ulaw_to_pcm16(payload))
-            self._mark_rx()
-            return True
-        return False
+        return ingest_rtp_media(kind, packet, asm, self._on_frame,
+                                self._on_direct_audio, self._mark_rx)
 
     def _receive(self):
         asm = RtpJpegReassembler(self._on_frame)
@@ -1954,13 +2037,18 @@ def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
                 self._index()
             elif path == "health":
                 self._health()
-            elif path.startswith("view/") and path[5:] in cameras:
-                self._view(path[5:])
-            elif path.startswith("cam/") and path[4:] in cameras:
-                self._mjpeg(cameras[path[4:]])
-            elif path.startswith("audio/") and path[6:] in cameras:
-                self._wav(cameras[path[6:]])
             else:
+                # One route table; the slice length comes from the prefix,
+                # so the per-route offsets can never drift apart.
+                for prefix, fn in (("view/", self._view), ("cam/", self._mjpeg),
+                                   ("audio/", self._wav)):
+                    if path.startswith(prefix):
+                        uid = path[len(prefix):]
+                        if uid in cameras:
+                            fn(cameras[uid])
+                        else:
+                            self.send_error(404)
+                        return
                 self.send_error(404)
 
         def _send(self, body: bytes, ctype: str):
@@ -2001,7 +2089,8 @@ def make_handler(cameras: dict, boot: "BootState", lock: threading.Lock):
             }
             self._send(json.dumps(data, indent=2).encode(), "application/json")
 
-        def _view(self, uid: str):
+        def _view(self, cam: ZiotCamera):
+            uid = cam.uid
             self._send(f"""<!doctype html><meta charset=utf-8>
 <title>ZIOT {uid}</title>
 <style>body{{background:#111;color:#ddd;font:14px system-ui;text-align:center;
@@ -2014,57 +2103,56 @@ max-width:100%}}</style>
 sound until you interact &mdash; press play if silent.</p>
 """.encode(), "text/html; charset=utf-8")
 
+        def _pump(self, cam: ZiotCamera, q: queue.Queue, label: str,
+                  write) -> None:
+            """Stream one Fanout to this client until it goes away.
+
+            The idle policy is shared because it is one policy: three 10s
+            gaps without media end the stream. A client hanging up
+            mid-frame is the normal way to stop watching, so only that --
+            and nothing else -- is swallowed here."""
+            idle = 0
+            try:
+                while True:
+                    try:
+                        item = q.get(timeout=10)
+                    except queue.Empty:
+                        idle += 1
+                        if idle >= 3:
+                            log.warning("[%s] %s idle timeout", cam.uid,
+                                        label)
+                            break
+                        continue
+                    idle = 0
+                    write(item)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def _mjpeg(self, cam: ZiotCamera):
             self.send_response(200)
             self.send_header("Content-Type",
                              "multipart/x-mixed-replace; boundary=frame")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            try:
-                idle = 0
-                with cam.video.subscribe() as q:
-                    while True:
-                        try:
-                            frame = q.get(timeout=10)
-                        except queue.Empty:
-                            idle += 1
-                            if idle >= 3:
-                                log.warning("[%s] viewer idle timeout", cam.uid)
-                                break
-                            continue
-                        idle = 0
-                        self.wfile.write(
-                            b"--frame\r\nContent-Type: image/jpeg\r\n"
-                            b"Content-Length: " + str(len(frame)).encode()
-                            + b"\r\n\r\n" + frame + b"\r\n")
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            with cam.video.subscribe() as q:
+                self._pump(cam, q, "viewer", self._write_jpeg_part)
+
+        def _write_jpeg_part(self, frame: bytes) -> None:
+            self.wfile.write(
+                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(frame)).encode()
+                + b"\r\n\r\n" + frame + b"\r\n")
 
         def _wav(self, cam: ZiotCamera):
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            try:
-                self.wfile.write(wav_header())
-                self.wfile.flush()
-                idle = 0
-                with cam.audio.subscribe() as q:
-                    while True:
-                        try:
-                            chunk = q.get(timeout=10)
-                        except queue.Empty:
-                            idle += 1
-                            if idle >= 3:
-                                log.warning("[%s] audio viewer idle timeout", cam.uid)
-                                break
-                            continue
-                        idle = 0
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            self.wfile.write(wav_header())
+            self.wfile.flush()
+            with cam.audio.subscribe() as q:
+                self._pump(cam, q, "audio viewer", self.wfile.write)
 
     return Handler
 

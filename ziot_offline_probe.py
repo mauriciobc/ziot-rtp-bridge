@@ -56,14 +56,12 @@ def parse_ports(spec: str) -> list:
 
 
 def describe(payload: bytes) -> str:
+    pt = payload[1] & 0x7F
+    ssrc = struct.unpack("!I", payload[8:12])[0] if len(payload) >= 12 else 0
     if not is_rtp_media(payload):
         if len(payload) < 12:
             return f"{len(payload)}B non-RTP"
-        pt = payload[1] & 0x7F
-        ssrc = struct.unpack("!I", payload[8:12])[0]
         return f"non-RTP (v{(payload[0] >> 6)} pt={pt} ssrc=0x{ssrc:08x})"
-    pt = payload[1] & 0x7F
-    ssrc = struct.unpack("!I", payload[8:12])[0]
     return f"ssrc=0x{ssrc:08x} pt={pt}"
 
 
