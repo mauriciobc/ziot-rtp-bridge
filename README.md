@@ -205,10 +205,14 @@ A camera the cloud marks `onlineState=0` is usually asleep (these TXW817
 units are battery-powered). Punching its last LAN IP does nothing while
 the radio is down. Keep the token: while the camera is cloud-offline the
 bridge **reannounces the same local UDP port** (no rebind — a new source
-port is a miss when it next checks in) and sends `notify(start)`. When
-`onlineState` flips 0→1, rendezvous runs immediately instead of waiting
-out a 60 s backoff. Device-list flags are polled every 5 s while any
-camera is cloud-offline (otherwise 30 s).
+port is a miss when it next checks in) and sends `notify(start)`. The
+reannounce interval grows 5 → 10 → 20 → 40 → 60 s (capped) — a sleeping
+camera checks in rarely, and re-registering every 5 s for hours is cloud
+chatter with nothing to catch. When `onlineState` flips 0→1, rendezvous
+runs immediately instead of waiting out the grown backoff. Device-list
+flags are polled every 5 s while any camera is cloud-offline (otherwise
+30 s), and that poll — not the reannounce — is what catches the camera's
+short awake window.
 
 Omit the token only if `ziot_offline_probe.py` reports a HIT. Then the
 bridge punches that host, hello-sweeps when starved, and will not rebind
@@ -592,8 +596,9 @@ near 241 of 255, so it discards most color information. Luma detail is fine.
 
 While `onlineState=0` the bridge reannounces the same local UDP port
 instead of rebinding — a sleeping battery camera checks in for a few
-seconds, and a new source port is a miss. When the flag flips 0→1,
-rendezvous runs immediately instead of waiting out the 60 s backoff.
+seconds, and a new source port is a miss. The reannounce interval grows
+to the 60 s cap while the camera stays asleep. When the flag flips 0→1,
+rendezvous runs immediately instead of waiting out the grown backoff.
 
 **There is no "start live" command.** An earlier version of this bridge sent
 `POST /api/v1/cmd/send-cmd {"cmdType":"20"}` before the rendezvous, believing it
@@ -741,7 +746,8 @@ reliability improvements were added during deployment:
   ephemeral range, and the camera's RTP identifies the port.
 * **No-rebind recovery** — while a camera is cloud-offline the same local
   UDP port is reannounced instead of rebound (a 176-rendezvous loop used
-  to close the socket the camera would send to). Punch-only cameras
+  to close the socket the camera would send to), on a growing interval
+  (5 → 60 s capped) rather than a fixed 5 s. Punch-only cameras
   hello-sweep from the existing socket, at rendezvous and on recovery
   alike; SSRC learning accepts only RTP v2 with PT 0/26, so a hello echo
   cannot poison it.

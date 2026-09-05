@@ -1058,7 +1058,6 @@ class ZiotCamera:
         self._re_rendezvous_count = 0
         self._backoff = RECOVERY_INITIAL_BACKOFF
         self._last_re_rendezvous = 0.0
-        self._last_reannounce = 0.0  # timestamp of last reannounce
         self._wake_now = False          # set when cloud onlineState goes 0→1
         # Endpoint selection + STUN freshness (mirrors DeviceStunItem)
         self._endpoint_kind = None      # "private" | "public"
@@ -1691,14 +1690,20 @@ class ZiotCamera:
 
         # Cloud says the camera is asleep. Rebinding here is how a 60s backoff
         # turns into 176 closed sockets and a miss when it next checks in.
+        # The reannounce interval grows instead of sitting at the initial 5s:
+        # a sleeping camera checks in rarely, and re-registering its port
+        # every 5s for hours is cloud chatter with nothing to catch. The
+        # awake window is the cloud poller's job (STATUS_OFFLINE_INTERVAL):
+        # a 0->1 flip there kicks the wake below, which resets this backoff
+        # and bypasses the gate entirely.
         if not wake and not cloud_is_on(self.cloud) and self.sock is not None:
             log.warning("[%s] cloud-offline %.0fs — reannounce, no rebind "
-                        "(backoff %.0fs)", self.uid, dead_for, self._backoff)
+                        "(next in %.0fs)", self.uid, dead_for, self._backoff)
             self._last_re_rendezvous = time.monotonic()
             self._re_rendezvous_count += 1
             self._reannounce()
-            self._last_reannounce = time.monotonic()
-            self._backoff = RECOVERY_INITIAL_BACKOFF
+            self._backoff = min(max(self._backoff, RECOVERY_INITIAL_BACKOFF)
+                                * 2, RECOVERY_MAX_BACKOFF)
             return
 
         what = "relay" if self.force_relay else "re-rendezvous"

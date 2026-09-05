@@ -2025,5 +2025,55 @@ class RelayCloseRaceTests(unittest.TestCase):
             conn.close()
 
 
+class ReannounceBackoffTests(unittest.TestCase):
+    """While a camera is cloud-offline the reannounce interval must grow
+    instead of sitting at the fixed initial 5s forever: a sleeping camera
+    checks in rarely, and re-registering its port every 5s for hours is
+    cloud chatter with nothing to catch. The awake window belongs to the
+    cloud poller (STATUS_OFFLINE_INTERVAL), whose 0->1 flip kicks the wake
+    and resets this backoff."""
+
+    def make_cam(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0", "mediaState": "0"})
+        cam.sock = bind_loopback()
+        self.addCleanup(cam.sock.close)
+        cam.addr = ("127.0.0.1", 9)
+        cam._reannounce = mock.Mock()
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        return cam
+
+    def test_the_reannounce_interval_grows_and_caps(self):
+        cam = self.make_cam()
+        for expected in (10.0, 20.0, 40.0, 60.0, 60.0):
+            with self.subTest(next_in=expected):
+                cam._last_re_rendezvous = 0.0   # age out the gate
+                cam._recovery_tick()
+                self.assertEqual(cam._reannounce.call_count, 1)
+                self.assertEqual(cam._backoff, expected)
+            cam._reannounce.reset_mock()
+
+    def test_streaming_resets_the_grown_backoff(self):
+        cam = self.make_cam()
+        cam._backoff = 60.0
+        cam._last_rx = time.monotonic()     # media flowing again
+        cam._recovery_tick()
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+        cam._reannounce.assert_not_called()
+
+    def test_a_wake_bypasses_the_grown_backoff(self):
+        cam = self.make_cam()
+        cam._backoff = 60.0
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})  # 0->1
+        self.assertEqual(cam._backoff, 0.0)
+        self.assertTrue(cam._wake_now)
+        cam._open_transport = mock.Mock(return_value=True)
+        cam._recovery_tick()
+        # The wake goes straight at a full re-rendezvous, not a reannounce.
+        cam._open_transport.assert_called_once()
+        cam._reannounce.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
