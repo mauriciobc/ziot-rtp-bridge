@@ -7,6 +7,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -438,6 +441,173 @@ class LogThrottleTests(unittest.TestCase):
                     rtp_packet(0, b"\x77" * 160, ts=i, ssrc=CAM_SSRC + 1), asm))
         self.assertEqual(len(logs.output), 1)
         self.assertEqual(self.cam.stats["foreign_ssrc"], 30)
+
+
+def http_error(code):
+    return urllib.error.HTTPError("https://cloud/v1/ipc", code,
+                                  "rejected", {}, None)
+
+
+class AuthFailureTests(unittest.TestCase):
+    """A rejected token is a config error wearing a network error's clothes;
+    a cloud outage is the thing retrying actually fixes."""
+
+    def test_rejections_that_retrying_cannot_fix(self):
+        for e in (http_error(401), http_error(403),
+                  bridge.CloudError(401, "Erro comum"),
+                  bridge.CloudError(403, "")):
+            with self.subTest(e=str(e)):
+                self.assertTrue(bridge.is_auth_failure(e))
+
+    def test_everything_else_is_worth_retrying(self):
+        for e in (http_error(500), http_error(502), http_error(429),
+                  bridge.CloudError(500, "server blew up"),
+                  urllib.error.URLError("connection refused"),
+                  socket.timeout("timed out"), KeyError("data"),
+                  OSError("network unreachable")):
+            with self.subTest(e=type(e).__name__):
+                self.assertFalse(bridge.is_auth_failure(e))
+
+    def test_the_cloud_reports_rejection_in_the_body_not_the_status(self):
+        """Observed live: a bogus token gets 200 OK with {"code": 401}. The
+        HTTP status says nothing, so the body is the only signal."""
+        self.assertEqual(bridge.cloud_error_code({"code": 401, "msg": "x"}), 401)
+        self.assertEqual(bridge.cloud_error_code({"code": "401"}), 401)
+
+    def test_a_response_carrying_data_is_never_an_error(self):
+        for body in ({"data": {"list": []}},
+                     {"code": 401, "data": {"list": []}},
+                     {"data": None}):
+            with self.subTest(body=body):
+                self.assertIsNone(bridge.cloud_error_code(body))
+
+    def test_unreadable_codes_are_not_invented(self):
+        for body in ({}, {"code": None}, {"code": "nope"}, [], None):
+            with self.subTest(body=body):
+                self.assertIsNone(bridge.cloud_error_code(body))
+
+    def test_list_cameras_raises_what_the_cloud_said(self):
+        api = bridge.GPS555("bogus")
+        with mock.patch.object(api, "_get",
+                               return_value={"code": 401, "msg": "Erro comum"}):
+            with self.assertRaises(bridge.CloudError) as cm:
+                api.list_cameras(1)
+        self.assertEqual(cm.exception.code, 401)
+        self.assertIn("Erro comum", str(cm.exception))
+        self.assertTrue(bridge.is_auth_failure(cm.exception))
+
+    def test_list_cameras_still_returns_the_list(self):
+        api = bridge.GPS555("t")
+        rows = [{"uid": CAM_UID}]
+        with mock.patch.object(api, "_get",
+                               return_value={"data": {"list": rows}}):
+            self.assertEqual(api.list_cameras(1), rows)
+
+
+class BootStateTests(unittest.TestCase):
+    def test_starts_out_starting_with_nothing_else_to_say(self):
+        self.assertEqual(bridge.BootState().snapshot(), {"phase": "starting"})
+
+    def test_detail_and_attempts_appear_only_once_set(self):
+        state = bridge.BootState()
+        state.set("retrying", "device list unavailable: timed out", 3)
+        self.assertEqual(state.snapshot(), {
+            "phase": "retrying",
+            "detail": "device list unavailable: timed out",
+            "attempts": 3,
+        })
+        state.set("ready", None)
+        self.assertEqual(state.snapshot(), {"phase": "ready"})
+
+
+class HealthEndpointTests(unittest.TestCase):
+    """The watchdog reads this payload, so its shape is a contract."""
+
+    def serve(self, cameras, boot):
+        server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                     bridge.make_handler(cameras, boot))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=5) as r:
+            return json.loads(r.read())
+
+    def test_health_answers_before_any_camera_exists(self):
+        boot = bridge.BootState()
+        boot.set("retrying", "device list unavailable: timed out", 3)
+        data = self.serve({}, boot)
+        # "error" belongs to the watchdog, for "could not reach the bridge".
+        self.assertEqual(data["status"], "degraded")
+        self.assertEqual(data["cameras"], [])
+        self.assertEqual(data["boot"]["phase"], "retrying")
+        self.assertEqual(data["boot"]["attempts"], 3)
+        self.assertIn("timed out", data["boot"]["detail"])
+
+    def test_a_ready_bridge_says_so(self):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        data = self.serve({}, boot)
+        self.assertEqual(data["boot"], {"phase": "ready"})
+
+
+class BootResilienceTests(unittest.TestCase):
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.old_interval = bridge.PUNCH_INTERVAL
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+        self.addCleanup(setattr, bridge, "PUNCH_INTERVAL", self.old_interval)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1}, f)
+            self.path = f.name
+        self.addCleanup(Path(self.path).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", self.path]
+
+    def test_a_rejected_token_at_startup_exits_before_binding(self):
+        """Nothing is serving yet and no token un-expires itself, so this is
+        fatal in the same sense as an unreadable config file."""
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server:
+            gps.return_value.list_cameras.side_effect = \
+                bridge.CloudError(401, "Erro comum")
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("rejected the token", "\n".join(logs.output))
+        server.assert_not_called()
+
+    def test_a_cloud_outage_at_startup_serves_health_anyway(self):
+        """Exiting instead is the same retry loop with every camera dark in
+        between and no /health answering to say why."""
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server:
+            gps.return_value.list_cameras.side_effect = \
+                urllib.error.URLError("connection refused")
+            with self.assertLogs(bridge.log, "WARNING"):
+                bridge.main()          # returns once serve_forever does
+        server.assert_called_once()
+        served = server.call_args[0]
+        self.assertEqual(served[0], ("0.0.0.0", 8085))
+        server.return_value.serve_forever.assert_called_once()
+
+    def test_an_unreachable_broker_falls_back_to_the_default_route(self):
+        """get_stun_addr was the other unguarded cloud call in the boot path."""
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam, \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.1.5") as local_ip:
+            gps.return_value.list_cameras.return_value = [{"uid": CAM_UID}]
+            gps.return_value.get_stun_addr.side_effect = socket.timeout("nope")
+            cam.return_value.start.return_value = True
+            with self.assertLogs(bridge.log, "WARNING") as logs:
+                bridge.main()
+        server.assert_called_once()
+        local_ip.assert_called_with("8.8.8.8")
+        self.assertIn("falling back to the default route",
+                      "\n".join(logs.output))
 
 
 class ConfigLoadTests(unittest.TestCase):

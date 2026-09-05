@@ -69,6 +69,18 @@ def main():
         issues.append(f"BRIDGE DOWN: {bridge.get('error')}")
         print(f"CRITICAL: Bridge unreachable — {bridge.get('error')}")
     else:
+        # Fields added alongside the resilient boot; tolerate an older bridge.
+        # A bridge that is up but has no cameras yet -- cloud unreachable, token
+        # rejected -- serves an empty list, which the loop below would walk in
+        # silence and call healthy. The boot phase is the only thing that says
+        # otherwise, so read it before trusting an empty roster.
+        boot = bridge.get("boot") or {}
+        phase = boot.get("phase")
+        if phase and phase != "ready":
+            detail = boot.get("detail") or phase
+            issues.append(f"BRIDGE NOT SERVING CAMERAS ({phase}): {detail}")
+            print(f"  [BOOT] {phase}: {detail}")
+
         for cam in bridge.get("cameras", []):
             uid = cam["uid"]
             streaming = cam["streaming"]
