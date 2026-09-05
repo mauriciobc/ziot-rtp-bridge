@@ -22,6 +22,7 @@ v3 follows a Dart-level decompilation of the vendor app (DECOMPILATION_REPORT.md
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import queue
@@ -350,6 +351,34 @@ def relay_urls(row: dict) -> list[str]:
     rtp = f"rtsp://{host}/rtp/{uid[-8:]}"
     live = f"rtsp://{host}/live/{uid}"
     return [rtp, live] if old_form else [live, rtp]
+
+def parse_static_endpoints(raw: dict) -> dict:
+    """Validate offline_endpoints {uid: ip:port} into {uid: (ip, port)}.
+
+    Raises ValueError naming the bad entry. Strict on purpose: a bare port
+    would punch 0.0.0.0, an out-of-range port dies inside sendto where the
+    punch loop swallows it, and the socket is AF_INET so IPv6 can never
+    send. Every one of those boots a bridge that reports mode=direct and
+    streams nothing.
+    """
+    out = {}
+    for uid, ep in (raw or {}).items():
+        ip_s, sep, port_s = str(ep).rpartition(":")
+        try:
+            port = int(port_s)
+        except (TypeError, ValueError):
+            port = -1
+        try:
+            addr = ipaddress.ip_address(ip_s.strip("[] "))
+            ok_ip = isinstance(addr, ipaddress.IPv4Address)
+        except ValueError:
+            ok_ip = False
+        if not sep or not ok_ip or not 0 < port < 65536:
+            raise ValueError(
+                f"offline endpoint for {uid!r} must be an IPv4 ip:port "
+                f"with port 1-65535, got {ep!r}")
+        out[str(uid)] = (str(addr), port)
+    return out
 
 
 class GPS555:
@@ -1916,13 +1945,10 @@ def main():
     offline = bool(args.offline or cfg.get("offline"))
     static: dict = {}
     if offline:
-        for uid, ep in (cfg.get("offline_endpoints") or {}).items():
-            ip, _, port = str(ep).rpartition(":")
-            try:
-                static[str(uid)] = (ip.strip("[] "), int(port))
-            except ValueError:
-                ap.error(f"offline endpoint for {uid} must be ip:port, "
-                         f"got {ep!r}")
+        try:
+            static = parse_static_endpoints(cfg.get("offline_endpoints"))
+        except ValueError as e:
+            ap.error(str(e))
         if not static:
             ap.error("offline mode needs offline_endpoints "
                      "{uid: ip:port} in the config")
@@ -1951,6 +1977,7 @@ def main():
         rather than a transient one, so the caller stops instead of retrying.
         """
         wanted = set(cfg.get("cameras") or [])
+        cams = [c for c in cams if not wanted or c["uid"] in wanted]
         only_online = bool(cfg.get("only_online"))
         if offline and only_online:
             log.warning("only_online needs cloud flags; ignoring in offline mode")
@@ -1972,7 +1999,10 @@ def main():
         # subnet; the per-camera choice between LAN and public happens later, in
         # ZiotCamera._pick_endpoint.
         probe = None
-        if not offline:
+        if offline:
+            # No broker to ask: the static endpoints ARE the camera LAN.
+            probe = next(iter(static.values()))[0]
+        else:
             try:
                 probe = api.get_stun_addr(cams[0]["uid"]).get("IpcPrivateIP")
             except Exception as e:
@@ -1986,8 +2016,13 @@ def main():
             bind_ip = local_ip_for(probe)
         else:
             bind_ip = local_ip_for("8.8.8.8")
-            log.warning("no IpcPrivateIP from the broker — binding on %s by default "
-                        "route; pass --bind-ip if that is the wrong interface", bind_ip)
+            if offline:
+                log.warning("no --bind-ip given — binding on %s by default "
+                            "route; pass --bind-ip if that is the wrong "
+                            "interface", bind_ip)
+            else:
+                log.warning("no IpcPrivateIP from the broker — binding on %s by default "
+                            "route; pass --bind-ip if that is the wrong interface", bind_ip)
         log.info("binding on %s (camera LAN %s), punch every %.1fs",
                  bind_ip, probe or "unknown", PUNCH_INTERVAL)
 

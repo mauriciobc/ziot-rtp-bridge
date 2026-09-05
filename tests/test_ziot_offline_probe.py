@@ -75,6 +75,14 @@ class ProbeTests(unittest.TestCase):
         self.assertIn(f":{cam.port}", out)
     def test_port_spec_parses_ranges_and_singles(self):
         self.assertEqual(probe.parse_ports("1-3,5"), [1, 2, 3, 5])
+    def test_hostname_target_matches_its_answers(self):
+        cam = FakeCamera().start()
+        self.addCleanup(cam.close)
+        rc, out = self.run_probe(
+            "localhost", "--ports", f"{cam.port - 1}-{cam.port + 1}",
+            "--uid", CAM_UID, "--rate", "5000", "--listen", "1")
+        self.assertEqual(rc, 0)
+        self.assertIn(f":{cam.port}", out)
 
     def test_silent_target_reports_nothing(self):
         # Reserve then release: ports nothing listens on.

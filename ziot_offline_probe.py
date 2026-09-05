@@ -75,6 +75,12 @@ def main() -> int:
                     help="local IP to send from (default: route to target)")
     args = ap.parse_args()
 
+    try:
+        target_ip = socket.gethostbyname(args.target)
+    except OSError as e:
+        print(f"cannot resolve {args.target}: {e}", file=sys.stderr)
+        return 1
+
     ports = parse_ports(args.ports)
     if not ports:
         print("no ports to scan", file=sys.stderr)
@@ -114,7 +120,7 @@ def main() -> int:
         for p in ports:
             for h in hellos:
                 try:
-                    sock.sendto(h, (args.target, p))
+                    sock.sendto(h, (target_ip, p))
                 except OSError:
                     pass
             if gap > 0:
@@ -122,20 +128,20 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     sweep_s = time.monotonic() - t0
-    print(f"swept {len(ports)} ports on {args.target} "
+    print(f"swept {len(ports)} ports on {args.target} ({target_ip}) "
           f"in {sweep_s:.1f}s; listening {args.listen:.0f}s more...",
           flush=True)
     time.sleep(args.listen)
     stop.set()
-    sock.close()
     listener.join(timeout=2)
+    sock.close()
 
     hits = 0
     with lock:
         items = sorted(seen.items(),
                        key=lambda kv: kv[1]["n"], reverse=True)
     for (ip, port), e in items:
-        if ip != args.target:
+        if ip != target_ip:
             continue
         info = describe(e["sample"])
         ssrc = struct.unpack("!I", e["sample"][8:12])[0] \

@@ -674,6 +674,54 @@ class BootResilienceTests(unittest.TestCase):
                       "\n".join(logs.output))
 
 
+class AllowListTests(unittest.TestCase):
+    """The cameras allow-list must filter the device list at startup."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "cameras": ["AAA"]}, f)
+            self.path = f.name
+        self.addCleanup(Path(self.path).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", self.path,
+                    "--bind-ip", "127.0.0.1"]
+
+    def test_only_listed_cameras_boot(self):
+        roster = [{"uid": "AAA"}, {"uid": "BBB"}, {"uid": "CCC"}]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            gps.return_value.list_cameras.return_value = roster
+            cam.return_value.start.return_value = True
+            bridge.main()
+        self.assertEqual(cam.call_count, 1)
+        rec = cam.call_args[0][1]
+        self.assertEqual(rec["uid"], "AAA")
+        server.assert_called_once()
+
+class EndpointParseTests(unittest.TestCase):
+    """Unsendable endpoints must fail at boot, not punch silence."""
+
+    def test_valid_map_parses(self):
+        self.assertEqual(
+            bridge.parse_static_endpoints(
+                {"A": "192.168.18.75:52901", "B": "10.0.0.5:9"}),
+            {"A": ("192.168.18.75", 52901), "B": ("10.0.0.5", 9)})
+
+    def test_unsendable_values_raise(self):
+        for bad in ("52901",                    # bare port -> 0.0.0.0
+                    "1.2.3.4:99999",            # sendto OverflowError
+                    "1.2.3.4:-1",
+                    "1.2.3.4:0",
+                    "not-an-endpoint",
+                    "1.2.3.4:notaport",
+                    "[fe80::1]:5000"):          # AF_INET socket, never sends
+            with self.subTest(ep=bad):
+                with self.assertRaises(ValueError):
+                    bridge.parse_static_endpoints({"A": bad})
+
 class ConfigLoadTests(unittest.TestCase):
     def setUp(self):
         self.old_argv = sys.argv[:]
@@ -966,6 +1014,31 @@ class OfflineModeTests(unittest.TestCase):
             cam.return_value.start.return_value = True
             bridge.main()
         server.assert_called_once()
+
+    def test_offline_binds_from_static_endpoint(self):
+        # Without --bind-ip the default route (8.8.8.8) may leave through
+        # the wrong NIC; the static endpoint already knows the camera LAN.
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "192.168.18.75:52901"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555"), \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera") as cam, \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.18.45") as local_ip:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        local_ip.assert_called_once_with("192.168.18.75")
+
+    def test_offline_rejects_unsendable_endpoint(self):
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "52901"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertRaises(SystemExit) as cm:
+                bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        gps.assert_not_called()
 
 
 if __name__ == "__main__":
