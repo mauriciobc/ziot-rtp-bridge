@@ -77,6 +77,14 @@ PUNCH_INTERVAL = 1.0
 HEART_EVERY_N_PUNCHES = 5
 # Must stay above PUNCH_INTERVAL -- if you retune one, look at the other.
 STARVED_THRESHOLD = 2.0        # re-resolve after 2s of silence
+# Floor between two STUN lookups. get_stun_addr blocks for up to 10s and the
+# punch loop asks for one on every tick without media, so an unfloored resolve
+# stretches the 1s punch cadence to 10s and hits the STUN endpoint once a
+# second per camera -- starving the NAT mapping the punches exist to keep warm.
+RESOLVE_MIN_INTERVAL = 5.0
+# Per-packet conditions log at most this often. At 15 fps a line per packet
+# buries every other log the bridge writes, indefinitely.
+LOG_THROTTLE_INTERVAL = 60.0
 FPS_LOG_INTERVAL = 30           # log fps every 30s
 RECOVERY_DEAD_THRESHOLD = 10.0  # start recovery after 10s dead
 RECOVERY_MAX_BACKOFF = 60.0     # max wait between re-rendezvous attempts
@@ -198,6 +206,22 @@ def same_subnet(a: str, b: str, mask: str = STUN_SUBNET_MASK) -> bool:
     except OSError:
         return False
     return (ia & im) == (ib & im)
+
+
+def uid_ssrc(uid: str) -> int | None:
+    """The SSRC this camera stamps on its RTP, or None if the UID is not the
+    form the mapping assumes.
+
+    The UID's last 8 decimal digits are reused as the SSRC's hex digits:
+    141030191094 -> 0x30191094. This is the only per-camera identifier in the
+    media path, and the only sound way to tell our camera's packets from
+    anyone else's -- the source address cannot do it, since the address the
+    STUN broker reports and the address the camera actually sends from
+    routinely disagree.
+    """
+    if not uid or not uid.isascii() or not uid.isdigit() or len(uid) < 8:
+        return None
+    return int(uid[-8:], 16)
 
 
 _VERSION_RE = re.compile(r"V?(\d+(?:\.\d+)+)")
@@ -399,10 +423,16 @@ class RtpJpegReassembler:
         self._frags.clear()
         self._meta.clear()
 
-    def feed(self, pkt: bytes) -> None:
+    def feed(self, pkt: bytes) -> bool:
+        """Store one structurally valid RFC 2435 fragment.
+
+        Returns True when one fragment was accepted and stored (not when a
+        complete JPEG was emitted). Returns False without touching `_frags`
+        or `_meta` for malformed input.
+        """
         p = rtp_payload(pkt)
         if p is None or len(p) < 8:
-            return
+            return False
         marker = pkt[1] >> 7
         ts = struct.unpack(">I", pkt[4:8])[0]
         frag_off = struct.unpack(">I", b"\x00" + p[1:4])[0]
@@ -410,10 +440,16 @@ class RtpJpegReassembler:
         width, height = p[6] * 8, p[7] * 8
         off, dri = 8, 0
         if jtype >= 64:
+            if len(p) < 12:
+                return False
             dri = struct.unpack(">H", p[8:10])[0]
             off = 12
         if q >= 128 and frag_off == 0:
+            if len(p) < off + 4:
+                return False
             qlen = struct.unpack(">H", p[off + 2:off + 4])[0]
+            if len(p) < off + 4 + qlen:
+                return False
             self._meta[ts] = (width, height, p[off + 4:off + 4 + qlen], jtype, dri)
             off += 4 + qlen
         self._frags[ts][frag_off] = p[off:]
@@ -426,6 +462,7 @@ class RtpJpegReassembler:
             for old in sorted(self._frags)[:-4]:
                 self._frags.pop(old, None)
                 self._meta.pop(old, None)
+        return True
 
 
 class RelayStream:
@@ -604,13 +641,14 @@ class RelayStream:
         kind = self._channels.get(channel)
         if not kind or len(packet) < 12:
             return
-        self._on_rx()
         if kind == "video":
-            self._asm.feed(packet)
-        else:
+            if self._asm.feed(packet):
+                self._on_rx()
+        elif kind == "audio":
             payload = rtp_payload(packet)
             if payload:
                 self._on_audio(ulaw_to_pcm16(payload))
+                self._on_rx()
 
     # ---- SDP ----------------------------------------------------------------
 
@@ -815,14 +853,20 @@ class ZiotCamera:
         self.addr = None
         self.sock = None
         self._sock_lock = threading.Lock()  # guards socket swap
-        self.stats = {"frames": 0, "audio_pkts": 0}
+        self.stats = {"frames": 0, "audio_pkts": 0, "rx_errors": 0,
+                      "foreign_ssrc": 0}
         self._last_rx = 0.0
+        # Media identity. None means this UID carries no usable SSRC, so the
+        # direct path can only check which socket a datagram arrived on.
+        self._ssrc = uid_ssrc(self.uid)
+        self._media_source = None       # where media actually comes from
+        self._log_throttle: dict = {}
         # FPS tracking
         self._frame_times: deque = deque(maxlen=120)
         self._last_fps_log = time.monotonic()
         # Endpoint move tracking
         self._endpoint_moves = 0
-        self._last_resolve = 0.0
+        self._last_resolve = float("-inf")
         # Recovery tracking
         self._re_rendezvous_count = 0
         self._backoff = RECOVERY_INITIAL_BACKOFF
@@ -839,6 +883,10 @@ class ZiotCamera:
         self._relay_user = relay_user
         self._relay_pass = relay_pass
         self._relay_last_direct_try = 0.0
+        if self._ssrc is None:
+            log.warning("[%s] UID is not the 8+ decimal digit form the SSRC "
+                        "mapping assumes -- direct media cannot be "
+                        "identity-checked", self.uid)
 
     def _load_cloud(self, cam: dict) -> None:
         keys = ["onlineState", "mediaState", "connectionState", "natType",
@@ -1009,6 +1057,18 @@ class ZiotCamera:
     def _mark_rx(self) -> None:
         self._last_rx = time.monotonic()
 
+    def _log_throttled(self, key: str, level: int, msg: str, *args, **kw) -> None:
+        """Log at most once per LOG_THROTTLE_INTERVAL per key.
+
+        Both callers sit in the per-packet path, where the condition being
+        reported either holds for one packet or holds for every packet.
+        """
+        now = time.monotonic()
+        if now - self._log_throttle.get(key, float("-inf")) < LOG_THROTTLE_INTERVAL:
+            return
+        self._log_throttle[key] = now
+        log.log(level, msg, *args, **kw)
+
     def _on_relay_audio(self, pcm: bytes) -> None:
         self.stats["audio_pkts"] += 1
         self.audio.publish(pcm)
@@ -1155,6 +1215,13 @@ class ZiotCamera:
             self._stop.wait(KEEPALIVE_INTERVAL)
 
     def _resolve(self) -> None:
+        """Re-ask the broker where the camera is, no more often than
+        RESOLVE_MIN_INTERVAL -- the lookup blocks, and the punch loop asks for
+        one on every tick where media is absent."""
+        now = time.monotonic()
+        if now - self._last_resolve < RESOLVE_MIN_INTERVAL:
+            return
+        self._last_resolve = now
         try:
             picked = self._fetch_endpoint()
         except Exception:
@@ -1164,11 +1231,16 @@ class ZiotCamera:
         ip, prt, kind = picked
         self._note_endpoint(kind)
         addr = (ip, prt)
-        if addr != self.addr:
-            log.info("[%s] endpoint moved %s -> %s", self.uid, self.addr, addr)
-            self.addr = addr
-            self._endpoint_moves += 1
-        self._last_resolve = time.monotonic()
+        moved = False
+        old = None
+        with self._sock_lock:
+            if addr != self.addr:
+                old = self.addr
+                self.addr = addr
+                self._endpoint_moves += 1
+                moved = True
+        if moved:
+            log.info("[%s] endpoint moved %s -> %s", self.uid, old, addr)
 
     def _punch(self):
         tick = 0
@@ -1288,6 +1360,52 @@ class ZiotCamera:
         self._frame_times.append(time.monotonic())
         self.video.publish(jpeg)
 
+    def _handle_direct_packet(self, sock: socket.socket, source: tuple[str, int], packet: bytes, asm: RtpJpegReassembler) -> bool:
+        """Accept one datagram from the direct socket.
+
+        Identity is the RTP SSRC, not the source address. The camera's real
+        sending address and the endpoint the STUN broker reports routinely
+        disagree -- it rebinds a UDP port per session, our /24 subnet test
+        picks the public pair on a wider LAN, and symmetric NAT maps us
+        differently -- so matching on the address would drop every packet of a
+        stream that is working, permanently.
+        """
+        with self._sock_lock:
+            if self.sock is not sock:
+                return False
+            addr = self.addr
+        if len(packet) < 12:
+            return False
+        if self._ssrc is not None:
+            ssrc = struct.unpack("!I", packet[8:12])[0]
+            if ssrc != self._ssrc:
+                self.stats["foreign_ssrc"] += 1
+                self._log_throttled(
+                    "foreign_ssrc", logging.WARNING,
+                    "[%s] dropping RTP with ssrc 0x%08x, expected 0x%08x "
+                    "(%d so far)", self.uid, ssrc, self._ssrc,
+                    self.stats["foreign_ssrc"])
+                return False
+        if source != addr and source != self._media_source:
+            log.info("[%s] media arriving from %s while the broker says %s",
+                     self.uid, source, addr)
+        self._media_source = source
+        pt = packet[1] & 0x7f
+        if pt == 26:
+            if asm.feed(packet):
+                self._mark_rx()
+                return True
+            return False
+        elif pt == 0:
+            payload = rtp_payload(packet)
+            if not payload:
+                return False
+            self.stats["audio_pkts"] += 1
+            self.audio.publish(ulaw_to_pcm16(payload))
+            self._mark_rx()
+            return True
+        return False
+
     def _receive(self):
         asm = RtpJpegReassembler(self._on_frame)
         while not self._stop.is_set():
@@ -1302,24 +1420,21 @@ class ZiotCamera:
                 continue
             sock.settimeout(0.5)
             try:
-                data, _ = sock.recvfrom(65535)
+                data, source = sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except OSError:
                 # Socket was closed (re-rendezvous in progress)
                 self._stop.wait(0.5)
                 continue
-            if len(data) < 12:
-                continue
-            self._last_rx = time.monotonic()
-            pt = data[1] & 0x7f
-            if pt == 26:
-                asm.feed(data)
-            elif pt == 0:
-                payload = rtp_payload(data)
-                if payload:
-                    self.stats["audio_pkts"] += 1
-                    self.audio.publish(ulaw_to_pcm16(payload))
+            try:
+                self._handle_direct_packet(sock, source, data, asm)
+            except Exception:
+                self.stats["rx_errors"] += 1
+                self._log_throttled(
+                    "rx_error", logging.ERROR,
+                    "[%s] direct RTP packet failed (%d so far)",
+                    self.uid, self.stats["rx_errors"], exc_info=True)
 
     def _fps_logger(self):
         while not self._stop.is_set():
@@ -1358,6 +1473,10 @@ class ZiotCamera:
             "fps": round(self.fps, 1),
             "frames_total": self.stats["frames"],
             "audio_pkts": self.stats["audio_pkts"],
+            "rx_errors": self.stats["rx_errors"],
+            "foreign_ssrc": self.stats["foreign_ssrc"],
+            "media_source": (f"{self._media_source[0]}:{self._media_source[1]}"
+                             if self._media_source else None),
             "endpoint_moves": self._endpoint_moves,
             "re_rendezvous_count": self._re_rendezvous_count,
             "backoff_s": round(self._backoff, 1),
@@ -1575,14 +1694,33 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
 
-    cfg = json.load(open(args.config))
+    try:
+        with open(args.config) as fh:
+            cfg = json.load(fh)
+    except OSError as e:
+        # The image ships no config, so this is what a forgotten -v looks like.
+        # Under --restart unless-stopped a bare traceback here just loops.
+        log.error("cannot read config %s: %s -- mount it into the container "
+                  "with  -v /host/path/ziot_config.json:%s:ro",
+                  args.config, e, args.config)
+        raise SystemExit(2)
 
     global PUNCH_INTERVAL
-    PUNCH_INTERVAL = float(cfg.get("punch_interval", PUNCH_INTERVAL))
-    if PUNCH_INTERVAL >= STARVED_THRESHOLD:
-        log.warning("punch_interval %.1fs is not below STARVED_THRESHOLD %.1fs — "
-                    "starved-stream detection will be sluggish",
-                    PUNCH_INTERVAL, STARVED_THRESHOLD)
+    default_interval = PUNCH_INTERVAL
+    raw = cfg.get("punch_interval", default_interval)
+    try:
+        interval = float(raw)
+    except (TypeError, ValueError):
+        interval = None
+    # A bad interval is not worth refusing to boot over: exiting here puts
+    # every camera in the fleet dark in a restart loop. Clamp loudly instead.
+    # (nan and inf fail the range test, so this covers them too.)
+    if interval is None or not 0 < interval < STARVED_THRESHOLD:
+        log.error("punch_interval %r must be a finite number greater than 0 "
+                  "and less than %g -- using %g instead",
+                  raw, STARVED_THRESHOLD, default_interval)
+        interval = default_interval
+    PUNCH_INTERVAL = interval
 
     api = GPS555(cfg["token"])
     cams = api.list_cameras(cfg["user_id"])

@@ -45,10 +45,14 @@ def check_go2rtc():
 def restart_frigate():
     """Restart Frigate container."""
     print("RESTARTING Frigate...")
-    result = subprocess.run(
-        ["docker", "restart", FRIGATE_CONTAINER],
-        capture_output=True, text=True, timeout=30
-    )
+    try:
+        result = subprocess.run(
+            ["docker", "restart", FRIGATE_CONTAINER],
+            capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  RESTART FAILED: {e}")
+        return False
     if result.returncode == 0:
         print(f"  Frigate restarted: {result.stdout.strip()}")
         return True
