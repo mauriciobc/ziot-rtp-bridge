@@ -44,14 +44,14 @@ ffmpeg:
 
 streams:
   cat_cam_1:
-    - http://127.0.0.1:8085/cam/141030191094#vflip
+    - http://127.0.0.1:8085/cam/141030191094
     - ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac#audio=opus#async
-    - ffmpeg:cat_cam_1#video=h264
+    - ffmpeg:cat_cam_1#video=h264#vflip
   cat_cam_2:
-    - http://127.0.0.1:8085/cam/140979857781#vflip
+    - http://127.0.0.1:8085/cam/140979857781
     - ffmpeg:http://127.0.0.1:8085/audio/140979857781#audio=aac#audio=opus#async
-    - ffmpeg:cat_cam_2#video=h264
+    - ffmpeg:cat_cam_2#video=h264#vflip
   cat_cam_3:
-    - http://127.0.0.1:8085/cam/140996632758#vflip
+    - http://127.0.0.1:8085/cam/140996632758
     - ffmpeg:http://127.0.0.1:8085/audio/140996632758#audio=aac#audio=opus#async
-    - ffmpeg:cat_cam_3#video=h264
+    - ffmpeg:cat_cam_3#video=h264#vflip
