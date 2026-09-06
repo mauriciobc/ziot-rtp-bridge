@@ -1297,6 +1297,25 @@ class ZiotCamera:
             time.sleep(1)
 
         if not addr and self._static_addr:
+            ip, prt = self._static_addr
+            if prt == 0:
+                # The broker never answered (rejected token, outage) and the
+                # roster endpoint is IP-only. Installing (ip, 0) as the
+                # camera address produces a /health entry that says "direct"
+                # while the punch loop skips port 0 and nothing is aimed
+                # anywhere. Do what punch-only mode does instead: install
+                # the socket and hello-sweep from it, so a camera that
+                # answers hellos is picked up even with the cloud gone.
+                with self._sock_lock:
+                    self.sock = sock
+                    self.addr = self._static_addr
+                self._note_endpoint("static")
+                log.warning("[%s] broker gave no address — sweeping %s for "
+                            "the listen port (we are %s:%d)",
+                            self.uid, ip, self.bind_ip, port)
+                self._lan_resweep()
+                self._last_re_rendezvous = time.monotonic()
+                return True
             addr = self._static_addr
             self._note_endpoint("static")
             log.warning("[%s] no address from broker — punching configured "
@@ -2016,7 +2035,7 @@ class CloudState:
                 log.error("cloud rejected the token (%s) — serving from "
                           "last-known state; update \"token\" and restart", e)
                 if self.boot is not None:
-                    self.boot.set("failed", "the cloud rejected the token")
+                    self.boot.set("failed", f"the cloud rejected the token ({e})")
             # Stale flags served as if fresh are worse than no flags at all, so
             # say something once we've missed enough polls to matter.
             if self._fails == STATUS_FAIL_WARN:
@@ -2519,7 +2538,7 @@ def main():
                     # rather than exiting into a loop that cannot help.
                     log.error("cloud rejected the token (%s) — check \"token\" "
                               "in %s; it is a JWT and they expire", e, args.config)
-                    boot.set("failed", "the cloud rejected the token")
+                    boot.set("failed", f"the cloud rejected the token ({e})")
                     return
                 boot.set("retrying", f"device list unavailable: {e}", attempt)
                 log.warning("device list still unavailable (attempt %d): %s — "
