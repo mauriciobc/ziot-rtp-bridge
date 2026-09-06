@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/AlexxIT/go2rtc/master/www/schema.json
+#
+# go2rtc for ziot_rtp_bridge. Copy next to the process (or mount as
+# /config/go2rtc.yaml) and start go2rtc. If go2rtc lives inside Frigate,
+# paste `streams`, `ffmpeg`, and `webrtc` into Frigate's `go2rtc:` block.
+#
+# The bridge already has LAN RTP from the camera (JPEG + PCMU). go2rtc
+# pulls the remuxed HTTP from the bridge — it cannot punch the camera
+# itself. Replace 127.0.0.1 with the bridge host if they are not together.
+#
+# Why this is not `ffmpeg:...#video=h264` alone:
+#   * The first producer is native MJPEG — live view is instant (no GOP wait).
+#   * `#video=h264` is a second producer, used only when a client wants H.264
+#     (Frigate record, WebRTC, MSE). It loopbacks the MJPEG already ingested,
+#     so the bridge is not pulled twice.
+#   * Default libx264 uses -g 50. At 6–8 fps that is 6–8 s between keyframes,
+#     which is the 5–10 s "live view offline" wait. -g 8 is one keyframe per
+#     second; -bf 0 keeps WebRTC happy.
+#   * AAC for Frigate; Opus for WebRTC. #async because JPEG and WAV clocks
+#     are independent.
+#   * Optional: append #hardware to the h264 line for VAAPI/NVENC/VideoToolbox.
+
+api:
+  listen: ":1984"
+
+rtsp:
+  listen: ":8554"
+  default_query: "video&audio"
+
+webrtc:
+  listen: ":8555"
+  # Candidates are host:port pairs, not URIs ("stun:8555" parses as host
+  # "stun" and never answers). Put this host's LAN IP here — the one the
+  # browser can reach.
+  candidates:
+    - 192.168.18.6:8555
+
+log:
+  level: info
+  ffmpeg: error          # hides the camera's cosmetic MJPEG "overread 8"
+
+ffmpeg:
+  h264: "-c:v libx264 -g:v 8 -bf:v 0 -profile:v high -level:v 4.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p"
+
+streams:
+  cat_cam_1:
+    - http://127.0.0.1:8085/cam/141030191094
+    - ffmpeg:http://127.0.0.1:8085/audio/141030191094#audio=aac#audio=opus#async
+    - ffmpeg:cat_cam_1#video=h264
+  cat_cam_2:
+    - http://127.0.0.1:8085/cam/140979857781
+    - ffmpeg:http://127.0.0.1:8085/audio/140979857781#audio=aac#audio=opus#async
+    - ffmpeg:cat_cam_2#video=h264
+  cat_cam_3:
+    - http://127.0.0.1:8085/cam/140996632758
+    - ffmpeg:http://127.0.0.1:8085/audio/140996632758#audio=aac#audio=opus#async
+    - ffmpeg:cat_cam_3#video=h264
