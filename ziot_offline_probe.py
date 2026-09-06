@@ -83,8 +83,10 @@ def main() -> int:
     ap.add_argument("--uid", default=None,
                     help="camera UID: only its SSRC counts as a hit")
     ap.add_argument("--rate", type=float, default=2000,
-                    help="ports per second; each port gets a hello and a "
-                         "heart, so the wire rate is 2x this (default 2000)")
+                    help="wire datagrams per second -- the same meaning as "
+                         "the bridge's LAN_SWEEP_RATE. Each port gets a "
+                         "hello and a heart, so ports/s is half this "
+                         "(default 2000)")
     ap.add_argument("--listen", type=float, default=5.0,
                     help="seconds to keep listening after the sweep")
     ap.add_argument("--bind-ip", default=None,
@@ -133,8 +135,16 @@ def main() -> int:
     listener = threading.Thread(target=collect, daemon=True)
     listener.start()
 
-    gap = 1.0 / max(args.rate, 1)
+    # --rate is the wire rate, matching LAN_SWEEP_RATE's meaning in the
+    # bridge: datagrams per second. Two datagrams go to each port (hello +
+    # heart), so the per-port pause covers both sends; at the 2000 default
+    # the full ephemeral sweep takes ~28 s of sending, not ~14.
     hellos = (PUNCH, HEART)
+    # --rate is the wire rate, matching LAN_SWEEP_RATE's meaning in the
+    # bridge: datagrams per second. Two datagrams go to each port (hello +
+    # heart), so the per-port pause covers both sends; at the 2000 default
+    # the full ephemeral sweep takes ~28 s of sending, not ~14.
+    gap = len(hellos) / max(args.rate, 1)
     t0 = time.monotonic()
     try:
         total = len(ports)
