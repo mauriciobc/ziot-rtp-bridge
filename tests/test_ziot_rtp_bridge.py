@@ -1,5 +1,7 @@
 """Behavior regressions for direct/relay RTP acceptance and startup validation."""
+import http.client
 import json
+import queue
 import socket
 import struct
 import sys
@@ -371,6 +373,240 @@ class RelayConsumeTests(unittest.TestCase):
         on_rx.assert_not_called()
 
 
+class MediaIngestParityTests(unittest.TestCase):
+    """The direct and relay transports must produce identical media from
+    identical packets: one frame from a JPEG fragment pair, one PCM chunk
+    from a PCMU datagram, and liveness refreshed only by accepted packets.
+    Whatever pipeline change lands must keep the two paths indistinguishable
+    to a subscriber."""
+
+    QUANT = bytes(range(128))
+
+    def frame_pair(self):
+        return [
+            rtp_packet(26, jpeg_payload(frag_off=0, q=255, quant=self.QUANT),
+                       ts=500),
+            rtp_packet(26, jpeg_payload(frag_off=64, q=255), ts=500,
+                       marker=True),
+        ]
+
+    @staticmethod
+    def drain(q):
+        out = []
+        try:
+            while True:
+                out.append(q.get_nowait())
+        except queue.Empty:
+            return out
+
+    def collect(self, cam, packets, transport):
+        """Feed `packets` to one camera over `transport` ('direct' or
+        'relay') and return (frames, pcm_chunks, stats_snapshot)."""
+        frames_q_ctx = cam.video.subscribe()
+        audio_q_ctx = cam.audio.subscribe()
+        with frames_q_ctx as vq, audio_q_ctx as aq:
+            if transport == "direct":
+                sock = bind_loopback()
+                self.addCleanup(sock.close)
+                cam.sock = sock
+                cam.addr = ("127.0.0.1", 9)
+                asm = bridge.RtpJpegReassembler(cam._on_frame)
+                for pkt in packets:
+                    cam._handle_direct_packet(sock, cam.addr, pkt, asm)
+            else:
+                stream = bridge.RelayStream(
+                    "rtsp://example/live/x", cam._on_frame,
+                    cam._on_relay_audio, cam._mark_rx, cam._stop, cam.uid)
+                stream._channels = {0: "video", 2: "audio"}
+                for pkt in packets:
+                    # The relay keys media on its negotiated interleaved
+                    # channel, not the payload type: 26 rides ch0, 0 rides ch2.
+                    channel = 2 if (pkt[1] & 0x7F) == 0 else 0
+                    hdr = b"$" + bytes([channel]) \
+                        + struct.pack("!H", len(pkt))
+                    with mock.patch.object(stream, "_read_exact",
+                                           side_effect=[hdr, pkt]):
+                        stream._consume_interleaved()
+            frames = self.drain(vq)
+            audio = self.drain(aq)
+        stats = dict(cam.stats)
+        return frames, audio, stats
+
+    def test_video_and_audio_reach_the_subscriber_identically(self):
+        packets = self.frame_pair() + [rtp_packet(0, b"\x7f" * 40, ts=600)]
+        direct = self.collect(make_camera(), packets, "direct")
+        relay = self.collect(make_camera(), packets, "relay")
+
+        self.assertEqual(direct[0], relay[0])
+        self.assertEqual(direct[1], relay[1])
+        for frames, audio, stats in (direct, relay):
+            self.assertEqual(len(frames), 1)
+            self.assertTrue(frames[0].startswith(b"\xff\xd8"))
+            self.assertTrue(frames[0].endswith(b"\xff\xd9"))
+            self.assertEqual(len(audio), 1)
+            self.assertEqual(stats["frames"], 1)
+            self.assertEqual(stats["audio_pkts"], 1)
+
+    def test_malformed_packets_produce_no_media_on_either_path(self):
+        # A payload type the direct path does not know (8) is deliberately
+        # divergent: the relay keys on its negotiated channel instead, so it
+        # is left to RxDatagramTests, not this parity check.
+        bad = [
+            rtp_packet(26, jpeg_payload(jtype=70)[:10], ts=81),
+            rtp_packet(0, b"", ts=82),
+        ]
+        direct = self.collect(make_camera(), bad, "direct")
+        relay = self.collect(make_camera(), bad, "relay")
+        for frames, audio, stats in (direct, relay):
+            self.assertEqual((frames, audio), ([], []))
+            self.assertEqual(stats["frames"], 0)
+            self.assertEqual(stats["audio_pkts"], 0)
+
+
+class CloudFlagTests(unittest.TestCase):
+    """The app's isOn/isFree, including its null and empty-string readings:
+    null -> False, "" -> "0" -> free, and every non-zero mediaState is busy."""
+
+    CASES = [
+        ({"onlineState": "1", "mediaState": "0"}, (True, True)),
+        ({"onlineState": "1", "mediaState": "2"}, (True, False)),
+        ({"onlineState": "1", "mediaState": "3"}, (True, False)),
+        ({"onlineState": "0", "mediaState": "0"}, (False, True)),
+        ({"onlineState": "", "mediaState": ""}, (False, True)),
+        ({}, (False, False)),
+        ({"onlineState": None, "mediaState": None}, (False, False)),
+        ({"onlineState": 1, "mediaState": 0}, (True, True)),
+    ]
+
+    def test_the_flags_read_exactly_like_the_app(self):
+        for row, (on, free) in self.CASES:
+            with self.subTest(row=row):
+                self.assertEqual(bridge.cloud_is_on(row), on)
+                self.assertEqual(bridge.cloud_is_free(row), free)
+
+
+class StreamEndpointTests(unittest.TestCase):
+    """The /cam and /audio endpoints stream real bytes over real HTTP: the
+    framing contracts (multipart part, WAV header) and the broken-client
+    path are pinned before the shared pump refactor."""
+
+    FRAME = b"\xff\xd8fake" + b"x" * 32 + b"\xff\xd9"
+
+    def serve(self, cam):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: cam}, boot, threading.Lock()))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def get(self, port, path):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", path)
+        return conn.getresponse()
+
+    def mjpeg_part(self, frame):
+        return (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+
+    def await_subscriber(self, cam, which="video", timeout=3.0):
+        """The handler subscribes after sending headers; a frame published
+        before that is dropped by the Fanout, so tests must wait for it."""
+        fanout = cam.video if which == "video" else cam.audio
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not len(fanout._subs):
+            time.sleep(0.01)
+        self.assertTrue(len(fanout._subs), "no subscriber arrived")
+
+    def test_mjpeg_streams_multipart_framing(self):
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/cam/{CAM_UID}")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("multipart/x-mixed-replace",
+                      resp.getheader("Content-Type"))
+        expected = self.mjpeg_part(self.FRAME)
+        self.await_subscriber(cam)
+        cam._on_frame(self.FRAME)
+        self.assertEqual(resp.read(len(expected)), expected)
+
+    def test_wav_streams_header_then_chunks(self):
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/audio/{CAM_UID}")
+        self.assertEqual(resp.status, 200)
+        header = bridge.wav_header()
+        self.assertEqual(resp.read(len(header)), header)
+        chunk = b"\x01\x02" * 40
+        self.await_subscriber(cam, which="audio")
+        cam.audio.publish(chunk)
+        self.assertEqual(resp.read(len(chunk)), chunk)
+
+    def test_a_dead_client_ends_the_stream_without_an_error(self):
+        """A viewer hanging up mid-stream is the normal way to stop
+        watching; the subscriber must leave cleanly, log nothing at ERROR,
+        and the camera must keep publishing."""
+        cam = make_camera()
+        resp = self.get(self.serve(cam), f"/cam/{CAM_UID}")
+        expected = self.mjpeg_part(self.FRAME)
+        self.await_subscriber(cam)
+        cam._on_frame(self.FRAME)
+        resp.read(len(expected))
+        resp.close()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and len(cam.video._subs):
+            cam._on_frame(self.FRAME)   # the write that notices the hangup
+            time.sleep(0.05)
+        self.assertEqual(len(cam.video._subs), 0,
+                         "handler never noticed the dead client")
+        cam._on_frame(self.FRAME)       # camera keeps publishing
+
+
+class RouteTests(unittest.TestCase):
+    """Every URL shape the README promises answers; anything else is a 404
+    (including a known prefix with an unknown camera)."""
+
+    def serve(self):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: make_camera()}, boot,
+                                threading.Lock()))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_every_promised_path_answers(self):
+        port = self.serve()
+        for path, expect in ((f"/view/{CAM_UID}", 200),
+                             (f"/cam/{CAM_UID}", 200),
+                             (f"/audio/{CAM_UID}", 200),
+                             (f"/view/000000000000", 404),
+                             (f"/cam/000000000000", 404),
+                             ("/nope", 404),
+                             ("/view/", 404)):
+            with self.subTest(path=path):
+                conn = http.client.HTTPConnection("127.0.0.1", port,
+                                                  timeout=5)
+                self.addCleanup(conn.close)
+                conn.request("GET", path)
+                self.assertEqual(conn.getresponse().status, expect)
+
+    def test_the_view_page_names_the_camera_not_the_object(self):
+        """A route-table refactor once passed the camera object where the
+        uid was expected, and the page rendered `ZiotCamera object at
+        0x...` — status 200, content garbage. Assert the bytes."""
+        port = self.serve()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", f"/view/{CAM_UID}")
+        body = conn.getresponse().read()
+        self.assertIn(CAM_UID.encode(), body)
+        self.assertNotIn(b"object at 0x", body)
+
+
 class PunchIntervalTests(unittest.TestCase):
     def setUp(self):
         self.old_interval = bridge.PUNCH_INTERVAL
@@ -394,7 +630,9 @@ class PunchIntervalTests(unittest.TestCase):
                       float("nan"), float("inf"), None, [], {}):
             with self.subTest(value=value):
                 bridge.PUNCH_INTERVAL = 1.0
-                self.run_main({"token": "t", "user_id": 1,
+                # port 0: ephemeral. main() binds the HTTP socket before
+                # bring-up now, and 8085 may be taken on the test host.
+                self.run_main({"token": "t", "user_id": 1, "port": 0,
                                "punch_interval": value})
                 with mock.patch.object(bridge, "GPS555") as gps:
                     gps.return_value.list_cameras.return_value = []
@@ -407,13 +645,156 @@ class PunchIntervalTests(unittest.TestCase):
                     logs.output)
 
     def test_valid_interval_passes_validation(self):
-        self.run_main({"token": "t", "user_id": 1, "punch_interval": 1.999})
+        self.run_main({"token": "t", "user_id": 1, "port": 0,
+                       "punch_interval": 1.999})
         with mock.patch.object(bridge, "GPS555") as gps:
             gps.return_value.list_cameras.return_value = []
             bridge.main()
             self.assertAlmostEqual(bridge.PUNCH_INTERVAL, 1.999)
             gps.assert_called_once_with("t")
             gps.return_value.list_cameras.assert_called_once_with(1)
+
+
+class PunchLoopTests(unittest.TestCase):
+    """Every tick sends exactly one hello to the camera. The starved branch
+    exists to re-resolve the endpoint, not to punch a second time -- the
+    app's punch loop is Timer.periodic(1s), one hello per tick."""
+
+    def make_punching_camera(self, starved):
+        fake_cam = bind_loopback()
+        self.addCleanup(fake_cam.close)
+        sender = bind_loopback()
+        self.addCleanup(sender.close)
+        cam = make_camera()
+        cam.sock = sender
+        cam.addr = ("127.0.0.1", fake_cam.getsockname()[1])
+        cam._resolve = mock.Mock()
+        cam._last_rx = (0.0 if starved else time.monotonic())
+        return cam, fake_cam
+
+    def drive(self, cam, ticks):
+        """Run `_punch` for exactly `ticks` loop iterations: `_stop.wait`
+        is the loop's heartbeat, so it is where the tick counter lives."""
+        waited = []
+
+        def wait(_t):
+            waited.append(1)
+            if len(waited) >= ticks:
+                cam._stop.set()
+            return True
+
+        cam._stop.wait = wait
+        cam._punch()
+        self.assertEqual(len(waited), ticks)
+
+    def drain(self, sock):
+        got = []
+        sock.settimeout(0.05)
+        try:
+            while True:
+                got.append(sock.recvfrom(65535)[0])
+        except socket.timeout:
+            return got
+
+    def test_a_starved_tick_punches_exactly_once(self):
+        cam, fake_cam = self.make_punching_camera(starved=True)
+        self.drive(cam, 1)
+        self.assertEqual(self.drain(fake_cam), [bridge.PUNCH])
+        cam._resolve.assert_called_once_with()
+
+    def test_a_normal_tick_punches_exactly_once(self):
+        cam, fake_cam = self.make_punching_camera(starved=False)
+        self.drive(cam, 1)
+        self.assertEqual(self.drain(fake_cam), [bridge.PUNCH])
+        cam._resolve.assert_not_called()
+
+    def test_the_heart_rides_the_nth_tick(self):
+        cam, fake_cam = self.make_punching_camera(starved=False)
+        with mock.patch.object(bridge, "HEART_EVERY_N_PUNCHES", 3):
+            self.drive(cam, 3)
+        self.assertEqual(self.drain(fake_cam),
+                         [bridge.PUNCH, bridge.PUNCH,
+                          bridge.PUNCH, bridge.HEART])
+
+    def test_a_relayed_or_force_relay_camera_punches_nothing(self):
+        for relayed, force in ((True, False), (False, True)):
+            with self.subTest(relayed=relayed, force_relay=force):
+                cam, fake_cam = self.make_punching_camera(starved=False)
+                if relayed:
+                    cam._relay = mock.Mock()
+                cam.force_relay = force
+                self.drive(cam, 2)
+                self.assertEqual(self.drain(fake_cam), [])
+
+
+class RecoveryBookkeepingTests(unittest.TestCase):
+    """Every recovery attempt ends in exactly one of two accountings: a
+    streaming camera resets the failure count, a failed one increments it and
+    doubles the backoff. The backoff reset to the initial value belongs to the
+    top-of-tick is_streaming check, not to the attempt itself."""
+
+    @staticmethod
+    def make_cam():
+        cam = make_camera()
+        # No real sleeping: _stop.wait is the tick's sleep knob.
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        # A dead camera whose last re-rendezvous is long past.
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        return cam
+
+    def test_failed_transport_attempts_double_the_backoff(self):
+        cam = self.make_cam()
+        cam._open_transport = mock.Mock(return_value=False)
+        cam._start_relay = mock.Mock(return_value=False)
+        for expected in (10.0, 20.0, 40.0):
+            with self.subTest(backoff=expected):
+                cam._last_re_rendezvous = 0.0   # age out the backoff gate
+                cam._recovery_tick()
+                self.assertEqual(cam._backoff, expected)
+        self.assertEqual(cam._consec_failures, 3)
+
+    def test_a_streaming_transport_resets_the_failure_count(self):
+        cam = self.make_cam()
+        cam._open_transport = mock.Mock(return_value=True)
+        # Media arrives while the post-rendezvous wait elapses.
+        cam._stop.wait.side_effect = \
+            lambda _t: setattr(cam, "_last_rx", time.monotonic())
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 0)
+        # The backoff still grew on this success; resetting it to the
+        # initial value is the next tick's job, once it sees the stream.
+        self.assertEqual(cam._backoff, 10.0)
+        cam._recovery_tick()
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+
+    def test_a_punch_only_sweep_that_streams_resets_backoff_at_once(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._backoff = 20.0
+        cam._lan_resweep = mock.Mock(
+            side_effect=lambda: setattr(cam, "_last_rx", time.monotonic()))
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 0)
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+
+    def test_a_punch_only_sweep_failure_counts_and_doubles(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._backoff = 20.0
+        cam._lan_resweep = mock.Mock()
+        cam._recovery_tick()
+        self.assertEqual(cam._consec_failures, 1)
+        self.assertEqual(cam._backoff, 40.0)
 
 
 class UidSsrcTests(unittest.TestCase):
@@ -628,9 +1009,12 @@ class BootResilienceTests(unittest.TestCase):
         self.addCleanup(Path(self.path).unlink, missing_ok=True)
         sys.argv = ["ziot_rtp_bridge.py", "--config", self.path]
 
-    def test_a_rejected_token_at_startup_exits_before_binding(self):
-        """Nothing is serving yet and no token un-expires itself, so this is
-        fatal in the same sense as an unreadable config file."""
+    def test_a_rejected_token_at_startup_exits_2(self):
+        """No retry can un-reject a token, so this is fatal in the same
+        sense as an unreadable config file: exit 2 right after the first
+        device-list call. The HTTP socket is bound before that call now
+        (/health must answer during bring-up), so binding happens even on
+        this path -- for the milliseconds before the exit."""
         with mock.patch.object(bridge, "GPS555") as gps, \
                 mock.patch.object(bridge, "ThreadingHTTPServer") as server:
             gps.return_value.list_cameras.side_effect = \
@@ -640,7 +1024,7 @@ class BootResilienceTests(unittest.TestCase):
                     bridge.main()
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("rejected the token", "\n".join(logs.output))
-        server.assert_not_called()
+        server.assert_called_once()
 
     def test_a_cloud_outage_at_startup_serves_health_anyway(self):
         """Exiting instead is the same retry loop with every camera dark in
@@ -673,6 +1057,56 @@ class BootResilienceTests(unittest.TestCase):
         self.assertIn("falling back to the default route",
                       "\n".join(logs.output))
 
+
+class AllowListTests(unittest.TestCase):
+    """The cameras allow-list must filter the device list at startup."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "cameras": ["AAA"]}, f)
+            self.path = f.name
+        self.addCleanup(Path(self.path).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", self.path,
+                    "--bind-ip", "127.0.0.1"]
+
+    def test_only_listed_cameras_boot(self):
+        roster = [{"uid": "AAA"}, {"uid": "BBB"}, {"uid": "CCC"}]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            gps.return_value.list_cameras.return_value = roster
+            cam.return_value.start.return_value = True
+            bridge.main()
+        self.assertEqual(cam.call_count, 1)
+        rec = cam.call_args[0][1]
+        self.assertEqual(rec["uid"], "AAA")
+        server.assert_called_once()
+
+class EndpointParseTests(unittest.TestCase):
+    """Unsendable endpoints must fail at boot, not punch silence."""
+
+    def test_valid_map_parses(self):
+        self.assertEqual(
+            bridge.parse_static_endpoints(
+                {"A": "192.168.18.75:52901", "B": "10.0.0.5:9"}),
+            {"A": ("192.168.18.75", 52901), "B": ("10.0.0.5", 9)})
+        self.assertEqual(
+            bridge.parse_static_endpoints({"A": "192.168.18.75"}),
+            {"A": ("192.168.18.75", 0)})
+
+    def test_unsendable_values_raise(self):
+        for bad in ("52901",                    # bare port -> 0.0.0.0
+                    "1.2.3.4:99999",            # sendto OverflowError
+                    "1.2.3.4:-1",
+                    "not-an-endpoint",
+                    "1.2.3.4:notaport",
+                    "[fe80::1]:5000"):          # AF_INET socket, never sends
+            with self.subTest(ep=bad):
+                with self.assertRaises(ValueError):
+                    bridge.parse_static_endpoints({"A": bad})
 
 class ConfigLoadTests(unittest.TestCase):
     def setUp(self):
@@ -896,7 +1330,934 @@ class CloudAuthParkTests(unittest.TestCase):
         boot.set("retrying", "device list unavailable: timed out", 2)
         cloud = bridge.CloudState(api, 1, boot)
         cloud.poll()
+        cloud.poll()
         self.assertEqual(boot.snapshot()["phase"], "retrying")
+
+
+class OfflineModeTests(unittest.TestCase):
+    """--offline takes the roster from offline_endpoints; token still signals."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+
+    def write_cfg(self, cfg):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        return path
+
+    def test_static_rendezvous_needs_no_cloud(self):
+        peer = bind_loopback()
+        self.addCleanup(peer.close)
+        port = peer.getsockname()[1]
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", port))
+        self.assertTrue(cam._rendezvous())
+        self.assertEqual(cam.addr, ("127.0.0.1", port))
+        self.assertEqual(cam._fetch_endpoint(),
+                         ("127.0.0.1", port, "static"))
+        cam.start()
+        cam.stop()
+
+    def test_main_offline_boots_without_token_or_cloud(self):
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        gps.assert_not_called()
+        _, kwargs = cam.call_args
+        self.assertEqual(kwargs["static_addr"], ("127.0.0.1", 56061))
+        server.assert_called_once()
+
+    def test_offline_without_endpoints_is_argparse_error(self):
+        path = self.write_cfg({"offline": True})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertRaises(SystemExit) as cm:
+                bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        gps.assert_not_called()
+
+    def test_offline_ignores_only_online(self):
+        # Cloud flags are absent offline, so the startup-only filter would
+        # drop every camera if it were applied.
+        path = self.write_cfg(
+            {"offline": True, "only_online": True,
+             "offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555"), \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        server.assert_called_once()
+
+    def test_offline_binds_from_static_endpoint(self):
+        # Without --bind-ip the default route (8.8.8.8) may leave through
+        # the wrong NIC; the static endpoint already knows the camera LAN.
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "192.168.18.75:52901"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555"), \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera") as cam, \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.18.45") as local_ip:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        local_ip.assert_called_once_with("192.168.18.75")
+
+    def test_offline_rejects_unsendable_endpoint(self):
+        path = self.write_cfg(
+            {"offline_endpoints": {CAM_UID: "52901"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--offline"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertRaises(SystemExit) as cm:
+                bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        gps.assert_not_called()
+
+    def test_parse_static_allows_ip_only(self):
+        got = bridge.parse_static_endpoints({CAM_UID: "192.168.18.75"})
+        self.assertEqual(got, {CAM_UID: ("192.168.18.75", 0)})
+        got = bridge.parse_static_endpoints(
+            {CAM_UID: "192.168.18.75:52901"})
+        self.assertEqual(got, {CAM_UID: ("192.168.18.75", 52901)})
+
+    def test_hello_is_not_rtp_media(self):
+        self.assertFalse(bridge.is_rtp_media(bridge.PUNCH))
+        self.assertFalse(bridge.is_rtp_media(bridge.HEART))
+        pkt = rtp_packet(26, jpeg_payload())
+        self.assertTrue(bridge.is_rtp_media(pkt, CAM_SSRC))
+        self.assertFalse(bridge.is_rtp_media(pkt, CAM_SSRC + 1))
+
+    def test_offline_with_token_keeps_cloud_for_notify(self):
+        path = self.write_cfg(
+            {"token": "t", "user_id": 1,
+             "offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        gps.assert_called_once_with("t")
+        args, kwargs = cam.call_args
+        self.assertIs(args[0], gps.return_value)
+        self.assertEqual(kwargs["static_addr"], ("127.0.0.1", 56061))
+        server.assert_called_once()
+
+    def test_fetch_endpoint_pins_lan_ip_and_private_port(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "192.168.18.6",
+                                static_addr=("192.168.18.75", 0))
+        self.assertEqual(cam._fetch_endpoint(),
+                         ("192.168.18.75", 55040, "static-lan"))
+
+    def test_punch_only_recovery_keeps_socket(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        self.assertTrue(cam._rendezvous())
+        sock = cam.sock
+        self.addCleanup(cam.stop)
+        with mock.patch.object(bridge, "LAN_SWEEP_LO", 9), \
+                mock.patch.object(bridge, "LAN_SWEEP_HI", 9), \
+                mock.patch.object(bridge, "LAN_SWEEP_RATE", 10000):
+            cam._last_re_rendezvous = 0.0
+            cam._recovery_tick()
+        self.assertIs(cam.sock, sock)
+
+    def test_punch_dest_follows_media_source(self):
+        cam = make_camera()  # has a cloud api: STUN addr wins
+        cam.addr = ("192.168.18.75", 1)
+        cam._media_source = ("192.168.18.75", 55040)
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 1))
+        cam.api = None
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 55040))
+        cam._media_source = None
+        self.assertEqual(cam._punch_dest(), ("192.168.18.75", 1))
+
+    def test_online_transition_kicks_wake(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0", "mediaState": "0"})
+        cam._wake_now = False
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})
+        self.assertTrue(cam._wake_now)
+        self.assertEqual(cam._backoff, 0.0)
+
+    def test_cloud_offline_recovery_keeps_socket(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 0,
+        }
+        cam = bridge.ZiotCamera(
+            api, {"uid": CAM_UID, "onlineState": "0"}, "127.0.0.1")
+        self.assertTrue(cam._rendezvous())
+        sock = cam.sock
+        self.addCleanup(cam.stop)
+        api.send_stun_addr.reset_mock()
+        api.notify.reset_mock()
+        cam._last_re_rendezvous = 0.0
+        cam._backoff = 0.0
+        cam._recovery_tick()
+        self.assertIs(cam.sock, sock)
+        api.send_stun_addr.assert_called()
+        api.notify.assert_called_with(CAM_UID, bridge.EVENT_START)
+
+
+class TokenOnlyConfigTests(unittest.TestCase):
+    """A config with a token but no user_id key is supported: the JWT claim
+    resolves the id. Every device-list call must use the *resolved* value --
+    indexing cfg["user_id"] raised KeyError, which the boot retry loop caught
+    and re-attempted forever as a fake cloud outage."""
+
+    # A JWT whose payload carries no user_id claim.
+    TOKEN_NO_CLAIM = "h.eyJhbSI6MX0.s"
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+
+    def write_cfg(self, cfg):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        return path
+
+    def test_list_cameras_names_the_missing_user_id(self):
+        path = self.write_cfg({"token": self.TOKEN_NO_CLAIM})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--list-cameras"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("user_id", "\n".join(logs.output))
+        gps.return_value.list_cameras.assert_not_called()
+
+    def test_online_boot_without_a_user_id_exits_before_binding(self):
+        """Retryable it is not: no retry invents an account id. Fatal in the
+        same sense as a token the cloud rejects on the first call."""
+        path = self.write_cfg({"token": self.TOKEN_NO_CLAIM})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server:
+            with self.assertLogs(bridge.log, "ERROR") as logs:
+                with self.assertRaises(SystemExit) as cm:
+                    bridge.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("user_id", "\n".join(logs.output))
+        server.assert_not_called()
+
+    def test_offline_boots_on_a_token_only_config(self):
+        """Offline needs no roster from the cloud, so a token without any
+        user_id anywhere still signals notify/keepalive."""
+        path = self.write_cfg(
+            {"token": self.TOKEN_NO_CLAIM,
+             "offline_endpoints": {CAM_UID: "127.0.0.1:56061"}})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path,
+                    "--offline", "--bind-ip", "127.0.0.1"]
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer") as server, \
+                mock.patch.object(bridge, "ZiotCamera") as cam:
+            cam.return_value.start.return_value = True
+            bridge.main()
+        gps.assert_called_once_with(self.TOKEN_NO_CLAIM)
+        server.assert_called_once()
+
+    def test_user_id_from_the_jwt_claim_reaches_the_device_list(self):
+        import base64
+        claim = base64.urlsafe_b64encode(
+            json.dumps({"user_id": 7}).encode()).decode().rstrip("=")
+        path = self.write_cfg({"token": f"h.{claim}.s"})
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path, "--list-cameras"]
+        with mock.patch.object(bridge, "GPS555") as gps:
+            bridge.main()
+        gps.return_value.list_cameras.assert_called_once_with(7)
+
+
+class WakeBackoffTests(unittest.TestCase):
+    """The wake path sets _backoff to 0.0 (its one-shot bypass is the
+    re-rendezvous stamp, not the backoff). A failed attempt must still build
+    a real backoff from the floor: min(0 * 2, MAX) stayed 0 forever, and
+    recovery hammered a full rendezvous every tick."""
+
+    def test_a_failed_wake_still_builds_backoff(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0"})
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})
+        self.assertEqual(cam._backoff, 0.0)
+        for expected in (10.0, 20.0, 40.0):
+            with self.subTest(backoff=expected):
+                cam._record_attempt(False)
+                self.assertEqual(cam._backoff, expected)
+        self.assertEqual(cam._consec_failures, 3)
+
+    def test_the_built_backoff_gates_recovery(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0"})
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})
+        cam._record_attempt(False)
+        cam._wake_now = False          # the wake's own tick consumed it
+        cam._open_transport = mock.Mock()
+        cam._last_re_rendezvous = time.monotonic()   # just attempted
+        cam._last_rx = 0.0
+        cam._recovery_tick()
+        cam._open_transport.assert_not_called()
+
+
+class SsrcLearningTests(unittest.TestCase):
+    """Punch-only SSRC learning must only ever learn from a datagram that
+    proved itself: RTP v2 with a known payload type. A hello echo (14 bytes
+    that parse as RTP-ish, ssrc 0x2068656c from b' hel') poisoned the learned
+    SSRC, after which the camera's real packets were dropped as foreign
+    forever."""
+
+    FOREIGN_CAM_SSRC = 0x12345678   # a punch-only camera off the uid mapping
+
+    def make_cam(self):
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 9))
+        cam.sock = bind_loopback()
+        self.addCleanup(cam.sock.close)
+        cam.addr = ("127.0.0.1", 9)
+        return cam
+
+    def handle(self, cam, pkt, asm=None):
+        return cam._handle_direct_packet(
+            cam.sock, cam.addr, pkt,
+            asm or bridge.RtpJpegReassembler(lambda jpeg: None))
+
+    def test_a_hello_echo_is_never_learned_from(self):
+        cam = self.make_cam()
+        self.assertFalse(self.handle(cam, bridge.PUNCH))
+        self.assertIsNone(cam._learned_ssrc)
+        self.assertFalse(self.handle(cam, bridge.HEART))
+        self.assertIsNone(cam._learned_ssrc)
+
+    def test_non_rtp_garbage_is_never_learned_from(self):
+        cam = self.make_cam()
+        # 14 bytes whose 9th-12th are not b' hel': still must not be learned.
+        self.assertFalse(self.handle(cam, b"\x00" * 14))
+        self.assertIsNone(cam._learned_ssrc)
+        # RTP v1 is not RTP v2: rejected before any state is learned.
+        v1 = rtp_packet(0, b"\x01" * 160, ssrc=self.FOREIGN_CAM_SSRC, b0=0x40)
+        self.assertFalse(self.handle(cam, v1))
+        self.assertIsNone(cam._learned_ssrc)
+
+    def test_learning_happens_from_the_first_valid_packet(self):
+        cam = self.make_cam()
+        pkt = rtp_packet(0, b"\x01" * 160, ssrc=self.FOREIGN_CAM_SSRC)
+        self.assertTrue(self.handle(cam, pkt))
+        self.assertEqual(cam._learned_ssrc, self.FOREIGN_CAM_SSRC)
+
+    def test_learned_ssrc_accepts_and_strangers_still_drop(self):
+        cam = self.make_cam()
+        self.assertTrue(self.handle(
+            cam, rtp_packet(0, b"\x01" * 160, ssrc=self.FOREIGN_CAM_SSRC)))
+        before = cam.stats["audio_pkts"]
+        stranger = rtp_packet(0, b"\x02" * 160, ssrc=0xDEADBEEF)
+        self.assertFalse(self.handle(cam, stranger))
+        self.assertEqual(cam.stats["foreign_ssrc"], 1)
+        self.assertEqual(cam.stats["audio_pkts"], before)
+        # The learned camera keeps streaming.
+        self.assertTrue(self.handle(
+            cam, rtp_packet(0, b"\x03" * 160, ssrc=self.FOREIGN_CAM_SSRC)))
+        self.assertEqual(cam.stats["audio_pkts"], before + 1)
+
+
+class PunchOnlyPortDiscoveryTests(unittest.TestCase):
+    """An offline_endpoints entry with an IP only (port 0) must not use a
+    probe socket: the camera answers the hello on the socket that swept, so
+    the rendezvous socket itself sweeps -- paced, send-only, no rebind --
+    and the receive thread learns where media comes from. The replaced
+    implementation checked RTP's payload type in byte 0 (always 0x80 on
+    RTP v2), so its blocking per-port recvfrom loop could never match a
+    real packet and burned ~94 minutes per silent sweep."""
+
+    def test_rendezvous_installs_the_socket_then_learns_media_source(self):
+        responder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        lo = bridge.LAN_SWEEP_LO
+        responder.bind(("127.0.0.1", lo + 10))
+        self.addCleanup(responder.close)
+        port = responder.getsockname()[1]
+        stop = threading.Event()
+
+        def fake_camera():
+            responder.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    _, src = responder.recvfrom(65535)
+                except (socket.timeout, OSError):
+                    continue
+                try:
+                    responder.sendto(
+                        rtp_packet(0, b"\x07" * 160, ssrc=0x12345678), src)
+                except OSError:
+                    return
+
+        worker = threading.Thread(target=fake_camera, daemon=True)
+        worker.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(worker.join, timeout=5)
+
+        cam = bridge.ZiotCamera(None, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("127.0.0.1", 0))
+        with mock.patch.object(bridge, "LAN_SWEEP_HI", lo + 20), \
+                mock.patch.object(bridge, "LAN_SWEEP_RATE", 10000.0):
+            self.assertTrue(cam._rendezvous())
+        # The socket that swept is the socket that receives: no rebind.
+        self.assertEqual(cam.addr, ("127.0.0.1", 0))
+        self.assertIsNotNone(cam.sock)
+
+        rx = threading.Thread(target=cam._receive, daemon=True)
+        rx.start()
+        try:
+            deadline = time.monotonic() + 5
+            while cam._media_source is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(cam._media_source, ("127.0.0.1", port))
+            self.assertEqual(cam._learned_ssrc, 0x12345678)
+            # Punching follows the media, not the sweep.
+            self.assertEqual(cam._punch_dest(), ("127.0.0.1", port))
+        finally:
+            cam._stop.set()
+            rx.join(timeout=5)
+        self.addCleanup(cam.stop)
+
+
+class HttpTokenTests(unittest.TestCase):
+    """http_token guards the media routes; /health stays token-free on
+    purpose (the watchdog polls it unauthenticated from cron)."""
+
+    TOKEN = "sekrit"
+
+    def serve(self, token=None):
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            bridge.make_handler({CAM_UID: make_camera()}, boot,
+                                threading.Lock(), token))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def get(self, port, path, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", path, headers=headers or {})
+        return conn.getresponse()
+
+    def test_media_routes_demand_the_token(self):
+        port = self.serve(self.TOKEN)
+        cases = (
+            (f"/cam/{CAM_UID}", None, 401),
+            (f"/cam/{CAM_UID}?token=wrong", None, 401),
+            (f"/cam/{CAM_UID}?token={self.TOKEN}", None, 200),
+            (f"/view/{CAM_UID}", None, 401),
+            (f"/view/{CAM_UID}", {"Authorization": "Bearer wrong"}, 401),
+            (f"/view/{CAM_UID}",
+             {"Authorization": f"Bearer {self.TOKEN}"}, 200),
+            (f"/audio/{CAM_UID}", None, 401),
+            ("/cameras", None, 401),
+            ("/health", None, 200),          # the watchdog's contract
+        )
+        for path, headers, expect in cases:
+            with self.subTest(path=path, headers=headers):
+                resp = self.get(port, path, headers)
+                if expect != 200:
+                    resp.read()       # error bodies are small and finite
+                # status is available without reading: streaming routes
+                # never end, and their first frame may not have arrived.
+                self.assertEqual(resp.status, expect)
+
+    def test_no_token_configured_means_no_auth(self):
+        port = self.serve(None)
+        for path in (f"/cam/{CAM_UID}", "/health"):
+            with self.subTest(path=path):
+                self.assertEqual(self.get(port, path).status, 200)
+
+    # (The 30s connection-timeout value itself is deliberately not pinned --
+    # it is a tuning constant. The behavioral pin is the stalled-write test
+    # below: a TimeoutError on write must end the pump like a hangup.)
+
+    def test_a_stalled_write_ends_the_pump(self):
+        """The 30s connection timeout surfaces as TimeoutError on write;
+        _pump must treat that as a hangup, not crash the thread."""
+        Handler = bridge.make_handler({}, bridge.BootState(),
+                                      threading.Lock())
+        h = object.__new__(Handler)
+        h.wfile = mock.Mock()
+        h.wfile.flush = lambda: None
+        cam = make_camera()
+        writes = {"n": 0}
+
+        def write(item):
+            writes["n"] += 1
+            if writes["n"] == 2:
+                raise TimeoutError()
+
+        q = queue.Queue()
+        for i in range(4):
+            q.put(i)
+        h._pump(cam, q, "viewer", write)
+        self.assertEqual(writes["n"], 2)     # stopped at the stall, cleanly
+
+
+class BindBeforeBootTests(unittest.TestCase):
+    """/health must answer during bring-up -- BootState exists for exactly
+    that, and the watchdog's boot-phase logic depends on it. The socket
+    therefore binds (and serves) before the device list is fetched."""
+
+    def test_the_socket_binds_before_the_device_list_is_fetched(self):
+        order = []
+
+        def recording_server(*a, **k):
+            order.append("bind")
+            m = mock.MagicMock()
+            return m
+
+        path = None
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+            path = f.name
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", path]
+        with mock.patch.object(bridge, "ThreadingHTTPServer",
+                               side_effect=recording_server), \
+                mock.patch.object(bridge, "GPS555") as gps:
+            gps.return_value.list_cameras.side_effect = \
+                lambda *a, **k: order.append("list") or []
+            bridge.main()
+        self.assertEqual(order[:2], ["bind", "list"])
+
+
+class NotifyTimeoutTests(unittest.TestCase):
+    """notify() rides the keepalive cadence: one 10s cloud stall inside the
+    2s cadence is session death (~12s). It needs a timeout well under that;
+    so does send_stun_addr, which the rendezvous retries 3x."""
+
+    def test_notify_and_stun_addr_carry_short_timeouts(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(api, "_get", return_value={"data": {}}) as g:
+            api.notify("u", bridge.EVENT_KEEPALIVE)
+            api.send_stun_addr("u", "1.2.3.4", 5)
+        notify_timeout = g.call_args_list[0].kwargs["timeout"]
+        stun_timeout = g.call_args_list[1].kwargs["timeout"]
+        self.assertEqual(notify_timeout, bridge.NOTIFY_TIMEOUT)
+        self.assertEqual(stun_timeout, bridge.STUN_ADDR_TIMEOUT)
+
+    def test_the_device_list_keeps_the_leisurely_default(self):
+        """Behavioral, at the urlopen boundary: the device list passes no
+        short timeout of its own, so it rides _get's 10s default."""
+        api = bridge.GPS555("t")
+        cm = mock.MagicMock()
+        cm.__enter__.return_value.read.return_value = b'{"data": {"list": []}}'
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               return_value=cm) as uo:
+            api.list_cameras(1)
+        self.assertEqual(uo.call_args.kwargs["timeout"], bridge.CLOUD_TIMEOUT)
+
+
+class DigestRelayTests(unittest.TestCase):
+    """Digest auth binds the response to method+URI. The old code cached the
+    Authorization header and replayed DESCRIBE's on SETUP and PLAY, so any
+    digest-authenticating relay passed DESCRIBE and then failed SETUP
+    forever."""
+
+    def test_digest_authorization_is_recomputed_per_request(self):
+        seen = []
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        sdp = (b"v=0\r\n"
+               b"m=video 0 RTP/AVP 26\r\n"
+               b"a=control:track1\r\n"
+               b"m=audio 0 RTP/AVP 0\r\n"
+               b"a=control:track2\r\n")
+
+        def serve():
+            conn, _ = server.accept()
+            f = conn.makefile("rb")
+
+            def read_req():
+                head = b""
+                while not head.endswith(b"\r\n\r\n"):
+                    line = f.readline()
+                    if not line:
+                        return None
+                    head += line
+                length = 0
+                for ln in head.split(b"\r\n"):
+                    if ln.lower().startswith(b"content-length:"):
+                        length = int(ln.split(b":")[1])
+                return head, f.read(length)
+
+            def reply(code, headers=b"", body=b""):
+                conn.sendall(
+                    f"RTSP/1.0 {code}\r\nCSeq: 1\r\n".encode()
+                    + headers + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body)
+
+            try:
+                while True:
+                    req = read_req()
+                    if req is None:
+                        return
+                    head, _ = req
+                    method, uri, _, _ = head.split(b" ", 3)
+                    method = method.decode()
+                    uri = uri.decode()
+                    auth = ""
+                    for ln in head.split(b"\r\n"):
+                        if ln.lower().startswith(b"authorization:"):
+                            auth = ln.split(b":", 1)[1].strip().decode()
+                    seen.append((method, uri, auth))
+                    if not auth:
+                        reply(401, b'WWW-Authenticate: Digest realm="r", '
+                                   b'nonce="abc"\r\n')
+                    elif method == "DESCRIBE":
+                        reply(200, b"Content-Type: application/sdp\r\n", sdp)
+                    elif method == "SETUP":
+                        reply(200, b"Session: 12345;timeout=60\r\n")
+                    else:
+                        reply(200)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        stream = bridge.RelayStream(
+            f"rtsp://127.0.0.1:{port}/live/x",
+            lambda jpeg: None, lambda pcm: None, lambda: None,
+            threading.Event(), CAM_UID, user="u", password="p")
+        self.addCleanup(stream.close)
+        self.assertTrue(stream.open())
+
+        describe = next(a for m, u, a in seen
+                        if m == "DESCRIBE" and a)
+        setup = next(a for m, u, a in seen if m == "SETUP")
+        play = next(a for m, u, a in seen if m == "PLAY")
+        # Each request carries the digest for its own method+URI...
+        base = f"rtsp://127.0.0.1:{port}/live/x"
+        self.assertIn(f'uri="{base}"', describe)
+        self.assertIn(f'uri="{base}/track1"', setup)
+        self.assertIn(f'uri="{base}"', play)
+        # ...which means no two are identical (the method is hashed in).
+        self.assertNotEqual(describe, setup)
+        self.assertNotEqual(setup, play)
+        self.assertTrue({c: k for c, k in stream._channels.items()} ==
+                        {0: "video", 2: "audio"})
+
+
+class RelayCloseRaceTests(unittest.TestCase):
+    """close() may null the socket while pump() is inside recv: that used to
+    raise AttributeError outside pump's caught exceptions and kill the pump
+    thread with an unhandled traceback."""
+
+    def test_close_during_pump_ends_cleanly(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        accepted = []
+
+        def serve():
+            try:
+                conn, _ = listener.accept()
+                accepted.append(conn)
+            except OSError:
+                pass
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        stream = bridge.RelayStream(
+            f"rtsp://127.0.0.1:{port}/live/x",
+            lambda jpeg: None, lambda pcm: None, lambda: None,
+            stop, CAM_UID)
+        stream._sock = socket.create_connection(("127.0.0.1", port),
+                                                timeout=2)
+        self.addCleanup(stream._sock.close)
+
+        errors = []
+        old_hook = threading.excepthook
+        threading.excepthook = lambda a: errors.append(a)
+        self.addCleanup(setattr, threading, "excepthook", old_hook)
+
+        pump = threading.Thread(target=stream.pump, daemon=True)
+        pump.start()
+        time.sleep(0.2)                 # pump is parked in recv
+        stream.close()                  # TEARDOWN ignored, socket closed
+        pump.join(timeout=5)
+        self.assertFalse(pump.is_alive())
+        self.assertEqual(errors, [],
+                         "pump died with an unhandled exception")
+        for conn in accepted:
+            conn.close()
+
+
+class ReannounceBackoffTests(unittest.TestCase):
+    """While a camera is cloud-offline the reannounce interval must grow
+    instead of sitting at the fixed initial 5s forever: a sleeping camera
+    checks in rarely, and re-registering its port every 5s for hours is
+    cloud chatter with nothing to catch. The awake window belongs to the
+    cloud poller (STATUS_OFFLINE_INTERVAL), whose 0->1 flip kicks the wake
+    and resets this backoff."""
+
+    def make_cam(self):
+        cam = make_camera()
+        cam._load_cloud({"onlineState": "0", "mediaState": "0"})
+        cam.sock = bind_loopback()
+        self.addCleanup(cam.sock.close)
+        cam.addr = ("127.0.0.1", 9)
+        cam._reannounce = mock.Mock()
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        return cam
+
+    def test_the_reannounce_interval_grows_and_caps(self):
+        cam = self.make_cam()
+        for expected in (10.0, 20.0, 40.0, 60.0, 60.0):
+            with self.subTest(next_in=expected):
+                cam._last_re_rendezvous = 0.0   # age out the gate
+                cam._recovery_tick()
+                self.assertEqual(cam._reannounce.call_count, 1)
+                self.assertEqual(cam._backoff, expected)
+            cam._reannounce.reset_mock()
+
+    def test_streaming_resets_the_grown_backoff(self):
+        cam = self.make_cam()
+        cam._backoff = 60.0
+        cam._last_rx = time.monotonic()     # media flowing again
+        cam._recovery_tick()
+        self.assertEqual(cam._backoff, bridge.RECOVERY_INITIAL_BACKOFF)
+        cam._reannounce.assert_not_called()
+
+    def test_a_wake_bypasses_the_grown_backoff(self):
+        cam = self.make_cam()
+        cam._backoff = 60.0
+        cam.update_cloud({"onlineState": "1", "mediaState": "0"})  # 0->1
+        self.assertEqual(cam._backoff, 0.0)
+        self.assertTrue(cam._wake_now)
+        cam._open_transport = mock.Mock(return_value=True)
+        cam._recovery_tick()
+        # The wake goes straight at a full re-rendezvous, not a reannounce.
+        cam._open_transport.assert_called_once()
+        cam._reannounce.assert_not_called()
+
+
+class StunSeqTests(unittest.TestCase):
+    """The hard constraint: a STUN answer with a lower seqNo than the last
+    one taken is stale and must be rejected (the app's
+    _isValidStunResponse). Nothing pinned this, so it could regress green."""
+
+    def make_cam(self):
+        return make_camera()
+
+    def accept(self, cam, d):
+        return cam._accept_stun(d)
+
+    def test_a_lower_seqno_is_rejected_and_does_not_move_state(self):
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertEqual(cam._stun_seq, 10)
+        with self.assertLogs(bridge.log, "WARNING") as logs:
+            self.assertFalse(self.accept(cam, {"seqNo": 9}))
+        self.assertEqual(cam._stun_seq, 10)
+        self.assertIn("stale stun rejected", "\n".join(logs.output))
+
+    def test_equal_and_higher_seqno_are_accepted(self):
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertTrue(self.accept(cam, {"seqNo": 10}))
+        self.assertTrue(self.accept(cam, {"seqNo": 11}))
+        self.assertEqual(cam._stun_seq, 11)
+
+    def test_a_missing_or_unreadable_seqno_is_accepted(self):
+        """No usable seqNo must not stall us: accept rather than wedge."""
+        cam = self.make_cam()
+        self.assertTrue(self.accept(cam, {}))
+        self.assertTrue(self.accept(cam, {"seqNo": None}))
+        self.assertTrue(self.accept(cam, {"seqNo": "nope"}))
+
+    def test_a_reannounce_forgets_the_sequence(self):
+        """A camera that rebooted restarts seqNo at the bottom; the last
+        taken seqNo would reject every fresh answer as stale until the
+        sequence was forgotten."""
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9",
+            "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1")
+        cam.sock = bind_loopback()
+        self.addCleanup(cam.sock.close)
+        cam.addr = ("1.2.3.4", 9)
+        self.assertTrue(cam._accept_stun({"seqNo": 99}))
+        self.assertEqual(cam._stun_seq, 99)
+        cam._reannounce()
+        self.assertEqual(cam._stun_seq, 1)      # fresh answer accepted
+        self.assertEqual(cam.addr, ("1.2.3.4", 9))
+        cam.stop()
+
+
+class KeepaliveCadenceTests(unittest.TestCase):
+    """The session dies ~12s without notify(keepAlive) every 2s. Nothing
+    pinned the cadence, so raising the interval past the death window would
+    kill sessions silently."""
+
+    def test_the_interval_leaves_room_inside_the_death_window(self):
+        self.assertLess(bridge.KEEPALIVE_INTERVAL + bridge.NOTIFY_TIMEOUT, 12)
+
+    def test_keepalive_notifies_every_interval(self):
+        cam = make_camera()
+        intervals = []
+        cam._stop = mock.Mock()
+        cam._stop.is_set.return_value = False
+
+        def wait(t):
+            intervals.append(t)
+            if len(intervals) >= 3:
+                cam._stop.is_set.return_value = True
+            return True
+
+        cam._stop.wait = wait
+        cam._keepalive()
+        self.assertEqual(intervals, [bridge.KEEPALIVE_INTERVAL] * 3)
+        self.assertEqual(cam.api.notify.call_count, 3)
+        cam.api.notify.assert_called_with(CAM_UID, bridge.EVENT_KEEPALIVE)
+
+
+class RendezvousOrderTests(unittest.TestCase):
+    """Rendezvous is send-stun-addr -> notify(start) -> poll, in that order,
+    and never a send-cmd (its "20" is speakOff, not a live-view command)."""
+
+    def test_register_then_wake_then_poll_and_never_send_cmd(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.return_value = {
+            "IpcPrivateIP": "10.0.0.9", "IpcPrivatePort": "55040",
+            "IpcPublicIP": "1.2.3.4", "IpcPublicPort": "9", "seqNo": 1,
+        }
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1")
+        self.addCleanup(cam.stop)
+        self.assertTrue(cam._rendezvous())
+        api.assert_has_calls([
+            mock.call.send_stun_addr(CAM_UID, "127.0.0.1", mock.ANY),
+            mock.call.notify(CAM_UID, bridge.EVENT_START),
+        ], any_order=False)
+        api.send_cmd.assert_not_called()
+        self.assertEqual(cam.addr, ("1.2.3.4", 9))
+
+
+class NotifyBodyTests(unittest.TestCase):
+    """notify() rides _data() like every other cloud call: a 200 + {"code":
+    401} body must raise CloudError, not vanish. Verified live, a success is
+    {"code": 200, "msg": "OK", "data": "ok"}."""
+
+    def test_a_rejected_notify_raises(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(api, "_get",
+                               return_value={"code": 401, "msg": "Erro"}):
+            with self.assertRaises(bridge.CloudError) as cm:
+                api.notify("u", bridge.EVENT_START)
+        self.assertEqual(cm.exception.code, 401)
+
+    def test_a_successful_notify_returns_the_data(self):
+        api = bridge.GPS555("t")
+        with mock.patch.object(
+                api, "_get",
+                return_value={"code": 200, "msg": "OK", "data": "ok"}):
+            self.assertEqual(api.notify("u", bridge.EVENT_KEEPALIVE), "ok")
+
+
+class CloudPollerFanoutTests(unittest.TestCase):
+    """The poller daemon thread must survive a device list that carries
+    garbage: one non-dict row used to kill _run silently and every camera
+    served stale flags forever with nothing on /health saying why."""
+
+    def test_a_non_dict_row_does_not_kill_the_poll(self):
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [
+            "garbage", {"uid": CAM_UID, "onlineState": "1"}, 42]
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cam = make_camera()
+        cam.update_cloud = mock.Mock()
+        cloud.register(cam)
+        cloud.poll()                     # must not raise
+        cam.update_cloud.assert_called_once()
+        self.assertEqual(boot.snapshot()["phase"], "ready")
+
+    def test_a_failing_fanout_counts_as_a_poll_failure(self):
+        api = mock.MagicMock()
+        api.list_cameras.return_value = [{"uid": CAM_UID}]
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cam = make_camera()
+        cam.update_cloud = mock.Mock(side_effect=RuntimeError("boom"))
+        cloud.register(cam)
+        cloud.poll()        # must not raise -- the failure is accounted
+        self.assertEqual(cloud._fails, 1)   # stale flags get the warning path
+
+
+class RecoveryWakeDuringBackoffTests(unittest.TestCase):
+    """update_cloud's 0->1 wake must not wait out a post-attempt backoff
+    sleep: the sleep used to be one monolithic _stop.wait(self._backoff) of
+    up to 60s, and a battery camera's awake window does not survive that."""
+
+    def test_a_wake_during_the_backoff_sleep_interrupts_it(self):
+        cam = make_camera()
+        cam._backoff = 30.0
+        cam._last_re_rendezvous = 0.0
+        cam._last_rx = 0.0
+        cam._open_transport = mock.Mock(return_value=True)
+        done = threading.Event()
+
+        def tick():
+            cam._recovery_tick()
+            done.set()
+
+        worker = threading.Thread(target=tick, daemon=True)
+        worker.start()
+        time.sleep(1.5)                 # the tick is now inside its 30s sleep
+        cam._wake_now = True            # what update_cloud does on a 0->1
+        self.assertTrue(done.wait(10), "recovery slept through the wake")
+        worker.join(timeout=5)
+        cam._open_transport.assert_called_once()
+        self.assertFalse(worker.is_alive())
 
 
 if __name__ == "__main__":

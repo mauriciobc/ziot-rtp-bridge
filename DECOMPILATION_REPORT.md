@@ -289,8 +289,9 @@ Referenced from `config.dart`, `request.dart` and `application.dart`. The app al
 ### 4.3 Timing constants
 
 - The `App send hello` punch loop is `Timer.periodic` at **1 s** (`_startP2PConnect`,
-  `Duration@b01731` = 1,000,000 µs). The bridge punches every 0.5 s — twice as fast as
-  the app, which is harmless but not "app-exact".
+  `Duration@b01731` = 1,000,000 µs). The bridge punches every 1 s — the same
+  cadence, app-exact. (An earlier revision punched every 0.5 s; PUNCH_INTERVAL
+  is 1.0 s since the app-exact pass.)
 - `getDeviceLatestStunAddr` polls at **1.5 s** (`Duration@b017a1`).
 - The stun-heart interval is computed at runtime (`AllocateDurationStub` at `0x6505f8`),
   not a constant, so the bridge's fixed 5-tick ratio has no fixed counterpart in the app.
