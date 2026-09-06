@@ -2260,5 +2260,55 @@ class RecoveryWakeDuringBackoffTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
 
 
+class BrokerlessFallbackTests(unittest.TestCase):
+    """A token-mode camera whose broker never answers and whose roster
+    endpoint is IP-only used to fall back to (ip, 0): a /health entry that
+    said "direct" while the punch loop skipped port 0 and nothing was aimed
+    anywhere (observed live: 41 re-rendezvous, 585 stray datagrams, zero
+    sends). It now sweeps from the rendezvous socket, like punch-only."""
+
+    def test_ip_only_fallback_sweeps_instead_of_installing_silence(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.side_effect = bridge.CloudError(401, "Erro comum")
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("192.0.2.5", 0))
+        cam._lan_resweep = mock.Mock()
+        with mock.patch.object(bridge.time, "sleep", lambda _s: None):
+            self.assertTrue(cam._rendezvous())
+        self.assertEqual(cam.addr, ("192.0.2.5", 0))
+        self.assertIsNotNone(cam.sock)
+        cam._lan_resweep.assert_called_once()
+        cam.stop()
+
+    def test_ip_and_port_fallback_still_punches_the_configured_port(self):
+        api = mock.MagicMock()
+        api.get_stun_addr.side_effect = bridge.CloudError(401, "Erro comum")
+        cam = bridge.ZiotCamera(api, {"uid": CAM_UID}, "127.0.0.1",
+                                static_addr=("192.0.2.5", 52901))
+        cam._lan_resweep = mock.Mock()
+        with mock.patch.object(bridge.time, "sleep", lambda _s: None):
+            self.assertTrue(cam._rendezvous())
+        self.assertEqual(cam.addr, ("192.0.2.5", 52901))
+        cam._lan_resweep.assert_not_called()
+        cam.stop()
+
+
+class ParkDetailTests(unittest.TestCase):
+    """The parked auth failure must name the code: 401 (expired token) and
+    403 (blocked or rate-limited) park identically, and "check the token"
+    is the wrong advice for one of them."""
+
+    def test_the_park_names_the_cloud_error(self):
+        api = mock.MagicMock()
+        api.list_cameras.side_effect = bridge.CloudError(401, "Erro comum")
+        boot = bridge.BootState()
+        boot.set("ready", None)
+        cloud = bridge.CloudState(api, 1, boot)
+        cloud.poll()
+        detail = boot.snapshot()["detail"]
+        self.assertIn("rejected the token", detail)
+        self.assertIn("401", detail)
+
+
 if __name__ == "__main__":
     unittest.main()
