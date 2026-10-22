@@ -14,6 +14,16 @@ Usage:
 A hit looks like:
     RESPONDER 192.168.18.75:52901  12 pkts  ssrc=0x30191094 pt=26,0
 
+Which cameras are even on? Powered cameras advertise Bluetooth LE as
+"ZIOTA_<uid>" for a short window (verified live: ZIOTA_140979857781,
+service UUID 0xa201, Tuya module). --ble scans for those names first,
+so you learn the UID before choosing a LAN IP to sweep. Needs BlueZ's
+bluetoothctl; the camera stops advertising once something connects or
+the window closes, so a silent BLE scan does not mean the camera is off:
+
+    python3 ziot_offline_probe.py --ble            # list ZIOTA cameras only
+    python3 ziot_offline_probe.py --ble 192.168.68.112 --uid 140979857781
+
 On TXW817 firmware, unsolicited hellos are ignored — a silent sweep is
 normal, not a probe bug. Those cameras still need a token in the bridge
 config so `--offline` can send notify/keepalive; put the LAN IP only:
@@ -27,8 +37,10 @@ Exit code is 0 when at least one responder (or the expected UID's SSRC)
 is seen, 1 when nothing answers.
 """
 import argparse
+import re
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -63,6 +75,66 @@ def parse_ports(spec: str) -> list:
     return sorted(ports)
 
 
+BLE_MAC_RE = r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}"
+# [NEW]/[CHG] discovery events and the `devices` listing both carry the name
+# right after the address; Name:/Alias: lines put it after a field label.
+BLE_NAMED_RE = re.compile(
+    rf"Device ({BLE_MAC_RE})(?:\s+(ZIOTA_\d+))?(?:\s*$|\s+(?:Name|Alias): (ZIOTA_\d+))", re.M)
+BLE_RSSI_RE = re.compile(
+    rf"^(?:\[[A-Z]+\] )?Device ({BLE_MAC_RE}) RSSI: (?:0x[0-9a-fA-F]+ )?\(?(-?\d+)\)?",
+    re.M)
+BLE_UID_RE = re.compile(r"^ZIOTA_(\d+)$")
+
+
+def parse_ble_devices(transcript: str) -> dict:
+    """ZIOTA cameras seen in a bluetoothctl transcript, keyed by MAC.
+
+    A camera appears as `Device <mac> ZIOTA_<uid>` in discovery events or in
+    the `devices` listing. RSSI is kept when the transcript carries it.
+    Anything that is not a ZIOTA device is ignored -- the bus has phones,
+    headsets and bands on it too.
+    """
+    cams: dict = {}
+    for mac, inline, fielded in BLE_NAMED_RE.findall(transcript):
+        name = inline or fielded
+        m = BLE_UID_RE.match(name) if name else None
+        if not m:
+            continue
+        cams.setdefault(mac, {"uid": m.group(1), "rssi": None})["uid"] = m.group(1)
+    for mac, rssi in BLE_RSSI_RE.findall(transcript):
+        if mac in cams:
+            cams[mac]["rssi"] = int(rssi)
+    return cams
+
+
+def ble_scan(seconds: float = 15.0) -> str:
+    """Run one bluetoothctl LE scan and return its transcript.
+
+    Raises FileNotFoundError when bluetoothctl is absent, and RuntimeError
+    when the adapter itself is missing or refused to start discovery.
+    """
+    proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    try:
+        assert proc.stdin and proc.stdout
+        proc.stdin.write("scan on\n")
+        proc.stdin.flush()
+        time.sleep(max(seconds, 1.0))
+        proc.stdin.write("devices\nquit\n")
+        proc.stdin.flush()
+        proc.stdin.close()
+        out, _ = proc.communicate(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    if "No default controller available" in out:
+        raise RuntimeError("bluetoothctl reports no default controller -- "
+                           "is there a powered Bluetooth adapter?")
+    return out
+
+
 def describe(payload: bytes) -> str:
     # Length first: a 0/1-byte datagram must not index payload[1] here --
     # an IndexError in the report loop kills the probe before it prints.
@@ -77,11 +149,17 @@ def describe(payload: bytes) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    ap.add_argument("target", help="camera LAN IP to sweep")
+    ap.add_argument("target", nargs="?", default=None,
+                    help="camera LAN IP to sweep (optional with --ble)")
     ap.add_argument("--ports", default=DEFAULT_PORTS,
                     help=f"ports to hello (default {DEFAULT_PORTS})")
     ap.add_argument("--uid", default=None,
                     help="camera UID: only its SSRC counts as a hit")
+    ap.add_argument("--ble", action="store_true",
+                    help="scan Bluetooth LE first and report ZIOTA_<uid> "
+                         "cameras; with no target, stop there")
+    ap.add_argument("--ble-scan", type=float, default=15.0, metavar="SECONDS",
+                    help="BLE discovery duration (default 15)")
     ap.add_argument("--rate", type=float, default=2000,
                     help="wire datagrams per second -- the same meaning as "
                          "the bridge's LAN_SWEEP_RATE. Each port gets a "
@@ -92,6 +170,40 @@ def main() -> int:
     ap.add_argument("--bind-ip", default=None,
                     help="local IP to send from (default: route to target)")
     args = ap.parse_args()
+
+    cams: dict = {}
+    if args.ble:
+        try:
+            cams = parse_ble_devices(ble_scan(args.ble_scan))
+        except FileNotFoundError:
+            print("bluetoothctl not found -- BLE discovery needs BlueZ "
+                  "(Linux); skipping it", file=sys.stderr)
+            cams = {}
+        except RuntimeError as e:
+            print(f"BLE discovery unavailable: {e}", file=sys.stderr)
+            cams = {}
+        if cams:
+            for mac, e in sorted(cams.items()):
+                rssi = f"  RSSI {e['rssi']}" if e["rssi"] is not None else ""
+                print(f"BLE  ZIOTA_{e['uid']}  at {mac}{rssi}")
+            print("     present and powered; sweep its LAN IP with "
+                f"--uid <uid> (the advertisement carries no IP)")
+        elif args.target is None:
+            print("no ZIOTA camera advertising right now. The BLE window is "
+                  "short (it closes after a connection or ~a minute), so a "
+                  "silent scan does not mean the camera is off; if you know "
+                  "its LAN IP, sweep it directly.")
+            return 1
+        else:
+            print("no ZIOTA camera advertising right now; continuing with "
+                  "the UDP sweep as asked", file=sys.stderr)
+
+    if args.target is None:
+        if not args.ble:
+            ap.error("a target IP is required (or use --ble to just list "
+                     "cameras by Bluetooth)")
+        # BLE-only run: hits already printed.
+        return 0 if cams else 1
 
     try:
         target_ip = socket.gethostbyname(args.target)

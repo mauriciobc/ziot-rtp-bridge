@@ -150,5 +150,69 @@ class ParsePortsErrorTests(unittest.TestCase):
         self.assertIn("32768-61000", err.getvalue())
 
 
+# A real bluetoothctl transcript shape, from the live TXW817 (2026-10-22):
+# discovery events, the `devices` listing, an RSSI both with and without
+# the hex echo, and non-camera neighbours that must be ignored.
+BLE_TRANSCRIPT = """\
+[CHG] Controller 10:3D:1C:CB:26:30 Discovering: yes
+[NEW] Device E0:44:40:60:68:82 ZIOTA_140979857781
+[CHG] Device E0:44:40:60:68:82 RSSI: 0xffffffb0 (-80)
+[NEW] Device A4:E2:87:EE:18:16 POCO X6 5G
+[CHG] Device A4:E2:87:EE:18:16 ServiceData.0000fcc0-0000-1000-8000-00805f9b34fb:
+  03 01 01 c0 db ff 8d 90 9e 06 1b 2f 80 17 0c 03
+[NEW] Device FC:58:FA:B7:A3:05 PBS40BT
+[CHG] Device AA:BB:CC:DD:EE:FF Name: ZIOTA_141030191094
+[CHG] Device AA:BB:CC:DD:EE:FF RSSI: -54
+[CHG] Device 98:B6:E9:88:A8:7C RSSI: 0xffffffc1 (-63)
+Device E0:44:40:60:68:82 ZIOTA_140979857781
+Device FC:58:FA:B7:A3:05 PBS40BT
+Device 98:B6:E9:88:A8:7C Xbox Wireless Controller
+"""
+
+
+class BleDiscoveryTests(unittest.TestCase):
+    def test_ziota_cameras_are_pulled_from_the_transcript(self):
+        cams = probe.parse_ble_devices(BLE_TRANSCRIPT)
+        self.assertEqual(
+            cams,
+            {"E0:44:40:60:68:82": {"uid": "140979857781", "rssi": -80},
+             "AA:BB:CC:DD:EE:FF": {"uid": "141030191094", "rssi": -54}})
+
+    def test_a_transcript_without_cameras_yields_nothing(self):
+        self.assertEqual(probe.parse_ble_devices(
+            "[NEW] Device A4:E2:87:EE:18:16 POCO X6 5G\n"
+            "Device FC:58:FA:B7:A3:05 PBS40BT\n"), {})
+
+    def test_ble_only_run_reports_cameras_and_exits_zero(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["probe", "--ble", "--ble-scan", "1"]), \
+                mock.patch.object(probe, "ble_scan", return_value=BLE_TRANSCRIPT), \
+                contextlib.redirect_stdout(out):
+            rc = probe.main()
+        self.assertEqual(rc, 0)
+        self.assertIn("ZIOTA_140979857781  at E0:44:40:60:68:82", out.getvalue())
+        self.assertIn("RSSI -80", out.getvalue())
+
+    def test_silent_ble_scan_with_no_target_exits_one(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["probe", "--ble", "--ble-scan", "1"]), \
+                mock.patch.object(probe, "ble_scan", return_value=""), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = probe.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("silent scan does not mean the camera is off",
+                      out.getvalue())
+
+    def test_a_missing_adapter_is_reported_not_raised(self):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["probe", "--ble", "--ble-scan", "1"]), \
+                mock.patch.object(probe, "ble_scan", side_effect=RuntimeError(
+                    "bluetoothctl reports no default controller")), \
+                contextlib.redirect_stderr(err):
+            rc = probe.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("no default controller", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

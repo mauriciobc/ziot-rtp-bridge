@@ -230,7 +230,19 @@ probe socket that would close before the reply lands.
 python3 ziot_offline_probe.py 192.168.18.75 --uid 141030191094
 ```
 
-A silent sweep on this firmware is normal, not a probe bug.
+A silent sweep on this firmware is normal, not a probe bug. To learn
+*which* cameras are even powered before sweeping IPs, use Bluetooth:
+an awake camera advertises BLE as `ZIOTA_<uid>` for a short window
+(verified live 2026-10-22 on the Tuya-module TXW817: service UUID
+`0xa201`, e.g. `ZIOTA_140979857781`; it stops advertising after a
+connection or about a minute, so a silent scan does not mean the camera
+is off — sweep the IP anyway). The advertisement carries no LAN IP;
+needs BlueZ's `bluetoothctl`:
+
+```bash
+python3 ziot_offline_probe.py --ble            # list powered cameras by UID
+python3 ziot_offline_probe.py --ble 192.168.68.112 --uid 140979857781
+```
 
 ### Docker (recommended)
 
@@ -518,7 +530,11 @@ they check in with the vendor.
 **`ziot_offline_probe.py` reports nothing.**
 Normal on TXW817 firmware — unsolicited hellos are ignored. Put the LAN
 IP in `offline_endpoints` and run the bridge with a token. A HIT means
-that camera will punch without a token.
+that camera will punch without a token. To tell "asleep, needs its cloud
+notify" from "not on this LAN at all", run `python3 ziot_offline_probe.py
+--ble`: a powered camera advertises `ZIOTA_<uid>` over Bluetooth LE for
+a short window. Nothing on the BLE scan either? The camera is likely
+off (or another central is holding its one connection).
 
 **Everything says `mode: down` and nothing streams.**
 The bridge stays up and retries rather than exiting, so this is a report, not a
@@ -748,6 +764,10 @@ reliability improvements were added during deployment:
   on TXW817). Pins the LAN IP and follows the STUN private port. Punch-only
   entries accept an IP only: the rendezvous socket itself hello-sweeps the
   ephemeral range, and the camera's RTP identifies the port.
+* **BLE discovery in the probe** — `ziot_offline_probe.py --ble` scans
+  Bluetooth LE and lists powered cameras by their `ZIOTA_<uid>`
+  advertisement before you pick a LAN IP to sweep (BlueZ `bluetoothctl`;
+  verified live on the Tuya-module TXW817, service UUID `0xa201`).
 * **No-rebind recovery** — while a camera is cloud-offline the same local
   UDP port is reannounced instead of rebound (a 176-rendezvous loop used
   to close the socket the camera would send to), on a growing interval
