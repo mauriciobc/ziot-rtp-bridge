@@ -247,6 +247,22 @@ python3 ziot_offline_probe.py --ble            # list powered cameras by UID + L
 python3 ziot_offline_probe.py --ble 192.168.68.107 --uid 140979857781
 ```
 
+### Local cloud emulation (work in progress)
+
+`ziot_fake_cloud.py` is phase 1 of removing the vendor cloud (goal and
+findings: `DECOMPILATION_REPORT.md` §8). It impersonates the gps555.net
+endpoints and logs everything the camera sends; a DNS hijack mode answers
+`*.gps555.net` with this host and forwards everything else upstream, so
+the camera's own registration/keepalive traffic becomes the protocol
+capture. Ports 53/80/13478/7080 need privileges:
+
+```bash
+sudo python3 ziot_fake_cloud.py --log fake_cloud.log
+```
+
+Then point the router's DHCP DNS at this host. Phase 2 (answering the
+camera correctly) is not implemented yet.
+
 ### Docker (recommended)
 
 ```bash
