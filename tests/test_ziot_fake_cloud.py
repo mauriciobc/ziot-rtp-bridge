@@ -201,5 +201,23 @@ class ProvisionFrameTests(unittest.TestCase):
             fake.parse_provision_response(b"\x00" + good[1:])
 
 
+class EnvTests(unittest.TestCase):
+    def test_env_values_are_loaded_and_comments_skipped(self):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as f:
+            f.write("# comment\nWIFI_SSID=House of Cats\nWIFI_PWD= s3cret \n"
+                    "NOEQUALS\n\nBLE_MAC=E0:44:40:60:68:82\n")
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        env = fake._load_env(path)
+        self.assertEqual(env["WIFI_SSID"], "House of Cats")
+        self.assertEqual(env["WIFI_PWD"], "s3cret")
+        self.assertEqual(env["BLE_MAC"], "E0:44:40:60:68:82")
+        self.assertNotIn("NOEQUALS", env)
+
+    def test_missing_env_file_is_empty(self):
+        self.assertEqual(fake._load_env("/nonexistent/.env"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

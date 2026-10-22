@@ -297,6 +297,21 @@ def _detect_lan_ip() -> str:
         probe.close()
 
 
+def _load_env(path: str = ".env") -> dict:
+    """KEY=VALUE pairs from a .env file; comments and blanks ignored."""
+    out = {}
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
 def ble_provision(args) -> int:
     """Build the wifiConnect frame and write it to the camera over BLE.
 
@@ -304,10 +319,18 @@ def ble_provision(args) -> int:
     connect, subscribe notify on 0x000a, then write the frame in 20-byte
     chunks to 0x0008 -- the order the vendor app uses (it subscribes after
     writing, we subscribe first so the reply cannot be missed).
+    Credentials come from --flags or from .env (WIFI_SSID/WIFI_PWD/BLE_MAC).
     """
-    if not (args.ssid and args.pwd is not None and args.ble_mac):
-        print("--provision needs --ssid, --pwd and --ble-mac", file=sys.stderr)
+    env = _load_env()
+    ssid = args.ssid or env.get("WIFI_SSID")
+    pwd = args.pwd if args.pwd is not None else env.get("WIFI_PWD")
+    ble_mac = args.ble_mac or env.get("BLE_MAC")
+    if not (ssid and pwd is not None and ble_mac):
+        print("--provision needs --ssid, --pwd and --ble-mac "
+              "(or WIFI_SSID/WIFI_PWD/BLE_MAC in .env; see .env.example)",
+              file=sys.stderr)
         return 2
+    args.ble_mac = ble_mac
     sig_addr = args.sig_addr or f"{_detect_lan_ip()}:8882"
     tz = args.tz if args.tz is not None else _local_tz_minutes()
     frame = wifi_connect_frame(args.ssid, args.pwd, sig_addr, tz)
