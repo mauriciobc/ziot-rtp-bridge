@@ -382,6 +382,18 @@ class AttTransportTests(unittest.TestCase):
         self.assertEqual(rsp, b"\x13")
         self.assertEqual(notes, [(0x000A, b"\xaa\xbb")])
 
+    def test_cameras_own_mtu_request_is_skipped_and_not_answered(self):
+        """The camera sends `02 17 00` where a write response is expected.
+        Taken as the response it hides the real `13`; answered with a 0x03
+        it provokes `01 03 .. .. 06` (verified live), which then displaces
+        the next write's response."""
+        script = lambda pdu: [b"\x02\x17\x00", b"\x13"]
+        sock = ScriptedAttSocket(script)
+        rsp = fake._att_request(sock, fake.ATT_WRITE_REQUEST,
+                                b"\x0b\x00\x01\x00", 1.0, [])
+        self.assertEqual(rsp, b"\x13")
+        self.assertEqual(len(sock.sent), 1)   # only our write; no reply
+
     def test_timeout_is_empty_not_an_error(self):
         sock = ScriptedAttSocket(lambda pdu: [])
         self.assertEqual(

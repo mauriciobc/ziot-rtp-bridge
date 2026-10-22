@@ -581,13 +581,26 @@ def _att_read(sock, timeout: float) -> bytes:
         return b""
 
 
+def _att_is_peer_mtu_request(pdu: bytes) -> bool:
+    """True for an Exchange MTU Request the *camera* sent us.
+
+    These cameras emit `02 17 00` in the middle of our handshake, where a
+    write response is expected. It must be skipped, not taken as the
+    response -- and NOT answered: replying with an MTU Response (0x03)
+    makes the camera answer `01 03 .. .. 06` (Request Not Supported),
+    which then lands in place of the next write's response.
+    """
+    return len(pdu) >= 3 and pdu[0] == ATT_MTU_REQUEST
+
+
 def _att_request(sock, opcode: int, payload: bytes, timeout: float,
                  notes: list) -> bytes:
     """Send one request and return its response PDU (or b"" on timeout).
 
     A notification can arrive before the response it was triggered by, so
     PDUs that are not the response are collected into `notes` as
-    (handle, value) instead of being mistaken for the response.
+    (handle, value) instead of being mistaken for the response. The
+    camera's own MTU request is answered and skipped the same way.
     """
     sock.send(bytes([opcode]) + payload)
     end = time.time() + timeout
@@ -597,6 +610,8 @@ def _att_request(sock, opcode: int, payload: bytes, timeout: float,
             continue
         if pdu[0] == ATT_NOTIFY and len(pdu) >= 3:
             notes.append((struct.unpack("<H", pdu[1:3])[0], pdu[3:]))
+            continue
+        if _att_is_peer_mtu_request(pdu):
             continue
         return pdu
     return b""
@@ -643,6 +658,8 @@ def _att_attempt(ble_mac: str, chunks: list) -> str:
             pdu = _att_read(sock, 1.0)
             if pdu and pdu[0] == ATT_NOTIFY and len(pdu) >= 3:
                 notes.append((struct.unpack("<H", pdu[1:3])[0], pdu[3:]))
+            elif pdu and _att_is_peer_mtu_request(pdu):
+                print(f"camera MTU request (ignored): {pdu.hex()}", flush=True)
             elif pdu:
                 print(f"event: {pdu.hex()}", flush=True)
 

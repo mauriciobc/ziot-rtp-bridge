@@ -545,7 +545,9 @@ truncated to its first byte, and the same scripts wrote ATT handles
 big-endian (they are little-endian) and a 4-byte CCCD value (it is 2
 bytes). Findings below are marked by whether they survive that.
 `ziot_fake_cloud.py` now reads whole PDUs and has tests pinning the wire
-bytes; nothing below has been re-run on a live camera with it yet.
+bytes. Re-run live on unit `140979857781` (still advertising, never
+joined) with that transport, see "Live result with the corrected
+transport" below.
 
 * **Survives — the first byte of each reply.** Classifying a reply by
   its opcode byte is valid even when truncated. Probing handles with a
@@ -572,10 +574,25 @@ bytes; nothing below has been re-run on a live camera with it yet.
 
 ### Still open
 
-* **What the camera said.** The notification after a write to `0x0008`
-  is the best lead in this document: it may be a status or error code for
-  the frame we sent. Reading it needs one live run of the corrected
-  transport against a camera in its pairing window.
+* **Live result with the corrected transport.** MTU exchange `03 17 00`
+  (server MTU 23 — now read whole, not inferred); CCCD write at `0x000b`
+  acknowledged; all three frame chunks written to `0x0008` acknowledged
+  (`13`); then **no notification at all** in a 15 s window, no WiFi join,
+  and the camera kept advertising. So the `1b` seen during the 1-byte
+  handle probe was a reaction to that probe, not a reply to the frame:
+  the camera does not answer the frame. In one run the camera also sent
+  its own `02 17 00` (an Exchange MTU *Request*) where the CCCD response
+  belonged; answering it with `03 17 00` made the camera reply
+  `01 03 17 00 06` — Error Response, request opcode `0x03`, "Request Not
+  Supported" — so it must be skipped, not answered.
+* **Why the frame is ignored is unknown.** Candidates, none tested with
+  a working read path: the command byte or payload differs from the
+  assembly reading; the `regCode` is required; the camera expects the
+  write on a different handle than `0x0008` (the UUIDs were never read);
+  the pairing state machine has timed out although the camera still
+  advertises. The cheapest discriminator is a capture of the real app
+  provisioning once (`btmon`, needs the sudo rule already in place),
+  which would show the true handle and bytes in one go.
 * **Whether the frame is what the firmware expects.** The frame is
   reproduced from the app's *assembly* (§9), never observed on the air,
   so a wrong command byte, the `0x0D` terminator or the `regCode` remain
