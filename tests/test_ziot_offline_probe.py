@@ -175,8 +175,24 @@ class BleDiscoveryTests(unittest.TestCase):
         cams = probe.parse_ble_devices(BLE_TRANSCRIPT)
         self.assertEqual(
             cams,
-            {"E0:44:40:60:68:82": {"uid": "140979857781", "rssi": -80},
-             "AA:BB:CC:DD:EE:FF": {"uid": "141030191094", "rssi": -54}})
+            {"E0:44:40:60:68:82": {"uid": "140979857781", "rssi": -80,
+                                   "ble_mac": "E0:44:40:60:68:82"},
+             "AA:BB:CC:DD:EE:FF": {"uid": "141030191094", "rssi": -54,
+                                   "ble_mac": "AA:BB:CC:DD:EE:FF"}})
+
+    def test_wifi_mac_is_the_reversed_ble_address(self):
+        # Live-verified 2026-10-22: ZIOTA_140979857781 advertises
+        # E0:44:40:60:68:82 and joined the LAN as 82:68:60:40:44:e0.
+        self.assertEqual(probe.ble_to_wifi_mac("E0:44:40:60:68:82"),
+                         "82:68:60:40:44:e0")
+
+    def test_lan_ip_resolves_from_neighbor_table(self):
+        cams = probe.parse_ble_devices(BLE_TRANSCRIPT)
+        neigh = ("192.168.68.107 dev wlan0 lladdr 82:68:60:40:44:e0 REACHABLE\n"
+                 "192.168.68.1 dev wlan0 lladdr 40:ed:00:84:24:e0 REACHABLE\n")
+        probe.ble_lan_ips(cams, neigh)
+        self.assertEqual(cams["E0:44:40:60:68:82"]["ip"], "192.168.68.107")
+        self.assertNotIn("ip", cams["AA:BB:CC:DD:EE:FF"])
 
     def test_a_transcript_without_cameras_yields_nothing(self):
         self.assertEqual(probe.parse_ble_devices(

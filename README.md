@@ -236,12 +236,15 @@ an awake camera advertises BLE as `ZIOTA_<uid>` for a short window
 (verified live 2026-10-22 on the Tuya-module TXW817: service UUID
 `0xa201`, e.g. `ZIOTA_140979857781`; it stops advertising after a
 connection or about a minute, so a silent scan does not mean the camera
-is off — sweep the IP anyway). The advertisement carries no LAN IP;
-needs BlueZ's `bluetoothctl`:
+is off — sweep the IP anyway). The advertisement carries no LAN IP, but
+the firmware associates with the **reversed BLE address** as its WiFi
+MAC (`E0:44:40:60:68:82` → `82:68:60:40:44:e0`), so `--ble` resolves
+the LAN IP straight from the ARP table when the kernel has seen the
+camera. Needs BlueZ's `bluetoothctl`:
 
 ```bash
-python3 ziot_offline_probe.py --ble            # list powered cameras by UID
-python3 ziot_offline_probe.py --ble 192.168.68.112 --uid 140979857781
+python3 ziot_offline_probe.py --ble            # list powered cameras by UID + LAN IP
+python3 ziot_offline_probe.py --ble 192.168.68.107 --uid 140979857781
 ```
 
 ### Docker (recommended)

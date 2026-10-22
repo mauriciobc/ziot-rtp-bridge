@@ -86,6 +86,33 @@ BLE_RSSI_RE = re.compile(
 BLE_UID_RE = re.compile(r"^ZIOTA_(\d+)$")
 
 
+def ble_to_wifi_mac(ble_mac: str) -> str:
+    """The camera's WiFi MAC, derived from its BLE address.
+
+    Verified live (2026-10-22): unit 140979857781 advertises BLE as
+    E0:44:40:60:68:82 and associates with 82:68:60:40:44:e0 -- the same
+    six bytes in reverse order. One observation, but six matching bytes
+    in reverse is not a coincidence; treat as firmware convention until
+    a unit contradicts it.
+    """
+    return ":".join(reversed(ble_mac.split(":"))).lower()
+
+
+def ble_lan_ips(cams: dict, neigh: str) -> None:
+    """Resolve each BLE-discovered camera's LAN IP from the ARP table.
+
+    `neigh` is `ip neigh show` output. The advertisement itself carries no
+    IP; the reversed-MAC convention plus the kernel's neighbor table does.
+    """
+    for e in cams.values():
+        wifi = ble_to_wifi_mac(e.pop("ble_mac"))
+        for line in neigh.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[4].lower() == wifi:
+                e["ip"] = parts[0]
+                break
+
+
 def parse_ble_devices(transcript: str) -> dict:
     """ZIOTA cameras seen in a bluetoothctl transcript, keyed by MAC.
 
@@ -100,7 +127,8 @@ def parse_ble_devices(transcript: str) -> dict:
         m = BLE_UID_RE.match(name) if name else None
         if not m:
             continue
-        cams.setdefault(mac, {"uid": m.group(1), "rssi": None})["uid"] = m.group(1)
+        cams.setdefault(mac, {"uid": m.group(1), "rssi": None,
+                              "ble_mac": mac})["uid"] = m.group(1)
     for mac, rssi in BLE_RSSI_RE.findall(transcript):
         if mac in cams:
             cams[mac]["rssi"] = int(rssi)
@@ -183,11 +211,23 @@ def main() -> int:
             print(f"BLE discovery unavailable: {e}", file=sys.stderr)
             cams = {}
         if cams:
+            try:
+                neigh = subprocess.run(["ip", "neigh", "show"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout
+                ble_lan_ips(cams, neigh)
+            except (OSError, subprocess.SubprocessError):
+                pass
             for mac, e in sorted(cams.items()):
                 rssi = f"  RSSI {e['rssi']}" if e["rssi"] is not None else ""
-                print(f"BLE  ZIOTA_{e['uid']}  at {mac}{rssi}")
-            print("     present and powered; sweep its LAN IP with "
-                f"--uid <uid> (the advertisement carries no IP)")
+                ip = f"  LAN {e['ip']}" if e.get("ip") else ""
+                print(f"BLE  ZIOTA_{e['uid']}  at {mac}{rssi}{ip}")
+            if all(e.get("ip") for e in cams.values()):
+                print("     present and powered; IPs resolved from the ARP "
+                      "table (WiFi MAC = reversed BLE MAC)")
+            else:
+                print("     present and powered; sweep its LAN IP with "
+                    f"--uid <uid> (the advertisement carries no IP)")
         elif args.target is None:
             print("no ZIOTA camera advertising right now. The BLE window is "
                   "short (it closes after a connection or ~a minute), so a "
