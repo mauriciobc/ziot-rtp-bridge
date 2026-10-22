@@ -89,6 +89,7 @@ Create `ziot_config.json` next to the script:
 | `punch_interval` | no | Seconds between `App send hello` packets. Default `1.0`, matching the app; must be a finite value strictly greater than 0 and strictly below the 2 s starvation threshold. Anything else is logged as an error and replaced with the default — a bad value never stops the bridge from booting |
 | `relay_user` / `relay_pass` | no | Credentials for the RTSP relay, if it ever demands them. Basic and Digest are both handled; a cached digest challenge is re-derived per request (method and URI are hashed into the response, so it cannot be replayed across requests) |
 | `offline` / `offline_endpoints` | no | Roster from LAN targets instead of `GET /v1/ipc`: `{"offline": true, "offline_endpoints": {"<uid>": "192.168.18.75"}}`. With a token, IP only is enough — the listen port rotates and comes from STUN. Punch-only (no token), IP only makes the bridge hello-sweep the ephemeral range from its own socket; `ip:port` from a probe HIT skips the sweep. A token in the same file still does notify/keepalive. See "Running without the device list" |
+| `api_base` | no | Base URL of the cloud API. Default `https://ipc.gps555.net/api`. Point it at a local broker (`http://192.168.68.114:80/api`) to keep the rendezvous off the vendor cloud — the media is LAN-local either way; only the signalling moves. See "Local cloud emulation" |
 
 ```bash
 chmod 600 ziot_config.json    # it holds an account credential
@@ -249,19 +250,36 @@ python3 ziot_offline_probe.py --ble 192.168.68.107 --uid 140979857781
 
 ### Local cloud emulation (work in progress)
 
-`ziot_fake_cloud.py` is phase 1 of removing the vendor cloud (goal and
-findings: `DECOMPILATION_REPORT.md` §8). It impersonates the gps555.net
-endpoints and logs everything the camera sends; a DNS hijack mode answers
-`*.gps555.net` with this host and forwards everything else upstream, so
-the camera's own registration/keepalive traffic becomes the protocol
-capture. Ports 53/80/13478/7080 need privileges:
+`ziot_fake_cloud.py` is the start of removing the vendor cloud (goal and
+findings: `DECOMPILATION_REPORT.md` §8–§11). Two things work today:
+
+* **The HTTP API is answered locally.** Response shapes come from a live
+  app capture (§11). Register a camera and point the bridge at the broker:
+
+  ```bash
+  python3 ziot_fake_cloud.py --http 8089 --sig 0 --stun 0 --ws 0 --dns 0 \
+      --camera 141030191094=192.168.68.50:34567
+  # ziot_config.json: "api_base": "http://127.0.0.1:8089/api"
+  ```
+
+  Verified: the bridge lists the camera, registers its UDP port, wakes it
+  and resolves the camera's address entirely from the local broker. What is
+  *not* verified is a real camera streaming against it.
+* **Provisioning frame.** `--provision` builds the BLE `wifiConnect` frame
+  (byte-identical to the app's, §9) and writes it over raw ATT (§10). On the
+  two units tried the camera acknowledged every write but did not act on
+  it; that is still open.
+
+The signalling (8882), STUN (13478) and websocket (7080) listeners only log
+what a camera sends — what a valid answer looks like is unknown. A DNS
+hijack mode answers `*.gps555.net` with this host and forwards everything
+else upstream. Ports 53/80/13478/7080 need privileges:
 
 ```bash
 sudo python3 ziot_fake_cloud.py --log fake_cloud.log
 ```
 
-Then point the router's DHCP DNS at this host. Phase 2 (answering the
-camera correctly) is not implemented yet.
+Then point the router's DHCP DNS at this host.
 
 ### Docker (recommended)
 

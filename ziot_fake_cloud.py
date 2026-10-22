@@ -2,37 +2,50 @@
 """
 ziot_fake_cloud.py -- local stand-in for the gps555.net cloud
 =============================================================
-Phase 1 of the cloud bypass (see DECOMPILATION_REPORT.md §8): a listener
-farm that impersonates the vendor cloud's endpoints and LOGS every byte
-the camera sends, so the camera→cloud protocol can be recovered from the
-camera's own re-registration and keepalive traffic.
+A local stand-in for the vendor cloud, in two parts (see
+DECOMPILATION_REPORT.md §8-§11):
+
+  * the HTTP API (ipc.gps555.net) is ANSWERED, with response shapes taken
+    from a live app capture: device list, send-stun-addr, stun-addr,
+    notify-live-event, device detail, package record. Point the bridge at
+    it with "api_base" in ziot_config.json and the rendezvous never leaves
+    the LAN. Register cameras with --camera UID=IP[:PORT].
+  * everything else (signalling 8882, STUN 13478, websocket 7080) only
+    LOGS every byte the camera sends, so the camera->cloud protocol can be
+    recovered from its own registration and keepalive traffic. These
+    listeners answer nothing; what a valid answer looks like is unknown.
+
+It also builds and writes the BLE provisioning frame (--provision) that
+tells a camera to join WiFi and register with this host.
 
 Endpoints impersonated (from DECOMPILATION_REPORT.md §4.1):
 
-    ipc.gps555.net:80      HTTP API   (plaintext; login, notify, stun-addr)
-    sig.gps555.net:8882    signalling (role unknown -- the broker)
-    stun.gps555.net:13478  STUN-like  (UDP)
-    ws.gps555.net:7080     status websocket (HTTP upgrade expected)
+    ipc.gps555.net:80      HTTP API   (answered)
+    sig.gps555.net:8882    signalling (logged only)
+    stun.gps555.net:13478  STUN-like  (UDP, logged only)
+    ws.gps555.net:7080     status websocket (logged only)
 
 Point the router's DNS for *.gps555.net at this host and the camera's
 own traffic lands here. Ports below 1024 need privileges: run under
 sudo, or once: sysctl -w net.ipv4.ip_unprivileged_port_start=0
 
-Nothing here pretends to work yet -- phase 1 answers "what does the
-camera send", not "how do we answer". Responses are deliberate
-protocol-shaped errors that keep the camera retrying.
-
 Usage:
-    python3 ziot_fake_cloud.py [--log FILE] [--no-http] [--no-sig]
-                               [--no-stun] [--no-ws]
+    python3 ziot_fake_cloud.py [--http PORT] [--sig PORT] [--stun PORT]
+                               [--ws PORT] [--dns PORT] [--log FILE]
+                               [--camera UID=IP[:PORT]]
+    python3 ziot_fake_cloud.py --provision --ssid S --pwd P --ble-mac MAC
 """
 import argparse
+import json
 import socket
 import socketserver
+import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import uuid
 
 VENDOR_DOMAINS = ("ipc.gps555.net", "sig.gps555.net", "stun.gps555.net",
                   "stunaddr.gps555.net", "ws.gps555.net", "gps555.net")
@@ -55,35 +68,190 @@ def log(kind: str, peer: tuple, data: bytes) -> None:
 
 
 class StreamHandler(socketserver.BaseRequestHandler):
-    """TCP: log each PDU (read until 2s idle or close) and answer nothing.
+    """TCP: log each PDU and answer the vendor's HTTP API.
 
-    The camera side of the protocol is unknown; a silent server that
-    keeps the connection open logs the most. A refused connection logs
-    nothing, which is the failure mode this must avoid.
+    The API answers are ground truth taken from a live app session against
+    ipc.gps555.net (captured 2026-08-29, see DECOMPILATION_REPORT.md
+    section 11): every response is {"requestId": ..., "code": 200, "msg":
+    "OK", "data": ...}, and the endpoint set is exactly the six the
+    bridge touches plus the device detail and package record.
     """
 
     def handle(self):
-        self.request.settimeout(2.0)
+        peer = self.request.getpeername()
+        buf = b""
+        self.request.settimeout(10.0)
         while True:
             try:
                 data = self.request.recv(65535)
             except socket.timeout:
-                continue
+                return
             except OSError:
                 return
             if not data:
                 return
-            log(self.server.kind, self.request.getpeername(), data)
-            # Phase 2 will answer per protocol; for now acknowledge TCP
-            # streams with nothing and let the client time out.
+            buf += data
+            log(self.server.kind, peer, data)
+            # Answer as soon as the headers are complete; the body of a
+            # POST is small and arrives with the headers.
+            if b"\r\n\r\n" not in buf:
+                continue
+            head, _, body = buf.partition(b"\r\n\r\n")
+            request_line = head.split(b"\r\n")[0].decode("latin-1", "replace")
+            parts = request_line.split()
+            if len(parts) < 2:
+                return
+            method, target = parts[0], parts[1]
+            path = target.split("?", 1)[0]
+            query = target.split("?", 1)[1] if "?" in target else ""
+            if self.server.api is None:
+                return
+            payload = self.server.api.respond(method, path, query, body)
+            if payload is None:
+                return
+            self.request.sendall(payload)
+
+
+class HttpApi:
+    """The vendor's camera API, answered locally.
+
+    Only what the rendezvous needs: the device list, the device detail,
+    send-stun-addr, stun-addr, notify-live-event, the package record and
+    the share list. The camera-side answers are the part that matters
+    for breaking free of the cloud -- the camera asks the broker for its
+    own address, and this is what it must be told.
+    """
+
+    def __init__(self):
+        self.cameras: dict[str, dict] = {}
+        self.seq = 0
+
+    def add_camera(self, uid: str, ip: str, port: int = 0, pwd: str = "123456"):
+        """Register a camera and the address it should be told about."""
+        self.cameras[uid] = {
+            "uid": uid,
+            "name": "",
+            "email": "",
+            "pwd": pwd,
+            "deviceType": "X5",
+            "version": "TXW817_A_V1.0.12.32",
+            "familyId": 1,
+            "terminalFamilyId": 3132031,
+            "natType": "xbH7",
+            "wifiSsid": "",
+            "connectionState": "BR",
+            "onlineState": "1",
+            "mediaState": "1",
+            "relay_ip": "",
+            "server_ip": "",
+            "commTime": "",
+            "power": "100",
+            "signal": "100%",
+            "online_time": str(int(time.time())),
+            "resolution": "",
+            "event_sensitivity": "1",
+            "status": "",
+            "sd_total": "0.00GB",
+            "sd_available": "0.00MB",
+            # What the broker hands back in stun-addr.
+            "_ip": ip,
+            "_port": port,
+        }
+        return self.cameras[uid]
+
+    def _camera_row(self, uid: str) -> dict:
+        row = dict(self.cameras.get(uid) or {})
+        for key in ("_ip", "_port"):
+            row.pop(key, None)
+        return row
+
+    def _stun(self, uid: str) -> dict:
+        """The address the camera is told to send media to."""
+        cam = self.cameras.get(uid) or {}
+        self.seq += 1
+        return {
+            "IpcPublicIP": cam.get("_ip", ""),
+            "IpcPublicPort": cam.get("_port", 0),
+            "IpcPrivateIP": cam.get("_ip", ""),
+            "IpcPrivatePort": cam.get("_port", 0),
+            "receiveTs": int(time.time()),
+            "seqNo": self.seq,
+        }
+
+    def respond(self, method: str, path: str, query: str,
+                body: bytes) -> bytes | None:
+        """Answer one HTTP request; returns the raw response bytes."""
+        params = urllib.parse.parse_qs(query)
+        one = {k: v[0] for k, v in params.items()}
+        path = path.rstrip("/") or "/"
+        data = None
+
+        if path == "/api/v1/ipc" and method == "GET":
+            rows = [self._camera_row(uid) for uid in self.cameras]
+            data = {"count": len(rows), "pageIndex": 1, "pageSize": 1000,
+                    "list": rows}
+        elif path == "/api/v1/ipc" and method == "POST":
+            # The camera registers itself here.
+            try:
+                cam = json.loads(body or b"{}")
+            except ValueError:
+                cam = {}
+            uid = str(cam.get("uid") or "")
+            if uid:
+                ip = cam.get("ip") or cam.get("IpcPrivateIP") or ""
+                port = int(cam.get("port") or cam.get("IpcPrivatePort") or 0)
+                self.add_camera(uid, ip, port, cam.get("pwd") or "123456")
+                data = "ok"
+            else:
+                data = "ok"
+        elif path == "/api/v1/ipc/send-stun-addr":
+            uid = one.get("uid", "")
+            data = self._stun(uid)
+        elif path.startswith("/api/v1/ipc/stun-addr/"):
+            uid = path.rsplit("/", 1)[-1]
+            stun = self._stun(uid)
+            stun["updateTime"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            data = stun
+        elif path == "/api/v1/ipc/notify-live-event":
+            uid = one.get("uid", "")
+            event = one.get("eventType", "")
+            log("notify", ("-", 0),
+                f"uid={uid} event={event}".encode())
+            data = "ok"
+        elif path.startswith("/api/v1/ipc/"):
+            uid = path.rsplit("/", 1)[-1]
+            data = self._camera_row(uid)
+        elif path == "/api/v1/share-list":
+            data = []
+        elif path == "/api/v1/cloud-service-record/current-package":
+            uid = one.get("uid", "")
+            data = {"uid": uid, "packageStatus": "3", "expiredDuration": "",
+                    "packageInfo": []}
+        elif path == "/api/v1/cmd/send-cmd":
+            data = "ok"
+        else:
+            data = None
+
+        if data is None:
+            payload = json.dumps({"requestId": "", "code": 404,
+                                  "msg": "not found", "data": None}).encode()
+        else:
+            payload = json.dumps({"requestId": str(uuid.uuid4()), "code": 200,
+                                  "msg": "OK", "data": data}).encode()
+        head = ("HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=UTF-8\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                "Connection: keep-alive\r\n\r\n").encode()
+        return head + payload
 
 
 class StreamServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, kind):
+    def __init__(self, addr, kind, api: "HttpApi | None" = None):
         self.kind = kind
+        self.api = api
         super().__init__(addr, StreamHandler)
 
 
@@ -268,8 +436,10 @@ def parse_provision_response(data: bytes) -> dict:
     return {"result": status == 0, "uid": uid}
 
 
-def serve(kind: str, addr: tuple) -> socketserver.BaseServer:
-    srv = StunServer(addr) if kind == "stun" else StreamServer(addr, kind)
+def serve(kind: str, addr: tuple,
+          api: "HttpApi | None" = None) -> socketserver.BaseServer:
+    srv = StunServer(addr) if kind == "stun" \
+        else StreamServer(addr, kind, api)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"listening {kind} on {addr[0]}:{addr[1]}", flush=True)
     return srv
@@ -315,10 +485,17 @@ def _load_env(path: str = ".env") -> dict:
 def ble_provision(args) -> int:
     """Build the wifiConnect frame and write it to the camera over BLE.
 
-    Drives btgatt-client over stdin (same tool the GATT enumeration used):
-    connect, subscribe notify on 0x000a, then write the frame in 20-byte
-    chunks to 0x0008 -- the order the vendor app uses (it subscribes after
-    writing, we subscribe first so the reply cannot be missed).
+    Talks raw ATT over L2CAP CID 4 rather than going through a GATT client:
+    bluetoothctl and btgatt-client both stall on these cameras, and the
+    GATT layer holds the link so a raw connect is refused outright. Raw
+    ATT also lands inside the pairing window, which is open for a few
+    seconds at boot -- the connect itself is the trigger.
+
+    Sequence: Exchange MTU, subscribe the notify characteristic (CCCD
+    0x000b), then write the frame in 20-byte chunks to the command
+    characteristic (0x0008 -- a write there is what makes the camera
+    answer by notification). See DECOMPILATION_REPORT.md section 9 and 10.
+
     Credentials come from --flags or from .env (WIFI_SSID/WIFI_PWD/BLE_MAC).
     """
     env = _load_env()
@@ -330,53 +507,159 @@ def ble_provision(args) -> int:
               "(or WIFI_SSID/WIFI_PWD/BLE_MAC in .env; see .env.example)",
               file=sys.stderr)
         return 2
-    args.ble_mac = ble_mac
+    args.ssid, args.pwd, args.ble_mac = ssid, pwd, ble_mac
     sig_addr = args.sig_addr or f"{_detect_lan_ip()}:8882"
     tz = args.tz if args.tz is not None else _local_tz_minutes()
-    frame = wifi_connect_frame(args.ssid, args.pwd, sig_addr, tz)
+    frame = wifi_connect_frame(ssid, pwd, sig_addr, tz)
     chunks = chunk20(frame)
     print(f"frame: {frame.hex()}", flush=True)
-    print(f"{len(chunks)} chunk(s) -> char 0x0008 on {args.ble_mac}, "
-          f"sig-addr {sig_addr}, tz {tz} min", flush=True)
+    print(f"{len(chunks)} chunk(s) -> char 0x{ATT_WRITE_HANDLE:04x} on "
+          f"{ble_mac}, sig-addr {sig_addr}, tz {tz} min", flush=True)
 
-    proc = subprocess.Popen(["btgatt-client", "-t", "public", "-d",
-                             args.ble_mac],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    try:
-        assert proc.stdin
-        proc.stdin.write("register-notify 0x000a\n")
-        proc.stdin.flush()
+    for attempt in range(1, 4):
+        result = _att_attempt(ble_mac, chunks)
+        if result == "sent":
+            break
+        print(f"attempt {attempt}: {result} -- reconnecting", flush=True)
         time.sleep(2)
-        for c in chunks:
-            proc.stdin.write("write-value 0x0008 %s\n" % c.hex())
-            proc.stdin.flush()
-            time.sleep(0.4)
-        # The camera answers in exactly two notifications; give them time.
-        end = time.time() + 15
-        while time.time() < end and proc.poll() is None:
-            line = proc.stdout.readline()
-            if line:
-                print(line.rstrip(), flush=True)
-                if "uid" in line.lower() or "Notification" in line:
-                    # keep draining briefly for the second notification
-                    for _ in range(6):
-                        line = proc.stdout.readline()
-                        if line:
-                            print(line.rstrip(), flush=True)
-                    break
-    finally:
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    print("if the camera joined the LAN it will appear in `ip neigh` and "
-          "register with the broker on :8882", flush=True)
+    else:
+        print("link never stayed up long enough to complete the writes; "
+              "reboot the camera into pairing mode and rerun", flush=True)
+        return 1
+
+    # The camera answers in exactly two notifications; drain for a while.
+    print("written; waiting for the uid reply (or check `ip neigh` for the "
+          "join and the broker log for its registration)", flush=True)
     return 0
+
+
+def _read_line(proc, timeout: float):
+    """One stdout line or None after `timeout` seconds (select-based)."""
+    import select
+    r, _, _ = select.select([proc.stdout], [], [], timeout)
+    if not r:
+        return None
+    return proc.stdout.readline()
+
+
+# --- raw ATT over L2CAP CID 4 ---------------------------------------------
+#
+# A GATT client (bluetoothctl, btgatt-client) holds the link and stalls on
+# these cameras, so we speak ATT directly. The socket is SOCK_SEQPACKET:
+# one recv() is exactly one PDU, and a short recv() DISCARDS the rest of
+# the datagram. Reading a PDU byte by byte therefore truncates every
+# multi-byte PDU to its first byte -- an MTU response reads as 0x03 and a
+# notification as 0x1b with no handle and no value. Always recv() a whole
+# PDU.
+#
+# PDU layouts used here (all multi-byte fields little-endian, unlike the
+# vendor frame inside the value, which is big-endian):
+#     Exchange MTU Request   02 | mtu(2)
+#     Write Request          12 | handle(2) | value...
+#     Write Response         13
+#     Error Response         01 | request opcode | handle(2) | error code
+#     Handle Value Notify    1B | handle(2) | value...
+
+ATT_ERROR_RESPONSE = 0x01
+ATT_MTU_REQUEST = 0x02
+ATT_WRITE_REQUEST = 0x12
+ATT_WRITE_RESPONSE = 0x13
+ATT_NOTIFY = 0x1B
+
+ATT_WRITE_HANDLE = 0x0008   # the command channel: a write here is what
+ATT_CCCD_HANDLE = 0x000B    # makes the camera answer by notification
+ATT_MAX_PDU = 512
+ATT_DRAIN_S = 15.0         # how long to listen for the camera's reply
+
+
+def _att_read(sock, timeout: float) -> bytes:
+    """One whole ATT PDU, or b"" on timeout."""
+    sock.settimeout(timeout)
+    try:
+        return sock.recv(ATT_MAX_PDU)
+    except socket.timeout:
+        return b""
+
+
+def _att_request(sock, opcode: int, payload: bytes, timeout: float,
+                 notes: list) -> bytes:
+    """Send one request and return its response PDU (or b"" on timeout).
+
+    A notification can arrive before the response it was triggered by, so
+    PDUs that are not the response are collected into `notes` as
+    (handle, value) instead of being mistaken for the response.
+    """
+    sock.send(bytes([opcode]) + payload)
+    end = time.time() + timeout
+    while time.time() < end:
+        pdu = _att_read(sock, max(end - time.time(), 0.05))
+        if not pdu:
+            continue
+        if pdu[0] == ATT_NOTIFY and len(pdu) >= 3:
+            notes.append((struct.unpack("<H", pdu[1:3])[0], pdu[3:]))
+            continue
+        return pdu
+    return b""
+
+
+def _att_attempt(ble_mac: str, chunks: list) -> str:
+    """One connect/write cycle over raw ATT. Returns 'sent' or a reason."""
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET,
+                         socket.BTPROTO_L2CAP)
+    sock.bind(("00:00:00:00:00:00", 0, 4, 1))
+    sock.settimeout(3.0)
+    try:
+        sock.connect((ble_mac, 0, 4, 1))
+    except OSError as e:
+        sock.close()
+        return f"connect failed ({e})"
+
+    notes: list = []
+    try:
+        mtu = _att_request(sock, ATT_MTU_REQUEST, struct.pack("<H", 247),
+                           2.0, notes)
+        print(f"mtu: {mtu.hex() if mtu else 'silent'}", flush=True)
+
+        # Subscribe the notify characteristic before writing, so the
+        # camera's reply cannot be missed. The CCCD value is 2 bytes.
+        cccd = _att_request(
+            sock, ATT_WRITE_REQUEST,
+            struct.pack("<H", ATT_CCCD_HANDLE) + b"\x01\x00", 2.0, notes)
+        print(f"cccd: {cccd.hex() if cccd else 'silent'}", flush=True)
+        if cccd and cccd[0] == ATT_ERROR_RESPONSE:
+            return "notify subscription rejected"
+
+        for i, chunk in enumerate(chunks):
+            rsp = _att_request(
+                sock, ATT_WRITE_REQUEST,
+                struct.pack("<H", ATT_WRITE_HANDLE) + chunk, 2.0, notes)
+            print(f"chunk {i}: {rsp.hex() if rsp else 'silent'}", flush=True)
+            if rsp and rsp[0] == ATT_ERROR_RESPONSE:
+                return f"write {i} rejected"
+
+        # Drain the camera's answer.
+        end = time.time() + ATT_DRAIN_S
+        while time.time() < end:
+            pdu = _att_read(sock, 1.0)
+            if pdu and pdu[0] == ATT_NOTIFY and len(pdu) >= 3:
+                notes.append((struct.unpack("<H", pdu[1:3])[0], pdu[3:]))
+            elif pdu:
+                print(f"event: {pdu.hex()}", flush=True)
+
+        buf = b""
+        for handle, value in notes:
+            buf += value
+            print(f"notify {handle:#06x}: {value.hex()}", flush=True)
+        if buf:
+            try:
+                print(f"reply: {parse_provision_response(buf)}", flush=True)
+            except (ValueError, IndexError) as e:
+                print(f"reply not parseable: {e}", flush=True)
+        return "sent"
+    except OSError as e:
+        return f"link failed ({e})"
+    finally:
+        sock.close()
 
 
 def main() -> int:
@@ -399,9 +682,9 @@ def main() -> int:
     ap.add_argument("--provision", action="store_true",
                     help="skip the listeners: build the BLE wifiConnect "
                          "frame, write it to the camera in 20-byte chunks "
-                         "via bluetoothctl/btgatt-client, and print its "
-                         "reply. Requires --ssid/--pwd/--ble-mac; "
-                         "--sig-addr defaults to this host's LAN address")
+                         "over raw ATT, and print its reply. Requires "
+                         "--ssid/--pwd/--ble-mac; --sig-addr defaults to "
+                         "this host's LAN address")
     ap.add_argument("--ssid", default=None)
     ap.add_argument("--pwd", default=None)
     ap.add_argument("--ble-mac", default=None, dest="ble_mac",
@@ -411,6 +694,11 @@ def main() -> int:
     ap.add_argument("--sig-addr", default=None, dest="sig_addr",
                     help="signalling server for the camera to register with "
                          "(default: <LAN IP>:8882 -- the local broker)")
+    ap.add_argument("--camera", action="append", default=[], metavar="UID=IP",
+                    help="a camera the API should know about, and the "
+                         "address it is told to send media to. Repeatable. "
+                         "A camera that registers itself over HTTP does not "
+                         "need this")
     args = ap.parse_args()
 
     if args.provision:
@@ -442,12 +730,25 @@ def main() -> int:
                     break
             upstream = upstream or "1.1.1.1"
 
+    api = HttpApi()
+    for spec in args.camera:
+        uid, _, ip = spec.partition("=")
+        if not uid or not ip:
+            print(f"--camera {spec!r} must be UID=IP", file=sys.stderr)
+            return 2
+        ip, _, port = ip.partition(":")
+        api.add_camera(uid.strip(), ip.strip(),
+                       int(port) if port.strip() else 0)
+        print(f"camera {uid.strip()} -> {ip.strip()}"
+              f"{':' + port.strip() if port.strip() else ''}", flush=True)
+
     servers = []
     for kind, port in (("http", args.http), ("sig", args.sig),
                        ("ws", args.ws), ("stun", args.stun)):
         if port:
             try:
-                servers.append(serve(kind, (args.bind, port)))
+                servers.append(serve(kind, (args.bind, port),
+                                      api if kind == "http" else None))
             except OSError as e:
                 print(f"cannot bind {kind} port {port}: {e} -- ports below "
                       "1024 need root (see module docstring)", file=sys.stderr)

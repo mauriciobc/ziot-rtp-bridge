@@ -462,10 +462,9 @@ below is read off the air.
 
 ### What this buys the cloud-free goal
 
-1. Provisioning (`write to 0x0008`) is how the vendor app delivers SSID,
-   password, and binding key. Recovering that payload format — from the APK,
-   or by decrypting an over-the-air pairing capture — would let us provision
-   the camera to point at *our* infrastructure without the vendor app.
+1. Provisioning (a write to the command channel) is how the vendor app
+   delivers SSID, password, and signalling address. The payload format
+   was recovered from the app's Dart snapshot afterwards — see §9.
 2. The cleartext binding key (`key…`, ServiceData) is the likely
    camera→cloud credential; a local broker emulator needs exactly this to
    authenticate the camera.
@@ -473,3 +472,160 @@ below is read off the air.
    `notify(start)` delivery, keepalive). Requires an encrypted WiFi capture
    of a wake — monitor mode + PSK decryption — which no amount of BLE work
    substitutes.
+
+## 9. The provisioning frame format — reconstructed from the app, 2026-10-22
+
+The payload format §8 called unknown was reconstructed from the app's Dart
+AOT snapshot (Blutter annotated assembly), not guessed. It has **not**
+been observed on the air — no capture of a real provisioning exists.
+`CustomBleProtocolPacket` (`app/config/custom_ble_protocol_packet.dart`)
+builds one frame shape for every command.
+
+```
+86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8
+```
+
+* `LEN16` = `5 + DLEN` — it counts everything after the LEN field
+  (SEQ + DLEN + payload + XOR).
+* All multi-byte fields are big-endian.
+* `XOR8` is the XOR of every preceding byte (`0 .. 8+DLEN-1`).
+* There is **no `0x0D` terminator on requests** — that byte belongs to the
+  camera's *response* frames only.
+
+`wifiConnect` payload (command `00 01`), in this exact order:
+
+```
+00 01 | <len><ssid utf-8> | <len><pwd utf-8> | <len><sigAddr utf-8> |
+<tz minutes, big-endian> | [regCode 4B, big-endian, optional]
+```
+
+* Negative timezone minutes are biased by `+0x8000`, not two's complement
+  (`_handleApRequest` masks the high and low byte separately and appends
+  them high-first).
+* `sigAddr` is `host:port` — the signalling server the camera registers
+  with. The app fetches it from the cloud (`icpSigAddress`) and stores it in
+  the frame; a local deployment substitutes its own broker.
+* `regCode` is `stringToUint32(sha256(text))`: SHA-256 of the digest's
+  bytes 0, 2, 4 and 6 packed big-endian into a uint32. The app derives it
+  from the *phone's* UUID plus a timestamp, so it is a nonce, not a
+  credential. `getApCommand` appends it for every real device and omits it
+  only for the placeholder device `"FFFFFFFFFFFF"`.
+
+**Byte-level cross-check.** A frame reconstructed by hand from the
+assembly (`getApCommand` → `sendApInfoRequest` → `_handleApRequest`) is
+reproduced exactly by `ziot_fake_cloud.py`'s `wifi_connect_frame()`. That
+checks the builder against the reading of the assembly; it does not prove
+the camera accepts the bytes:
+
+```
+built:   868600350001003000010d486f757365206f66204361747309313233343536373839133139322e3136382e36382e3131343a383838327f4c59
+by hand: 868600350001003000010d486f757365206f66204361747309313233343536373839133139322e3136382e36382e3131343a383838327f4c59
+```
+
+and the regCode variant likewise (`…7f4cc43459ad55`, LEN `0x39`), with the
+worked example `sha256("a1b2c3d4-e5f6-7890-abcd-ef1234567890" +
+"2026-10-22 15:00:00.000")` → `c4 34 59 ad`.
+
+**Chunking.** `DeviceBluetoothAddController.splitSend` writes the frame in
+20-byte pieces: chunk *i* is `sublist(i*20, min(i*20+20, len))`. There is
+no per-chunk header. The app asks for MTU 1024 first and falls back to 20
+when the negotiated MTU is smaller.
+
+## 10. Talking to the camera — raw ATT instead of the GATT layer, 2026-10-22
+
+`bluetoothctl`/`btgatt-client` stall on these cameras (one service, then
+silence) and BlueZ's client holds the link, so a raw connect is refused
+while it is attached. Raw ATT over L2CAP CID 4 connects and is fast enough
+to land inside the short pairing window — the connect *is* the trigger.
+
+**Correction (same day).** The first ATT scripts read PDUs byte by byte.
+L2CAP is `SOCK_SEQPACKET`: one `recv()` is one PDU, and a short `recv()`
+*discards the rest of the datagram*. Every multi-byte PDU was therefore
+truncated to its first byte, and the same scripts wrote ATT handles
+big-endian (they are little-endian) and a 4-byte CCCD value (it is 2
+bytes). Findings below are marked by whether they survive that.
+`ziot_fake_cloud.py` now reads whole PDUs and has tests pinning the wire
+bytes; nothing below has been re-run on a live camera with it yet.
+
+* **Survives — the first byte of each reply.** Classifying a reply by
+  its opcode byte is valid even when truncated. Probing handles with a
+  1-byte write on unit `140979857781`: `0x0001`/`0x0002` answered with an
+  Error Response; `0x0003`–`0x0007` and `0x0009`–`0x000b` answered with a
+  Write Response; `0x000c` and above answered with an Error Response. A
+  write to **`0x0008`** was answered by `0x1b` — a Handle Value
+  Notification — followed by the Write Response. So that handle makes the
+  camera speak. The notification *body was never read*.
+* **Does not survive — "reads are refused", the MTU value, the CCCD
+  handle.** The opcode bytes of the read replies were Error Responses, but
+  the error code and handle were truncated away, so *why* reads fail is
+  unknown (a "read not permitted" on write-only handles would be normal).
+  The MTU response was recorded as `03 17 00` in one run and `03 02 17` in
+  another, which is what truncation looks like; server MTU 23 is plausible
+  but unconfirmed. Whether `0x000b` is the notify CCCD is inferred from
+  the acknowledgements only.
+* **Survives — the outcome.** After writing the frame to `0x0008` (twice
+  on `140979857781`, once on `140996632758`) the camera kept advertising
+  and never appeared on the home LAN. A camera that took WiFi credentials
+  would be expected to stop advertising, so the frame was not acted on.
+  The truncated CCCD write may mean notifications were never enabled,
+  but that cannot explain the absent join.
+
+### Still open
+
+* **What the camera said.** The notification after a write to `0x0008`
+  is the best lead in this document: it may be a status or error code for
+  the frame we sent. Reading it needs one live run of the corrected
+  transport against a camera in its pairing window.
+* **Whether the frame is what the firmware expects.** The frame is
+  reproduced from the app's *assembly* (§9), never observed on the air,
+  so a wrong command byte, the `0x0D` terminator or the `regCode` remain
+  possibilities. A `regCode` variant was tried once with the broken
+  transport; it proves nothing either way.
+* **The AP-mode socket.** The app connects to device port **16532**, which
+  was refused on `140996632758`'s AP. Ports 7070 and 8266 accepted TCP and
+  never answered anything sent (the frame raw, its hex text, an HTTP GET).
+  An earlier note here said this socket speaks hex text; that was wrong —
+  `_convertHex16Msg` only formats a log line in `socket_handler.dart`
+  (`0x53cfb4` feeds `LogD`).
+* **Which handle is `36000002`.** UUIDs were never read from this
+  firmware; the write handle is inferred from behaviour.
+
+## 11. A live app session captured on the wire, and what the broker does with it
+
+`PCAPdroid_29_ago._15_13_27.pcap` (2026-08-29, phone side, 721 packets)
+is a real app session against the vendor cloud and is the ground truth
+for the HTTP API. PCAPdroid sees only the phone's own traffic, so it
+contains **no camera traffic** and says nothing about the camera↔cloud
+protocol.
+
+What it shows:
+
+* Plain HTTP on port 80 to `ipc.gps555.net` (`120.26.121.165`). The app's
+  first `GET /api/v1/ipc/?terminalFamilyId=…` (trailing slash) draws a
+  `301`; it retries without the slash.
+* Every reply is `{"requestId":…,"code":200,"msg":"OK","data":…}`.
+  `send-stun-addr` and `stun-addr` return `IpcPublicIP/Port`,
+  `IpcPrivateIP/Port` and a `seqNo` that rises by one per call (114, 115
+  in the capture); `stun-addr` adds `updateTime`. `notify-live-event` and
+  `send-cmd` return `data: "ok"`; `share-list` returns `[]`;
+  `current-package` returns `packageStatus "3"`.
+* A separate UDP exchange with `stunaddr.gps555.net:13478`: a 20-byte
+  request and a 56-byte reply from two local ports, before the REST
+  calls. The broker does **not** implement it, and the bridge has never
+  needed it.
+
+`ziot_fake_cloud.py`'s `HttpApi` answers exactly those shapes, and the
+bridge's new `api_base` option sends its signalling there. Verified on this
+host: `--list-cameras` listed the camera from the local broker, and a full
+bridge run did `send-stun-addr` → `notify` → `stun-addr` → punch against it
+(`/health`: `endpoint_kind: private`, `addr` taken from the broker). The
+camera address used was a placeholder, so no media flowed; **a real
+camera streaming against the local broker has not been demonstrated.**
+
+Lab topology used for the AP-mode probing: `wlan0` (internal) stays on the
+home LAN; `wlan1` is the USB ZyDAS ZD1211B adapter (`0ace:1215`, needs the
+`zd1211/` firmware from linux-firmware) and associates with a camera's own
+open AP `ZIOTA_<uid>` (`192.168.1.0/24`, camera at `192.168.1.1`). A
+camera's AP carries the same MAC as its STA side, so `ip neigh` always
+shows it on `192.168.1.1`; a join to the home LAN must be looked for on
+`192.168.68.x`, not by MAC alone.

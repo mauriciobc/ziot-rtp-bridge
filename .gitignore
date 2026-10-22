@@ -6,3 +6,4 @@ __pycache__/
 # analysis artifacts
 *.xapk
 *.apk
+ZIOT_FINDINGS.md

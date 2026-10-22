@@ -1,6 +1,7 @@
 """Fake-cloud regressions: the listener farm logs what the camera sends."""
 import contextlib
 import io
+import json
 import socket
 import sys
 import threading
@@ -217,6 +218,233 @@ class EnvTests(unittest.TestCase):
 
     def test_missing_env_file_is_empty(self):
         self.assertEqual(fake._load_env("/nonexistent/.env"), {})
+
+
+class HttpApiTests(unittest.TestCase):
+    """The broker answers the vendor's API, so the camera and the bridge
+    can both be pointed at it instead of at gps555.net."""
+
+    def setUp(self):
+        self.api = fake.HttpApi()
+        self.api.add_camera("141030191094", "192.168.68.50", 34567)
+
+    def call(self, method, path, query="", body=b""):
+        raw = self.api.respond(method, path, query, body)
+        self.assertIsNotNone(raw)
+        head, _, payload = raw.partition(b"\r\n\r\n")
+        return json.loads(payload)
+
+    def test_device_list_carries_the_camera_row(self):
+        body = self.call("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        self.assertEqual(body["code"], 200)
+        self.assertEqual(body["msg"], "OK")
+        rows = body["data"]["list"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["uid"], "141030191094")
+        # The address bookkeeping fields are internal, not API fields.
+        self.assertNotIn("_ip", rows[0])
+        self.assertNotIn("_port", rows[0])
+
+    def test_send_stun_addr_hands_back_the_camera_address(self):
+        body = self.call("GET", "/api/v1/ipc/send-stun-addr",
+                         "appId=x&uid=141030191094&publicIp=1.2.3.4"
+                         "&publicPort=1&privateIp=5.6.7.8&privatePort=2")
+        data = body["data"]
+        self.assertEqual(data["IpcPrivateIP"], "192.168.68.50")
+        self.assertEqual(data["IpcPrivatePort"], 34567)
+        self.assertIn("seqNo", data)
+
+    def test_stun_addr_is_answered_for_the_camera(self):
+        body = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
+        self.assertEqual(body["code"], 200)
+        self.assertEqual(body["data"]["IpcPrivateIP"], "192.168.68.50")
+        self.assertIn("updateTime", body["data"])
+
+    def test_notify_is_acknowledged(self):
+        body = self.call("GET", "/api/v1/ipc/notify-live-event",
+                         "appId=x&eventType=1&uid=141030191094")
+        self.assertEqual(body["data"], "ok")
+
+    def test_share_list_is_a_list_not_an_object(self):
+        body = self.call("GET", "/api/v1/share-list")
+        self.assertEqual(body["data"], [])
+
+    def test_unknown_endpoint_is_a_404_body(self):
+        body = self.call("GET", "/api/v1/nope")
+        self.assertEqual(body["code"], 404)
+
+    def test_a_camera_registers_itself_over_http(self):
+        body = self.call("POST", "/api/v1/ipc", "",
+                         b'{"uid":"140979857781","ip":"192.168.68.77",'
+                         b'"port":9000}')
+        self.assertEqual(body["code"], 200)
+        rows = self.call("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        uids = {r["uid"] for r in rows["data"]["list"]}
+        self.assertEqual(uids, {"141030191094", "140979857781"})
+        stun = self.call("GET", "/api/v1/ipc/stun-addr/140979857781")
+        self.assertEqual(stun["data"]["IpcPrivateIP"], "192.168.68.77")
+        self.assertEqual(stun["data"]["IpcPrivatePort"], 9000)
+
+    def test_seqno_advances_between_answers(self):
+        first = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
+        second = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
+        self.assertGreater(second["data"]["seqNo"], first["data"]["seqNo"])
+
+
+class HttpApiServerTests(unittest.TestCase):
+    """The API is reachable over the socket the bridge actually talks to."""
+
+    def setUp(self):
+        self.api = fake.HttpApi()
+        self.api.add_camera("141030191094", "192.168.68.50", 34567)
+        srv = fake.serve("http", ("127.0.0.1", 0), self.api)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        self.port = srv.server_address[1]
+
+    def test_device_list_over_http(self):
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(b"GET /api/v1/ipc?terminalFamilyId=3132031 HTTP/1.1\r\n"
+                  b"Host: ipc.gps555.net\r\n\r\n")
+        chunks = b""
+        deadline = time.time() + 5
+        while b"\r\n\r\n" not in chunks and time.time() < deadline:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks += chunk
+        # keep reading until the body is complete
+        while len(chunks.split(b"\r\n\r\n", 1)[1]) < int(
+                chunks.split(b"Content-Length: ")[1].split(b"\r\n")[0]):
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            chunks += chunk
+        s.close()
+        head, _, body = chunks.partition(b"\r\n\r\n")
+        self.assertIn(b"200 OK", head)
+        parsed = json.loads(body)
+        self.assertEqual(parsed["data"]["list"][0]["uid"], "141030191094")
+
+
+class ScriptedAttSocket:
+    """A fake ATT peer: records what was sent, answers from a script.
+
+    `script(pdu)` returns the PDUs to queue in reply to one sent PDU.
+    recv() hands out one whole PDU per call, like a SOCK_SEQPACKET socket.
+    """
+
+    def __init__(self, script):
+        self.script = script
+        self.sent = []
+        self.queue = []
+
+    def bind(self, addr):
+        pass
+
+    def settimeout(self, t):
+        pass
+
+    def connect(self, addr):
+        pass
+
+    def close(self):
+        pass
+
+    def send(self, pdu):
+        self.sent.append(bytes(pdu))
+        self.queue.extend(self.script(bytes(pdu)))
+
+    def recv(self, n):
+        if not self.queue:
+            raise socket.timeout()
+        return self.queue.pop(0)[:n]
+
+
+class AttTransportTests(unittest.TestCase):
+    def test_read_returns_a_whole_multibyte_pdu(self):
+        """L2CAP is SOCK_SEQPACKET: a short recv() discards the rest of the
+        datagram, so a PDU read byte by byte arrives as its first byte."""
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        notify = bytes([0x1B, 0x08, 0x00]) + b"\x86\x86\x00\x15"
+        b.send(notify)
+        self.assertEqual(fake._att_read(a, 1.0), notify)
+
+    def test_notification_before_response_is_not_the_response(self):
+        notify = bytes([0x1B, 0x0A, 0x00, 0xAA, 0xBB])
+        script = lambda pdu: [notify, b"\x13"]
+        sock = ScriptedAttSocket(script)
+        notes = []
+        rsp = fake._att_request(sock, fake.ATT_WRITE_REQUEST,
+                                b"\x08\x00data", 1.0, notes)
+        self.assertEqual(rsp, b"\x13")
+        self.assertEqual(notes, [(0x000A, b"\xaa\xbb")])
+
+    def test_timeout_is_empty_not_an_error(self):
+        sock = ScriptedAttSocket(lambda pdu: [])
+        self.assertEqual(
+            fake._att_request(sock, fake.ATT_WRITE_REQUEST, b"\x08\x00x",
+                              0.05, []), b"")
+
+    def _run_attempt(self, script):
+        sock = ScriptedAttSocket(script)
+        frame = fake.wifi_connect_frame("net", "pw", "10.0.0.1:8882", -180)
+        chunks = fake.chunk20(frame)
+        out = io.StringIO()
+        with mock.patch.object(fake.socket, "socket", return_value=sock), \
+                mock.patch.object(fake, "ATT_DRAIN_S", 0.2), \
+                contextlib.redirect_stdout(out):
+            result = fake._att_attempt("AA:BB:CC:DD:EE:FF", chunks)
+        return result, sock, chunks, out.getvalue()
+
+    def test_wire_bytes_use_little_endian_handles_and_two_byte_cccd(self):
+        def script(pdu):
+            return [b"\x03\x17\x00"] if pdu[0] == 0x02 else [b"\x13"]
+        result, sock, chunks, _ = self._run_attempt(script)
+        self.assertEqual(result, "sent")
+        # Exchange MTU: opcode + little-endian MTU.
+        self.assertEqual(sock.sent[0], bytes([0x02, 247, 0x00]))
+        # CCCD 0x000b enabled with the 2-byte value 01 00 -- handle bytes
+        # little-endian, no stray value bytes.
+        self.assertEqual(sock.sent[1], bytes([0x12, 0x0B, 0x00, 0x01, 0x00]))
+        # Every chunk goes to handle 0x0008, in order, unmodified.
+        writes = sock.sent[2:]
+        self.assertEqual(writes,
+                         [bytes([0x12, 0x08, 0x00]) + c for c in chunks])
+
+    def test_reply_split_across_notifications_is_reassembled(self):
+        reply = bytes.fromhex(
+            "8686" "0015" "0001" "0010"
+            "8001" "00" "0c" "303132333435363738394142"
+            "8b" "0d")
+        n1 = bytes([0x1B, 0x0A, 0x00]) + reply[:20]
+        n2 = bytes([0x1B, 0x0A, 0x00]) + reply[20:]
+        state = {"writes": 0}
+
+        def script(pdu):
+            if pdu[0] == 0x02:
+                return [b"\x03\x17\x00"]
+            if pdu[0] == 0x12 and pdu[1:3] == b"\x08\x00":
+                state["writes"] += 1
+                if state["writes"] == 2:   # last chunk: the frame is 34 B
+                    return [b"\x13", n1, n2]
+            return [b"\x13"]
+        result, _, _, out = self._run_attempt(script)
+        self.assertEqual(result, "sent")
+        self.assertIn("'uid': '0123456789AB'", out)
+
+    def test_error_response_to_a_write_aborts_the_attempt(self):
+        def script(pdu):
+            if pdu[0] == 0x02:
+                return [b"\x03\x17\x00"]
+            if pdu[0] == 0x12 and pdu[1:3] == b"\x08\x00":
+                return [bytes([0x01, 0x12, 0x08, 0x00, 0x03])]
+            return [b"\x13"]
+        result, _, _, _ = self._run_attempt(script)
+        self.assertEqual(result, "write 0 rejected")
+
 
 
 if __name__ == "__main__":
