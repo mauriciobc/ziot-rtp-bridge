@@ -405,3 +405,71 @@ Applied in `ziot_rtp_bridge.py` (v3). See the README for operator-facing detail.
 * The `gps666.net` selector, the role of `sig.gps555.net:8882`, and the server-side
   meaning of the non-zero `mediaState` codes, of which `1`, `2` and `3` have been
   observed (§5).
+
+---
+
+## 8. The camera's Bluetooth pairing surface — live RE, 2026-10-22
+
+Recovered by scanning and connecting to unit `140979857781` in pairing mode
+(rebooted with no WiFi configured). No decompilation involved — everything
+below is read off the air.
+
+### Advertisement
+
+* Device name: `ZIOTA_<uid>` — the UID is broadcast, no auth. This is what
+  `ziot_offline_probe.py --ble` uses.
+* Service UUID `0000a201-…` in the advertisement. In **pairing mode** the
+  advertisement additionally carries ServiceData on `0xa201` whose payload is
+  literal ASCII: `key` + a 16-char secret (observed `keyyfg5y34yqxqgd`).
+  **That is the device's binding/registration secret, broadcast in the
+  clear** to anyone in BLE range. It matches the per-device `pwd` field in
+  the device-list schema (§4.4) in shape; the cloud presumably knows the
+  same value. Implication for a cloud-free deployment: the camera already
+  carries its credential locally — a local broker can know it too, by
+  reading the pairing advertisement once.
+* The **WiFi MAC is the reversed BLE MAC**: BLE `E0:44:40:60:68:82`,
+  associated WiFi `82:68:60:40:44:e0`. Six bytes matching in reverse is not
+  chance; `ziot_offline_probe.py --ble` resolves the LAN IP from the ARP
+  table with this (a second unit should be checked before hardening this
+  into a claim).
+* BLE only advertises in a short window at boot / in pairing mode. A paired,
+  online camera advertises nothing.
+
+### GATT database (btgatt-client, full)
+
+* `0x1800` Generic Access: device name (`0x2a00`), appearance (`0x2a01`).
+* Vendor service `36000001-0001-0002-0003-010203040506`:
+  * `36000002` @ handle `0x0008`, props `0x0c` (write, write-without-response)
+    — the command channel.
+  * `36000003` @ handle `0x000a`, props `0x12` (notify) + CCCD `0x2902` — the
+    response channel. Subscription succeeds; the camera pushes nothing until
+    a valid command is written.
+
+### Connection behavior
+
+* Outside pairing mode the camera **refuses** the connection
+  (`Connection refused` / hangs) — it was likely held or bonded by another
+  central (the phone running the vendor app).
+* In pairing mode the connection succeeds and services resolve, but
+  `bluetoothctl` sessions are killed by the camera ~1 s after
+  `ServicesResolved` — before an attribute listing returns. `btgatt-client`
+  holds the link indefinitely: the drop is triggered by bluetoothctl's
+  discovery/attr sequence, not by a fixed timeout.
+* Writes to the command channel were **not** attempted: no point fuzzing a
+  protocol whose client side is recoverable from the vendor APK's Dart code
+  (the BLE bits the decompilation saw as `BmConnectionStateEnum`), and the
+  camera sat in the user's provisioning window.
+
+### What this buys the cloud-free goal
+
+1. Provisioning (`write to 0x0008`) is how the vendor app delivers SSID,
+   password, and binding key. Recovering that payload format — from the APK,
+   or by decrypting an over-the-air pairing capture — would let us provision
+   the camera to point at *our* infrastructure without the vendor app.
+2. The cleartext binding key (`key…`, ServiceData) is the likely
+   camera→cloud credential; a local broker emulator needs exactly this to
+   authenticate the camera.
+3. Still the hard unknown: the camera↔cloud protocol itself (registration,
+   `notify(start)` delivery, keepalive). Requires an encrypted WiFi capture
+   of a wake — monitor mode + PSK decryption — which no amount of BLE work
+   substitutes.
