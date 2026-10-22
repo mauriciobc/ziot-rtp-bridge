@@ -29,6 +29,7 @@ Usage:
 import argparse
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -183,6 +184,90 @@ class DnsServer(socketserver.ThreadingUDPServer):
         super().__init__(addr, DnsHandler)
 
 
+# --- BLE provisioning frame ------------------------------------------------
+#
+# From the vendor app's Dart code (Blutter, DECOMPILATION_REPORT.md §8): the
+# app provisions over BLE with one frame format (CustomBleProtocolPacket),
+# written in 20-byte chunks to the write characteristic:
+#
+#     86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8
+#     LEN16 = 5 + DLEN (seq + dlen + payload + xor); all multi-byte BE
+#     XOR8  = xor of every preceding byte
+#
+# wifiConnect payload (cmd 0x00,0x01):
+#     00 01 | <len><ssid utf-8> | <len><pwd utf-8> | <len><sigAddr utf-8> |
+#     <tz minutes, negative biased +0x8000, big-endian> | [regCode 4B BE]
+#
+# The sigAddr is the signalling server the camera registers with -- the app
+# sends `sig.gps555.net:8882`; we send our own address so the camera talks
+# only to the local broker. The camera answers on the notify characteristic
+# in exactly two notifications:
+#     86 86 | LEN16 | SEQ16 | DLEN16 | 80 01 00 <len> <uid> | XOR8 | 0x0D
+
+
+def _u8(n: int) -> bytes:
+    return bytes([n])
+
+
+def _be16(n: int) -> bytes:
+    return bytes([(n >> 8) & 0xFF, n & 0xFF])
+
+
+def _xor(data: bytes) -> int:
+    x = 0
+    for b in data:
+        x ^= b
+    return x
+
+
+def _lp(s: str) -> bytes:
+    """One length-prefixed UTF-8 string."""
+    raw = s.encode("utf-8")
+    if len(raw) > 255:
+        raise ValueError("field too long for u8 length prefix")
+    return _u8(len(raw)) + raw
+
+
+def wifi_connect_frame(ssid: str, pwd: str, sig_addr: str, tz_minutes: int,
+                       seq: int = 1, reg_code: int = 0) -> bytes:
+    # Negative minutes are biased +0x8000, not two's complement
+    # (custom_ble_protocol_packet.dart 0x53ec64/0x53ecc4).
+    t = tz_minutes + 0x8000 if tz_minutes < 0 else tz_minutes
+    payload = (b"\x00\x01" + _lp(ssid) + _lp(pwd) + _lp(sig_addr) + _be16(t))
+    if reg_code:
+        payload += _be16(reg_code >> 16) + _be16(reg_code & 0xFFFF)
+    body = _be16(seq) + _be16(len(payload)) + payload
+    head = b"\x86\x86" + _be16(len(body) + 1)
+    return head + body + _u8(_xor(head + body))
+
+
+def chunk20(frame: bytes) -> list:
+    """splitSend: 20-byte writes (MTU 1024 is requested first; 20 is the
+    fallback the vendor app computes for)."""
+    return [frame[i:i + 20] for i in range(0, len(frame), 20)]
+
+
+def parse_provision_response(data: bytes) -> dict:
+    """readBluetoothWriteResult + dealSubData: the camera's answer frame."""
+    if len(data) < 10 or data[0] != 0x86 or data[1] != 0x86:
+        raise ValueError("packet header != 0x86")
+    dlen = (data[6] << 8) | data[7]
+    if len(data) < 8 + dlen + 2:
+        raise ValueError("packet truncated")
+    body = data[:8 + dlen]
+    if _xor(body) != data[8 + dlen]:
+        raise ValueError("checksum error")
+    if data[9 + dlen] != 0x0D:
+        raise ValueError("invalid end symbol")
+    sub = data[8:8 + dlen]
+    if (sub[0] << 8 | sub[1]) != 0x8001:
+        raise ValueError(f"invalid subByte header 0x{sub[0]:02x}{sub[1]:02x}")
+    status = sub[2]
+    uid_len = sub[3]
+    uid = sub[4:4 + uid_len].decode("utf-8", "replace")
+    return {"result": status == 0, "uid": uid}
+
+
 def serve(kind: str, addr: tuple) -> socketserver.BaseServer:
     srv = StunServer(addr) if kind == "stun" else StreamServer(addr, kind)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -193,6 +278,82 @@ def serve(kind: str, addr: tuple) -> socketserver.BaseServer:
 def _wait_forever() -> None:
     """Sleep until Ctrl-C. Module-level so tests can stub it."""
     threading.Event().wait()
+
+
+def _local_tz_minutes() -> int:
+    if time.daylight and time.localtime().tm_isdst:
+        return -time.altzone // 60
+    return -time.timezone // 60
+
+
+def _detect_lan_ip() -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("10.255.255.255", 53))
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+def ble_provision(args) -> int:
+    """Build the wifiConnect frame and write it to the camera over BLE.
+
+    Drives btgatt-client over stdin (same tool the GATT enumeration used):
+    connect, subscribe notify on 0x000a, then write the frame in 20-byte
+    chunks to 0x0008 -- the order the vendor app uses (it subscribes after
+    writing, we subscribe first so the reply cannot be missed).
+    """
+    if not (args.ssid and args.pwd is not None and args.ble_mac):
+        print("--provision needs --ssid, --pwd and --ble-mac", file=sys.stderr)
+        return 2
+    sig_addr = args.sig_addr or f"{_detect_lan_ip()}:8882"
+    tz = args.tz if args.tz is not None else _local_tz_minutes()
+    frame = wifi_connect_frame(args.ssid, args.pwd, sig_addr, tz)
+    chunks = chunk20(frame)
+    print(f"frame: {frame.hex()}", flush=True)
+    print(f"{len(chunks)} chunk(s) -> char 0x0008 on {args.ble_mac}, "
+          f"sig-addr {sig_addr}, tz {tz} min", flush=True)
+
+    proc = subprocess.Popen(["btgatt-client", "-t", "public", "-d",
+                             args.ble_mac],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        assert proc.stdin
+        proc.stdin.write("register-notify 0x000a\n")
+        proc.stdin.flush()
+        time.sleep(2)
+        for c in chunks:
+            proc.stdin.write("write-value 0x0008 %s\n" % c.hex())
+            proc.stdin.flush()
+            time.sleep(0.4)
+        # The camera answers in exactly two notifications; give them time.
+        end = time.time() + 15
+        while time.time() < end and proc.poll() is None:
+            line = proc.stdout.readline()
+            if line:
+                print(line.rstrip(), flush=True)
+                if "uid" in line.lower() or "Notification" in line:
+                    # keep draining briefly for the second notification
+                    for _ in range(6):
+                        line = proc.stdout.readline()
+                        if line:
+                            print(line.rstrip(), flush=True)
+                    break
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    print("if the camera joined the LAN it will appear in `ip neigh` and "
+          "register with the broker on :8882", flush=True)
+    return 0
 
 
 def main() -> int:
@@ -212,7 +373,25 @@ def main() -> int:
                          "(default: first nameserver in /etc/resolv.conf)")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--log", default=None, help="also write lines to this file")
+    ap.add_argument("--provision", action="store_true",
+                    help="skip the listeners: build the BLE wifiConnect "
+                         "frame, write it to the camera in 20-byte chunks "
+                         "via bluetoothctl/btgatt-client, and print its "
+                         "reply. Requires --ssid/--pwd/--ble-mac; "
+                         "--sig-addr defaults to this host's LAN address")
+    ap.add_argument("--ssid", default=None)
+    ap.add_argument("--pwd", default=None)
+    ap.add_argument("--ble-mac", default=None, dest="ble_mac",
+                    help="camera's BLE MAC (the advertising address)")
+    ap.add_argument("--tz", type=int, default=None,
+                    help="timezone offset in minutes (default: local)")
+    ap.add_argument("--sig-addr", default=None, dest="sig_addr",
+                    help="signalling server for the camera to register with "
+                         "(default: <LAN IP>:8882 -- the local broker)")
     args = ap.parse_args()
+
+    if args.provision:
+        return ble_provision(args)
 
     global _log_file
     if args.log:

@@ -140,5 +140,66 @@ class DnsTests(unittest.TestCase):
         s.close()
 
 
+class ProvisionFrameTests(unittest.TestCase):
+    def test_wifi_connect_frame_matches_vendor_app_example(self):
+        # Worked example recovered from the app's own construction rules
+        # (BlutterMine): ssid "MyWiFi", pwd "pass1234",
+        # sig "sig.gps555.net:8882", tz +120 min, seq 1.
+        frame = fake.wifi_connect_frame("MyWiFi", "pass1234",
+                                        "sig.gps555.net:8882", 120)
+        self.assertEqual(frame.hex(),
+                         "8686" "002d" "0001" "0028"
+                         "0001"
+                         "06" "4d7957694669"
+                         "08" "7061737331323334"
+                         "13" "7369672e6770733535352e6e65743a38383832"
+                         "0078"
+                         "33")
+
+    def test_negative_timezone_is_biased(self):
+        frame = fake.wifi_connect_frame("s", "p", "h:1", -60)
+        dlen = (frame[6] << 8) | frame[7]
+        tz = frame[8 + dlen - 2:8 + dlen]
+        self.assertEqual(tz, b"\x7f\xc4")   # 0x8000 + (-60) = 0x7fc4
+        frame = fake.wifi_connect_frame("s", "p", "h:1", 60)
+        tz = frame[8 + (frame[6] << 8 | frame[7]) - 2:
+                   8 + (frame[6] << 8 | frame[7])]
+        self.assertEqual(tz, b"\x00\x3c")   # plain 60
+
+    def test_reg_code_appends_four_bytes(self):
+        with_reg = fake.wifi_connect_frame("s", "p", "h:1", 0, reg_code=0x11223344)
+        without = fake.wifi_connect_frame("s", "p", "h:1", 0)
+        self.assertEqual(len(with_reg) - len(without), 4)
+        self.assertIn(b"\x11\x22\x33\x44", with_reg)
+
+    def test_chunks_are_20_bytes(self):
+        frame = fake.wifi_connect_frame("a" * 200, "p", "h:1", 0)
+        chunks = fake.chunk20(frame)
+        self.assertEqual(b"".join(chunks), frame)
+        self.assertTrue(all(len(c) <= 20 for c in chunks))
+        self.assertEqual(len(chunks), (len(frame) + 19) // 20)
+
+    def test_success_response_parses_uid(self):
+        # Example frame for uid 0123456789AB from the app's parser rules.
+        resp = bytes.fromhex(
+            "8686" "0015" "0001" "0010"
+            "8001" "00" "0c" "303132333435363738394142"
+            "8b" "0d")
+        self.assertEqual(fake.parse_provision_response(resp),
+                         {"result": True, "uid": "0123456789AB"})
+
+    def test_bad_checksum_and_end_symbol_are_rejected(self):
+        good = bytes.fromhex(
+            "8686" "0015" "0001" "0010"
+            "8001" "00" "0c" "303132333435363738394142"
+            "8b" "0d")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            fake.parse_provision_response(good[:-2] + b"\x00" + good[-1:])
+        with self.assertRaisesRegex(ValueError, "end symbol"):
+            fake.parse_provision_response(good[:-1] + b"\x00")
+        with self.assertRaisesRegex(ValueError, "header"):
+            fake.parse_provision_response(b"\x00" + good[1:])
+
+
 if __name__ == "__main__":
     unittest.main()
