@@ -462,8 +462,20 @@ def parse_static_endpoints(raw: dict) -> dict:
 
 
 
+def _make_api(token: str, base_url: str = BASE_URL):
+    """Build the cloud client.
+
+    The base URL is only passed on when it differs from the vendor default,
+    so the default path constructs the client exactly as before.
+    """
+    if base_url == BASE_URL:
+        return GPS555(token)
+    return GPS555(token, base_url)
+
+
 class GPS555:
-    def __init__(self, token: str):
+    def __init__(self, token: str, base_url: str = BASE_URL):
+        self._base = base_url.rstrip("/")
         self._h = {
             "Authorization": f"Bearer {token}",
             "language": "pt",
@@ -471,7 +483,7 @@ class GPS555:
         }
 
     def _get(self, path: str, timeout: float = CLOUD_TIMEOUT, **params) -> dict:
-        url = BASE_URL + path
+        url = self._base + path
         if params:
             url += "?" + urllib.parse.urlencode({k: str(v) for k, v in params.items()})
         req = urllib.request.Request(url, headers=self._h)
@@ -518,7 +530,7 @@ class GPS555:
 
     def _post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
-            BASE_URL + path, data=json.dumps(body).encode(),
+            self._base + path, data=json.dumps(body).encode(),
             headers={**self._h, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
@@ -2342,6 +2354,18 @@ def main():
     PUNCH_INTERVAL = interval
 
     offline = bool(args.offline or cfg.get("offline"))
+    # The API base is configurable so this bridge can talk to a local broker
+    # (ziot_fake_cloud.py) instead of the vendor cloud -- that is the whole
+    # point of provisioning a camera with our own sig server. The vendor
+    # default stays in place when the key is absent.
+    base_url = cfg.get("api_base") or BASE_URL
+    if not isinstance(base_url, str) or not base_url.strip():
+        log.error("api_base %r must be a non-empty URL -- using %s",
+                  base_url, BASE_URL)
+        base_url = BASE_URL
+    base_url = base_url.rstrip("/")
+    if base_url != BASE_URL:
+        log.info("cloud API base: %s", base_url)
     static: dict = {}
     if offline:
         try:
@@ -2358,9 +2382,9 @@ def main():
         # used for signalling (send-stun-addr / notify / keepalive) so
         # --offline actually streams; without one we punch the LAN only.
         token = cfg.get("token")
-        api = GPS555(token) if token else None
+        api = _make_api(token, base_url) if token else None
     else:
-        api = GPS555(cfg["token"])
+        api = _make_api(cfg["token"], base_url)
 
     # The device list needs an account id. The config may carry it, or the
     # JWT's user_id claim does. Resolved once, here, because every use site

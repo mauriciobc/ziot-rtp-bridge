@@ -655,6 +655,81 @@ class PunchIntervalTests(unittest.TestCase):
             gps.return_value.list_cameras.assert_called_once_with(1)
 
 
+class ApiBaseTests(unittest.TestCase):
+    """`api_base` points the bridge's signalling at a local broker."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+        self.old_interval = bridge.PUNCH_INTERVAL
+        self.addCleanup(setattr, bridge, "PUNCH_INTERVAL", self.old_interval)
+
+    def run_main(self, config):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(config, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name]
+
+    def test_configured_base_reaches_the_client(self):
+        self.run_main({"token": "t", "user_id": 1, "port": 0,
+                       "api_base": "http://127.0.0.1:8089/api/"})
+        with mock.patch.object(bridge, "GPS555") as gps:
+            gps.return_value.list_cameras.return_value = []
+            bridge.main()
+        # A trailing slash would double up in BASE + "/v1/..." paths.
+        gps.assert_called_once_with("t", "http://127.0.0.1:8089/api")
+
+    def test_blank_base_falls_back_to_the_vendor_default(self):
+        for value in ("", "   ", 5, []):
+            with self.subTest(value=value):
+                self.run_main({"token": "t", "user_id": 1, "port": 0,
+                               "api_base": value})
+                with mock.patch.object(bridge, "GPS555") as gps:
+                    gps.return_value.list_cameras.return_value = []
+                    bridge.main()
+                gps.assert_called_once_with("t")
+
+    def test_requests_go_to_the_configured_base(self):
+        seen = []
+
+        class Reply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"code":200,"msg":"OK","data":{"list":[]}}'
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            return Reply()
+
+        client = bridge.GPS555("t", "http://10.0.0.5:80/api")
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            client.list_cameras(7)
+            client.send_cmd("u", "20")
+        self.assertTrue(seen[0].startswith("http://10.0.0.5:80/api/v1/ipc?"),
+                        seen)
+        self.assertEqual(seen[1], "http://10.0.0.5:80/api/v1/cmd/send-cmd")
+
+    def test_default_client_still_uses_the_vendor_cloud(self):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            raise OSError("stop")
+
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            with self.assertRaises(OSError):
+                bridge.GPS555("t").get_stun_addr("u")
+        self.assertTrue(seen[0].startswith("https://ipc.gps555.net/api/"))
+
+
 class PunchLoopTests(unittest.TestCase):
     """Every tick sends exactly one hello to the camera. The starved branch
     exists to re-resolve the endpoint, not to punch a second time -- the
