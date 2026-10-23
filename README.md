@@ -299,16 +299,30 @@ It adds `120.26.121.165/32`, `47.110.77.193/32`, `47.238.125.111/32` and
 `8.130.23.234/32` to the interface and prints the route entries. Re-running
 it is safe.
 
-**2 — Point the router at this host.** In the Deco app: *More → Advanced →
-Static Routing → +*. One entry per address, all with the gateway set to
-this host's LAN address:
+The gateway in those entries must not move when an adapter's DHCP lease
+changes, so the broker also claims a **fixed address of its own**,
+`192.168.68.114`, on the LAN. `ziot-ips.service` does both at boot:
 
-| Description | Network destination | Subnet mask | Default gateway |
-|---|---|---|---|
-| ZIOT ipc | `120.26.121.165` | `255.255.255.255` | `192.168.68.114` |
-| ZIOT sig | `47.110.77.193` | `255.255.255.255` | `192.168.68.114` |
-| ZIOT stun+ws | `47.238.125.111` | `255.255.255.255` | `192.168.68.114` |
-| ZIOT stunaddr | `8.130.23.234` | `255.255.255.255` | `192.168.68.114` |
+```bash
+sudo cp ziot-ips.service /etc/systemd/system/
+sudo systemctl enable --now ziot-ips.service
+```
+
+**2 — Point the router at this host.** In the Deco app: *More → Advanced →
+Static Routing → +*. One entry per address:
+
+| Description | Network destination | Subnet mask | Default gateway | Interface |
+|---|---|---|---|---|
+| ZIOT ipc | `120.26.121.165` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT sig | `47.110.77.193` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT stun+ws | `47.238.125.111` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT stunaddr | `8.130.23.234` | `255.255.255.255` | `192.168.68.114` | LAN |
+
+The mask is `255.255.255.255` because each entry is a single host. The
+gateway is this host, and it must sit on the same subnet as the router
+interface that sends the traffic out — hence **LAN**, not WAN: the packets
+leave the router's LAN side towards us. The four destinations are public
+addresses, so none of them collides with the router's own LAN or WAN.
 
 **3 — Run the broker and watch.** The API answers on the vendor's port 80,
 the signalling server on 8882, STUN on 13478 and the websocket on 7080. A

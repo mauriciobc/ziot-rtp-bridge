@@ -1,0 +1,33 @@
+# Claim the ZIOT vendor addresses on this host.
+#
+# The camera reaches the vendor cloud through fixed addresses. The router's
+# static routes send that traffic here, but for the camera to accept the
+# replies, this host must own those addresses: the reply then carries the
+# vendor's address as its source, which is what the camera expects.
+#
+# The router's routes also point at this host, so the broker needs an
+# address that does not move when an adapter's DHCP lease changes.
+# 192.168.68.114 is that fixed address.
+#
+# Install:
+#   sudo cp ziot-ips.service /etc/systemd/system/
+#   sudo systemctl enable --now ziot-ips.service
+#
+# Idempotent: `ip addr replace` on an address that is already there leaves
+# it as it is.
+
+[Unit]
+Description=Claim the ZIOT vendor addresses on this host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '/usr/sbin/ip addr replace 192.168.68.114/32 dev wlan1; for ip in 120.26.121.165 47.110.77.193 47.238.125.111 8.130.23.234; do /usr/sbin/ip addr replace $ip/32 dev wlan1; done'
+ExecStart=/bin/sh -c 'ip -brief addr show wlan1'
+StandardOutput=append:/home/mauriciobc/ziot-ips.out
+StandardError=append:/home/mauriciobc/ziot-ips.err
+
+[Install]
+WantedBy=multi-user.target

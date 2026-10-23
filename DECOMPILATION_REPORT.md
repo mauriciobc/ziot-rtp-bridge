@@ -677,18 +677,32 @@ Two details make this work rather than merely redirect packets:
    same place and is not needed for this.
 
 Router side (TP-Link Deco: *More → Advanced → Static Routing*), one entry
-per address, mask `255.255.255.255`, gateway = this host:
+per address, mask `255.255.255.255`, gateway = this host, **interface
+LAN** — the packets leave the router's LAN side towards us, and the
+gateway must be on the same subnet as the interface that sends them out:
 
-| destination | vendor host |
-|---|---|
-| `120.26.121.165` | `ipc.gps555.net` |
-| `47.110.77.193` | `sig.gps555.net` |
-| `47.238.125.111` | `stun.gps555.net`, `ws.gps555.net` |
-| `8.130.23.234` | `stunaddr.gps555.net` |
+| name | destination | mask | gateway | interface |
+|---|---|---|---|---|
+| ZIOT ipc | `120.26.121.165` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT sig | `47.110.77.193` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT stun+ws | `47.238.125.111` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT stunaddr | `8.130.23.234` | `255.255.255.255` | `192.168.68.114` | LAN |
+
+The destinations are public addresses, so none collides with the router's
+own LAN or WAN (TP-Link rejects those).
 
 Host side is scripted: `python3 ziot_fake_cloud.py --claim-ips` claims the
 four addresses and prints these entries; `ziot-broker.service` runs the
 broker.
+
+**The gateway address must be fixed, not the DHCP lease.** The first
+attempt used the adapter's DHCP address as the gateway — and that adapter
+disappeared mid-session (the internal one went away and the USB one took
+over), taking the claimed vendor addresses with it and silently returning
+the vendor's addresses to the real vendor. The broker now claims its own
+fixed address, `192.168.68.114`, independent of which adapter is up, and
+`ziot-ips.service` re-claims everything at boot. A route pointing at a
+moving address is a route that works until it silently does not.
 
 Running the broker as a service needed one non-obvious step: port 80.
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` with `User=`/`Group=` gives an
