@@ -336,8 +336,23 @@ sudo python3 ziot_fake_cloud.py --log fake_cloud.log
 
 Running it as a service needs port 80; `AmbientCapabilities=CAP_NET_BIND_SERVICE`
 gives an unprivileged service that capability, which keeps the log readable
-without running the broker as root. See `DECOMPILATION_REPORT.md` §11 for
-the unit file.
+without running the broker as root. See `ziot-broker.service` in this repo
+and `DECOMPILATION_REPORT.md` §11 for the details.
+
+**The broker speaks the vendor's protocol, not an approximation of it.**
+Every response shape — the header block, the envelope, the device record's
+46 fields and their types, the redirect on the trailing-slash path, the two
+different `stun` shapes — was taken from a live app session and is checked
+by `VendorConformanceTests`, so the broker and the vendor are
+indistinguishable to the app. `DECOMPILATION_REPORT.md` §11 has the full
+contract.
+
+Point the bridge at the broker with `api_base`; it can be the vendor's own
+address, which is where the camera will look:
+
+```json
+{"token": "…", "user_id": 3132031, "api_base": "http://120.26.121.165/api"}
+```
 
 Note: this is a *routing* redirect, so the camera keeps its vendor
 configuration. It talks to the local broker and nothing else — which is the
