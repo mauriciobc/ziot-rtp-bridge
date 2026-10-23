@@ -101,6 +101,31 @@ class DnsTests(unittest.TestCase):
                          "ipc.gps555.net")
         self.assertIsNone(fake._dns_name(b"short"))
 
+    def test_answer_echoes_the_full_question_section(self):
+        """The question is name + QTYPE + QCLASS. Dropping the last four
+        bytes makes a resolver read the answer's compression pointer as the
+        query type and reject the reply as malformed."""
+        query = self.query("ipc.gps555.net")
+        reply = fake._dns_answer(query, "192.168.68.114")
+        # The question section is echoed verbatim, so QTYPE is still 1 (A).
+        qtype_at = len(query) - 4
+        self.assertEqual(reply[qtype_at:qtype_at + 2], b"\x00\x01")
+        self.assertEqual(reply[qtype_at + 2:qtype_at + 4], b"\x00\x01")
+        # ... and the answer record follows the question, not inside it.
+        self.assertEqual(reply[-4:], socket.inet_aton("192.168.68.114"))
+        self.assertEqual(reply[-14:-12], b"\x00\x01")   # type A
+        self.assertEqual(reply[-12:-10], b"\x00\x01")   # class IN
+
+    def test_non_a_query_gets_no_records(self):
+        """An AAAA query must not get an A record back."""
+        query = bytearray(self.query("ipc.gps555.net"))
+        query[-4:-2] = b"\x00\x1c"          # QTYPE = AAAA
+        reply = fake._dns_answer(bytes(query), "192.168.68.114")
+        # No answer record: the reply ends with the echoed question, and
+        # the answer count is zero.
+        self.assertEqual(reply[6:8], b"\x00\x00")   # ANCOUNT = 0
+        self.assertNotIn(socket.inet_aton("192.168.68.114"), reply)
+
     def test_vendor_name_is_answered_locally(self):
         srv = fake.DnsServer(("127.0.0.1", 0), "192.168.68.114", "127.0.0.1")
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -263,6 +288,133 @@ class EnvTests(unittest.TestCase):
 
     def test_missing_env_file_is_empty(self):
         self.assertEqual(fake._load_env("/nonexistent/.env"), {})
+
+
+class VendorConformanceTests(unittest.TestCase):
+    """The broker's answers must match what the vendor actually sent.
+
+    Every expectation here comes from the live app session captured in
+    PCAPdroid_29_ago._15_13_27.pcap (DECOMPILATION_REPORT.md section 11):
+    the header block, the envelope, the device record's field set and
+    order, the trailing-slash redirect and the per-endpoint "msg".
+    """
+
+    # The device row the vendor returned, in the order it returned it.
+    VENDOR_ROW_FIELDS = [
+        "uid", "name", "email", "pwd", "deviceType", "version", "familyId",
+        "terminalFamilyId", "natType", "wifiSsid", "connectionState",
+        "interpolation", "remark", "startTime", "createdAt", "updatedAt",
+        "createBy", "updateBy", "commTime", "status", "relay_ip", "sd_total",
+        "sd_available", "power", "signal", "online_time", "server_ip",
+        "event_sensitivity", "resolution", "onlineState", "sdState",
+        "sdPolicy", "infraredLight", "lampLight", "vflip", "hflip", "led",
+        "mediaState", "ringing", "ringingTime", "charged",
+        "isShowRemoteService", "isRemoteServiceExpired",
+        "remoteServiceEndTime", "unReadEventCount",
+    ]
+
+    def setUp(self):
+        self.api = fake.HttpApi()
+        self.api.add_camera("141030191094", "192.168.68.50", 34567)
+
+    def raw(self, method, path, query="", body=b""):
+        return self.api.respond(method, path, query, body)
+
+    def test_device_row_has_the_vendor_fields_in_the_vendor_order(self):
+        raw = self.raw("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        row = json.loads(raw.partition(b"\r\n\r\n")[2])["data"]["list"][0]
+        self.assertEqual([k for k in row if not k.startswith("_")],
+                         self.VENDOR_ROW_FIELDS)
+
+    def test_device_row_types_match_the_vendor(self):
+        """The app parses these: onlineState and mediaState are strings,
+        the remote-service flags are booleans, the counters are numbers."""
+        raw = self.raw("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        row = json.loads(raw.partition(b"\r\n\r\n")[2])["data"]["list"][0]
+        self.assertIsInstance(row["onlineState"], str)
+        self.assertIsInstance(row["mediaState"], str)
+        self.assertIsInstance(row["isShowRemoteService"], bool)
+        self.assertIsInstance(row["isRemoteServiceExpired"], bool)
+        self.assertIsInstance(row["unReadEventCount"], int)
+        self.assertIsInstance(row["familyId"], int)
+        self.assertIsInstance(row["terminalFamilyId"], int)
+        self.assertIsInstance(row["createBy"], int)
+        self.assertIsInstance(row["updateBy"], int)
+
+    def test_list_envelope_matches_the_vendor(self):
+        raw = self.raw("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        data = json.loads(raw.partition(b"\r\n\r\n")[2])["data"]
+        self.assertEqual(list(data.keys()),
+                         ["count", "pageIndex", "pageSize", "list", "showAd"])
+
+    def test_response_carries_the_vendor_headers(self):
+        raw = self.raw("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        head = raw.partition(b"\r\n\r\n")[0].decode()
+        self.assertIn("Server: nginx/1.24.0 (Ubuntu)", head)
+        self.assertIn("Content-Type: application/json; charset=utf-8", head)
+        self.assertIn("Access-Control-Allow-Origin: *", head)
+        self.assertIn("Cache-Control: no-cache, no-store, max-age=0,"
+                      " must-revalidate", head)
+        self.assertIn("Expires: Thu, 01 Jan 1970 00:00:00 GMT", head)
+        self.assertIn("X-Content-Type-Options: nosniff", head)
+        self.assertIn("X-Xss-Protection: 1; mode=block", head)
+        self.assertIn("Connection: keep-alive", head)
+
+    def test_trailing_slash_draws_a_301_to_the_bare_path(self):
+        """The vendor's nginx redirects /api/v1/ipc/?... to /api/v1/ipc?...;
+        the app follows it. The query must survive the redirect."""
+        raw = self.raw("GET", "/api/v1/ipc/", "terminalFamilyId=3132031")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        head = head.decode()
+        self.assertIn("HTTP/1.1 301 Moved Permanently", head)
+        self.assertIn("Location: /api/v1/ipc?terminalFamilyId=3132031", head)
+        self.assertIn("Content-Type: text/html; charset=utf-8", head)
+        self.assertEqual(body,
+                         b'<a href="/api/v1/ipc?terminalFamilyId=3132031">'
+                         b'Moved Permanently</a>.\n\n')
+
+    def test_envelope_keys_match_the_vendor(self):
+        raw = self.raw("GET", "/api/v1/ipc", "terminalFamilyId=3132031")
+        body = json.loads(raw.partition(b"\r\n\r\n")[2])
+        self.assertEqual(list(body.keys()),
+                         ["requestId", "code", "msg", "data"])
+        # The request id is a UUID, as the vendor's is.
+        self.assertRegex(body["requestId"],
+                         r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                         r"[0-9a-f]{4}-[0-9a-f]{12}$")
+
+    def test_package_record_keeps_the_vendors_chinese_message(self):
+        body = json.loads(self.raw(
+            "GET", "/api/v1/cloud-service-record/current-package",
+            "uid=141030191094&serviceType=2").partition(b"\r\n\r\n")[2])
+        self.assertEqual(body["msg"], "查询成功")
+        self.assertEqual(body["data"], {"uid": "141030191094",
+                                        "packageStatus": "3",
+                                        "expiredDuration": "",
+                                        "packageInfo": []})
+
+    def test_share_list_is_an_empty_array(self):
+        body = json.loads(self.raw("GET", "/api/v1/share-list")
+                          .partition(b"\r\n\r\n")[2])
+        self.assertEqual(body["data"], [])
+
+    def test_stun_addr_shape_matches_the_vendor(self):
+        body = json.loads(self.raw("GET", "/api/v1/ipc/stun-addr/141030191094")
+                          .partition(b"\r\n\r\n")[2])
+        data = body["data"]
+        self.assertEqual(sorted(data.keys()),
+                         ["IpcPrivateIP", "IpcPrivatePort", "IpcPublicIP",
+                          "IpcPublicPort", "seqNo", "updateTime"])
+
+    def test_send_stun_addr_shape_matches_the_vendor(self):
+        body = json.loads(self.raw(
+            "GET", "/api/v1/ipc/send-stun-addr",
+            "appId=x&uid=141030191094&publicIp=1.2.3.4&publicPort=1"
+            "&privateIp=5.6.7.8&privatePort=2").partition(b"\r\n\r\n")[2])
+        data = body["data"]
+        self.assertEqual(sorted(data.keys()),
+                         ["IpcPrivateIP", "IpcPrivatePort", "IpcPublicIP",
+                          "IpcPublicPort", "receiveTs", "seqNo"])
 
 
 class HttpApiTests(unittest.TestCase):

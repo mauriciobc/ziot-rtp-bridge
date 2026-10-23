@@ -639,6 +639,58 @@ bridge run did `send-stun-addr` → `notify` → `stun-addr` → punch against i
 camera address used was a placeholder, so no media flowed; **a real
 camera streaming against the local broker has not been demonstrated.**
 
+### The vendor's wire contract, in full
+
+Reassembled from the capture (the phone's two connections carry the whole
+session) and reproduced by the broker. `VendorConformanceTests` in
+`tests/test_ziot_fake_cloud.py` checks each point against the broker, so
+the contract cannot drift silently.
+
+**Headers** (nginx 1.24.0 on Ubuntu):
+
+```
+HTTP/1.1 200 OK
+Server: nginx/1.24.0 (Ubuntu)
+Date: <RFC 1123>
+Content-Type: application/json; charset=utf-8
+Content-Length: <n>
+Connection: keep-alive
+Access-Control-Allow-Origin: *
+Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+Expires: Thu, 01 Jan 1970 00:00:00 GMT
+Last-Modified: <RFC 1123>
+X-Content-Type-Options: nosniff
+X-Xss-Protection: 1; mode=block
+```
+
+**Envelope:** `{"requestId": <uuid>, "code": 200, "msg": …, "data": …}`.
+`msg` is `"OK"` everywhere except the package record, which answers
+`"查询成功"`.
+
+**The device list** is `{"count", "pageIndex", "pageSize", "list",
+"showAd"}` — and `count` is **0** in the vendor's own answer even though
+`list` holds the camera. The field is not populated; the app and the
+bridge read `list` and never look at `count`, so the broker reproduces the
+vendor's value rather than inventing one.
+
+**The device record** carries 46 fields in a fixed order, from `uid` to
+`unReadEventCount`. The types matter to the app's parser:
+`onlineState`/`mediaState` are **strings** (`"1"`, `"0"` — the app
+compares them as text), `isShowRemoteService`/`isRemoteServiceExpired`
+are **booleans**, `familyId`/`terminalFamilyId`/`createBy`/`updateBy`/
+`unReadEventCount` are **numbers**. The broker emits the same set, in the
+same order, with the same types.
+
+**The two endpoints answer with different shapes**, which is easy to get
+wrong: `send-stun-addr` returns `receiveTs`, `stun-addr` returns
+`updateTime` instead (both carry `IpcPublicIP/Port`,
+`IpcPrivateIP/Port` and `seqNo`).
+
+**The trailing slash draws a 301.** `GET /api/v1/ipc/?terminalFamilyId=…`
+answers `301 Moved Permanently` with `Location: /api/v1/ipc?terminalFamilyId=…`
+and a 71-byte HTML body; the app follows it and asks again without the
+slash. The broker reproduces the redirect rather than answering directly.
+
 Lab topology used for the AP-mode probing: `wlan0` (internal) stays on the
 home LAN; `wlan1` is the USB ZyDAS ZD1211B adapter (`0ace:1215`, needs the
 `zd1211/` firmware from linux-firmware) and associates with a camera's own

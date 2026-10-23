@@ -89,7 +89,7 @@ class StreamHandler(socketserver.BaseRequestHandler):
     def handle(self):
         peer = self.request.getpeername()
         buf = b""
-        self.request.settimeout(10.0)
+        self.request.settimeout(30.0)
         while True:
             try:
                 data = self.request.recv(65535)
@@ -103,22 +103,71 @@ class StreamHandler(socketserver.BaseRequestHandler):
             log(self.server.kind, peer, data)
             # Answer as soon as the headers are complete; the body of a
             # POST is small and arrives with the headers.
-            if b"\r\n\r\n" not in buf:
-                continue
-            head, _, body = buf.partition(b"\r\n\r\n")
-            request_line = head.split(b"\r\n")[0].decode("latin-1", "replace")
-            parts = request_line.split()
-            if len(parts) < 2:
-                return
-            method, target = parts[0], parts[1]
-            path = target.split("?", 1)[0]
-            query = target.split("?", 1)[1] if "?" in target else ""
-            if self.server.api is None:
-                return
-            payload = self.server.api.respond(method, path, query, body)
-            if payload is None:
-                return
-            self.request.sendall(payload)
+            while b"\r\n\r\n" in buf:
+                head, _, rest = buf.partition(b"\r\n\r\n")
+                request_line = head.split(b"\r\n")[0].decode("latin-1",
+                                                              "replace")
+                parts = request_line.split()
+                if len(parts) < 2:
+                    return
+                method, target = parts[0], parts[1]
+                path = target.split("?", 1)[0]
+                query = target.split("?", 1)[1] if "?" in target else ""
+                # The body length is the header's word, not "whatever
+                # arrived with the headers": a POST split across two TCP
+                # segments would otherwise be answered with half a body.
+                length = 0
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        try:
+                            length = int(line.split(b":", 1)[1].strip())
+                        except ValueError:
+                            length = 0
+                if len(rest) < length:
+                    buf = head + b"\r\n\r\n" + rest      # wait for more
+                    break
+                body, buf = rest[:length], rest[length:]
+                if self.server.api is None:
+                    return
+                payload = self.server.api.respond(method, path, query, body)
+                if payload is None:
+                    return
+                self.request.sendall(payload)
+                if b"connection: close" in head.lower():
+                    return
+
+
+def _http_response(status: str, payload: bytes,
+                   content_type: str = "application/json; charset=utf-8",
+                   extra: list | None = None) -> bytes:
+    """An HTTP response with the vendor's header set.
+
+    Taken from the captured app session (DECOMPILATION_REPORT.md section
+    11): nginx's own header block, plus the security headers it adds.
+    Reproducing them keeps the client on the same footing as against the
+    vendor -- in particular the no-cache headers, so a stale device list is
+    never served from a cache.
+    """
+    stamp = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    lines = [
+        f"HTTP/1.1 {status}",
+        "Server: nginx/1.24.0 (Ubuntu)",
+        f"Date: {stamp}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {len(payload)}",
+        "Connection: keep-alive",
+    ]
+    if content_type.startswith("application/json"):
+        lines += [
+            "Access-Control-Allow-Origin: *",
+            "Cache-Control: no-cache, no-store, max-age=0, must-revalidate",
+            "Expires: Thu, 01 Jan 1970 00:00:00 GMT",
+            f"Last-Modified: {stamp}",
+            "X-Content-Type-Options: nosniff",
+            "X-Xss-Protection: 1; mode=block",
+        ]
+    lines += extra or []
+    return ("\r\n".join(lines) + "\r\n\r\n").encode() + payload
 
 
 class HttpApi:
@@ -137,7 +186,14 @@ class HttpApi:
 
     def add_camera(self, uid: str, ip: str, port: int = 0, pwd: str = "123456"):
         """Register a camera and the address it should be told about."""
+        now = time.time()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
         self.cameras[uid] = {
+            # The field set and order are the camera's own, taken from a
+            # live app session against the vendor (DECOMPILATION_REPORT.md
+            # section 11). The app's CameraInfoModel.fromJson reads them by
+            # name, so the names must match; the order keeps the record
+            # comparable with the vendor's byte for byte.
             "uid": uid,
             "name": "",
             "email": "",
@@ -149,19 +205,40 @@ class HttpApi:
             "natType": "xbH7",
             "wifiSsid": "",
             "connectionState": "BR",
-            "onlineState": "1",
-            "mediaState": "1",
-            "relay_ip": "",
-            "server_ip": "",
-            "commTime": "",
-            "power": "100",
-            "signal": "100%",
-            "online_time": str(int(time.time())),
-            "resolution": "",
-            "event_sensitivity": "1",
+            "interpolation": "30w",
+            "remark": "",
+            "startTime": stamp,
+            "createdAt": stamp,
+            "updatedAt": stamp,
+            "createBy": 0,
+            "updateBy": 3132031,
+            "commTime": stamp,
             "status": "",
+            "relay_ip": "",
             "sd_total": "0.00GB",
             "sd_available": "0.00MB",
+            "power": "100",
+            "signal": "100%",
+            "online_time": str(int(now)),
+            "server_ip": "",
+            "event_sensitivity": "1",
+            "resolution": "",
+            "onlineState": "1",
+            "sdState": "0",
+            "sdPolicy": "1",
+            "infraredLight": "0",
+            "lampLight": "",
+            "vflip": "0",
+            "hflip": "0",
+            "led": "1",
+            "mediaState": "0",
+            "ringing": "",
+            "ringingTime": "",
+            "charged": "",
+            "isShowRemoteService": False,
+            "isRemoteServiceExpired": False,
+            "remoteServiceEndTime": "0001-01-01T00:00:00Z",
+            "unReadEventCount": 0,
             # What the broker hands back in stun-addr.
             "_ip": ip,
             "_port": port,
@@ -174,31 +251,63 @@ class HttpApi:
             row.pop(key, None)
         return row
 
-    def _stun(self, uid: str) -> dict:
-        """The address the camera is told to send media to."""
+    def _stun(self, uid: str, receive_ts: bool = True) -> dict:
+        """The address the camera is told to send media to.
+
+        The two endpoints answer with slightly different shapes, and the
+        difference is in the capture: send-stun-addr carries `receiveTs`,
+        stun-addr carries `updateTime` instead.
+        """
         cam = self.cameras.get(uid) or {}
         self.seq += 1
-        return {
+        out = {
             "IpcPublicIP": cam.get("_ip", ""),
             "IpcPublicPort": cam.get("_port", 0),
             "IpcPrivateIP": cam.get("_ip", ""),
             "IpcPrivatePort": cam.get("_port", 0),
-            "receiveTs": int(time.time()),
-            "seqNo": self.seq,
         }
+        if receive_ts:
+            out["receiveTs"] = int(time.time())
+        out["seqNo"] = self.seq
+        return out
 
     def respond(self, method: str, path: str, query: str,
                 body: bytes) -> bytes | None:
-        """Answer one HTTP request; returns the raw response bytes."""
+        """Answer one HTTP request; returns the raw response bytes.
+
+        The shapes come from a live app session against the vendor
+        (DECOMPILATION_REPORT.md section 11): the envelope is
+        {"requestId", "code", "msg", "data"}, the device list is
+        {count, pageIndex, pageSize, list, showAd} and the vendor's
+        trailing-slash quirk (a 301 to the same path without it) is
+        reproduced, because the app follows it.
+        """
         params = urllib.parse.parse_qs(query)
         one = {k: v[0] for k, v in params.items()}
-        path = path.rstrip("/") or "/"
         data = None
+        msg = "OK"
+
+        # /api/v1/ipc/?... draws a 301 to /api/v1/ipc?... in the vendor's
+        # nginx; the app retries without the slash. Answering the same
+        # way keeps the client on the path it expects.
+        if path.endswith("/") and path.strip("/"):
+            bare = path.rstrip("/")
+            location = bare + (("?" + query) if query else "")
+            body_html = (f'<a href="{location}">Moved Permanently</a>.\n\n'
+                         ).encode()
+            return _http_response(
+                "301 Moved Permanently", body_html,
+                content_type="text/html; charset=utf-8",
+                extra=[f"Location: {location}"])
 
         if path == "/api/v1/ipc" and method == "GET":
             rows = [self._camera_row(uid) for uid in self.cameras]
-            data = {"count": len(rows), "pageIndex": 1, "pageSize": 1000,
-                    "list": rows}
+            # The vendor answers "count": 0 even when the list holds a
+            # camera -- it does not populate the field. Matching that
+            # keeps the record comparable with the capture; the app and
+            # the bridge both read "list" and never look at "count".
+            data = {"count": 0, "pageIndex": 1, "pageSize": 1000,
+                    "list": rows, "showAd": False}
         elif path == "/api/v1/ipc" and method == "POST":
             # The camera registers itself here.
             try:
@@ -210,15 +319,13 @@ class HttpApi:
                 ip = cam.get("ip") or cam.get("IpcPrivateIP") or ""
                 port = int(cam.get("port") or cam.get("IpcPrivatePort") or 0)
                 self.add_camera(uid, ip, port, cam.get("pwd") or "123456")
-                data = "ok"
-            else:
-                data = "ok"
+            data = "ok"
         elif path == "/api/v1/ipc/send-stun-addr":
             uid = one.get("uid", "")
             data = self._stun(uid)
         elif path.startswith("/api/v1/ipc/stun-addr/"):
             uid = path.rsplit("/", 1)[-1]
-            stun = self._stun(uid)
+            stun = self._stun(uid, receive_ts=False)
             stun["updateTime"] = time.strftime("%Y-%m-%d %H:%M:%S")
             data = stun
         elif path == "/api/v1/ipc/notify-live-event":
@@ -236,6 +343,8 @@ class HttpApi:
             uid = one.get("uid", "")
             data = {"uid": uid, "packageStatus": "3", "expiredDuration": "",
                     "packageInfo": []}
+            # The vendor answers this one in Chinese, not "OK".
+            msg = "查询成功"
         elif path == "/api/v1/cmd/send-cmd":
             data = "ok"
         else:
@@ -246,12 +355,8 @@ class HttpApi:
                                   "msg": "not found", "data": None}).encode()
         else:
             payload = json.dumps({"requestId": str(uuid.uuid4()), "code": 200,
-                                  "msg": "OK", "data": data}).encode()
-        head = ("HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json; charset=UTF-8\r\n"
-                f"Content-Length: {len(payload)}\r\n"
-                "Connection: keep-alive\r\n\r\n").encode()
-        return head + payload
+                                  "msg": msg, "data": data}).encode()
+        return _http_response("200 OK", payload)
 
 
 class StreamServer(socketserver.ThreadingTCPServer):
@@ -310,13 +415,29 @@ def _dns_name(query: bytes) -> str | None:
 
 
 def _dns_answer(query: bytes, ip: str) -> bytes:
-    """Minimal A-record answer echoing the question section."""
+    """Minimal A-record answer echoing the question section.
+
+    The question section is the name *plus* QTYPE and QCLASS. Leaving
+    those four bytes off makes the resolver read the answer's name pointer
+    as the query type, and every answer is then rejected as malformed --
+    dig reports it as "Question section mismatch: got .../TYPE49164/IN",
+    and 49164 is 0xC00C, the compression pointer of the record below.
+
+    Only an A query gets an A record. A query for anything else (AAAA,
+    most of all) is answered with no records, which is what a resolver
+    expects and what keeps the camera from caching a bogus answer.
+    """
     name_end = 12
     while query[name_end]:
         name_end += 1 + query[name_end]
-    name_end += 1
-    question = query[12:name_end]
-    header = query[:2] + b"\x81\x80" + b"\x00\x01\x00\x01\x00\x00\x00\x00"
+    name_end += 1              # the root label ends the name
+    if name_end + 4 > len(query):
+        raise ValueError("truncated question section")
+    qtype = int.from_bytes(query[name_end:name_end + 2], "big")
+    question = query[12:name_end + 4]     # name + QTYPE + QCLASS
+    header = query[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00"
+    if qtype != 1:              # not A: answer with no records
+        return header + question
     rr = (b"\xc0\x0c"                # name pointer to the question
           b"\x00\x01\x00\x01"        # type A, class IN
           b"\x00\x00\x00\x3c"        # TTL 60s
