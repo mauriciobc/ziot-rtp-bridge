@@ -430,6 +430,28 @@ class VendorConformanceTests(unittest.TestCase):
                          ["IpcPrivateIP", "IpcPrivatePort", "IpcPublicIP",
                           "IpcPublicPort", "receiveTs", "seqNo"])
 
+    def test_send_stun_addr_remembers_the_viewers_address(self):
+        """The viewer registers where it wants the media delivered; the
+        camera is told that address over the signalling connection."""
+        self.raw("GET", "/api/v1/ipc/send-stun-addr",
+                 "appId=x&uid=141030191094&publicIp=177.221.120.116"
+                 "&publicPort=64550&privateIp=192.168.18.30"
+                 "&privatePort=55795")
+        viewer = self.api.viewer_for("141030191094")
+        self.assertEqual(viewer["privateIp"], "192.168.18.30")
+        self.assertEqual(viewer["privatePort"], 55795)
+        self.assertEqual(viewer["publicIp"], "177.221.120.116")
+        self.assertEqual(viewer["publicPort"], 64550)
+
+    def test_viewer_address_can_be_read_back(self):
+        self.raw("GET", "/api/v1/ipc/send-stun-addr",
+                 "appId=x&uid=141030191094&publicIp=1.2.3.4&publicPort=1"
+                 "&privateIp=192.168.68.111&privatePort=40000")
+        body = json.loads(self.raw("GET", "/api/v1/ipc/viewer/141030191094")
+                          .partition(b"\r\n\r\n")[2])
+        self.assertEqual(body["data"]["privateIp"], "192.168.68.111")
+        self.assertEqual(body["data"]["privatePort"], 40000)
+
 
 class HttpApiTests(unittest.TestCase):
     """The broker answers the vendor's API, so the camera and the bridge

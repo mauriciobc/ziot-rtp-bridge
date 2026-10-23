@@ -607,6 +607,92 @@ class RouteTests(unittest.TestCase):
         self.assertNotIn(b"object at 0x", body)
 
 
+class StableBindIpTests(unittest.TestCase):
+    """The camera is told where to send its media, so that address must
+    not move when an adapter's DHCP lease changes."""
+
+    def test_local_address_detection_finds_a_bound_address(self):
+        # 127.0.0.1 is always local.
+        self.assertTrue(bridge._has_local_address("127.0.0.1"))
+        # An address that is not ours cannot be bound.
+        self.assertFalse(bridge._has_local_address("203.0.113.99"))
+
+    def test_a_fixed_address_is_preferred_over_the_lease(self):
+        """With a camera on the same subnet, the fixed address wins."""
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name]
+
+        calls = []
+
+        class Cam:
+            def __init__(self, api, cam, bind_ip, **kw):
+                calls.append({"bind_ip": bind_ip, **kw})
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera", Cam), \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.68.111"), \
+                mock.patch.object(bridge, "_has_local_address",
+                                  return_value=True):
+            gps.return_value.list_cameras.return_value = [
+                {"uid": "AAA", "onlineState": "1"}]
+            gps.return_value.get_stun_addr.return_value = {
+                "IpcPrivateIP": "192.168.68.50", "IpcPrivatePort": 5000}
+            bridge.main()
+        # The camera was constructed with the fixed address.
+        self.assertTrue(calls, "the camera was never started")
+        self.assertEqual(calls[0].get("bind_ip"), bridge.STABLE_BIND_IP)
+
+    def test_an_explicit_bind_ip_wins(self):
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name,
+                    "--bind-ip", "192.168.68.111"]
+
+        calls = []
+
+        class Cam:
+            def __init__(self, api, cam, bind_ip, **kw):
+                calls.append({"bind_ip": bind_ip, **kw})
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera", Cam), \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.68.111"), \
+                mock.patch.object(bridge, "_has_local_address",
+                                  return_value=True):
+            gps.return_value.list_cameras.return_value = [
+                {"uid": "AAA", "onlineState": "1"}]
+            gps.return_value.get_stun_addr.return_value = {
+                "IpcPrivateIP": "192.168.68.50", "IpcPrivatePort": 5000}
+            bridge.main()
+        self.assertTrue(calls)
+        self.assertEqual(calls[0].get("bind_ip"), "192.168.68.111")
+
+
 class PunchIntervalTests(unittest.TestCase):
     def setUp(self):
         self.old_interval = bridge.PUNCH_INTERVAL

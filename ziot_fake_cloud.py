@@ -84,6 +84,13 @@ class StreamHandler(socketserver.BaseRequestHandler):
     section 11): every response is {"requestId": ..., "code": 200, "msg":
     "OK", "data": ...}, and the endpoint set is exactly the six the
     bridge touches plus the device detail and package record.
+
+    On the signalling port (8882) the peer is the camera, not the app, and
+    its protocol is not the HTTP API -- it is not known yet. What is known
+    is that the camera must be told where to send its media: the viewer
+    registered that address through send-stun-addr. So a camera that asks
+    for it by uid is answered with it, in the JSON shape the vendor uses
+    elsewhere, and everything else is only logged.
     """
 
     def handle(self):
@@ -182,6 +189,9 @@ class HttpApi:
 
     def __init__(self):
         self.cameras: dict[str, dict] = {}
+        # Where each camera's media should be delivered: the viewer that
+        # registered through send-stun-addr.
+        self.viewers: dict[str, dict] = {}
         self.seq = 0
 
     def add_camera(self, uid: str, ip: str, port: int = 0, pwd: str = "123456"):
@@ -252,11 +262,16 @@ class HttpApi:
         return row
 
     def _stun(self, uid: str, receive_ts: bool = True) -> dict:
-        """The address the camera is told to send media to.
+        """The camera's address, as the capture shows it.
 
         The two endpoints answer with slightly different shapes, and the
         difference is in the capture: send-stun-addr carries `receiveTs`,
         stun-addr carries `updateTime` instead.
+
+        What comes back is the CAMERA's address, not the viewer's: in the
+        capture the viewer registers 192.168.18.30:55795 and is answered
+        with 192.168.18.75:53693, the camera's private address and the
+        port its media comes from.
         """
         cam = self.cameras.get(uid) or {}
         self.seq += 1
@@ -270,6 +285,33 @@ class HttpApi:
             out["receiveTs"] = int(time.time())
         out["seqNo"] = self.seq
         return out
+
+    def _register_viewer(self, uid: str, one: dict) -> None:
+        """Remember where the viewer wants the media delivered.
+
+        The viewer's address is what the camera is told over the signalling
+        connection, so it has to be kept: it is the one piece of state the
+        broker cannot invent. In the capture the app registers
+        publicIp=177.221.120.116, publicPort=64550, privateIp=192.168.18.30,
+        privatePort=55795 -- the address its own media socket listens on.
+        """
+        try:
+            public_port = int(one.get("publicPort") or 0)
+            private_port = int(one.get("privatePort") or 0)
+        except ValueError:
+            public_port = private_port = 0
+        self.viewers[uid] = {
+            "publicIp": one.get("publicIp", ""),
+            "publicPort": public_port,
+            "privateIp": one.get("privateIp", ""),
+            "privatePort": private_port,
+        }
+        log("viewer", ("-", 0),
+            f"uid={uid} -> {one.get('privateIp')}:{private_port}".encode())
+
+    def viewer_for(self, uid: str) -> dict:
+        """The viewer registered for a camera, or an empty dict."""
+        return dict(self.viewers.get(uid) or {})
 
     def respond(self, method: str, path: str, query: str,
                 body: bytes) -> bytes | None:
@@ -322,6 +364,9 @@ class HttpApi:
             data = "ok"
         elif path == "/api/v1/ipc/send-stun-addr":
             uid = one.get("uid", "")
+            # The viewer registers where it wants the media delivered; the
+            # camera is told that address over the signalling connection.
+            self._register_viewer(uid, one)
             data = self._stun(uid)
         elif path.startswith("/api/v1/ipc/stun-addr/"):
             uid = path.rsplit("/", 1)[-1]
@@ -334,6 +379,20 @@ class HttpApi:
             log("notify", ("-", 0),
                 f"uid={uid} event={event}".encode())
             data = "ok"
+        elif path.startswith("/api/v1/ipc/viewer/"):
+            # The camera's side of the rendezvous: where the media should
+            # be delivered. The camera is told this over the signalling
+            # connection; the path here exists so the address can be read
+            # back and compared with what the camera receives.
+            uid = path.rsplit("/", 1)[-1]
+            viewer = self.viewer_for(uid)
+            data = {
+                "uid": uid,
+                "publicIp": viewer.get("publicIp", ""),
+                "publicPort": viewer.get("publicPort", 0),
+                "privateIp": viewer.get("privateIp", ""),
+                "privatePort": viewer.get("privatePort", 0),
+            }
         elif path.startswith("/api/v1/ipc/"):
             uid = path.rsplit("/", 1)[-1]
             data = self._camera_row(uid)

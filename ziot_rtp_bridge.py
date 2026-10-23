@@ -105,6 +105,12 @@ RELAY_RETRY_DIRECT = 120.0      # while relayed, retry a direct rendezvous this 
 RELAY_FIRMWARE_PIVOT = "TXW817_A_V1.0.11.52"   # app's CameraInfoModel gate
 RELAY_DEFAULT_PORT = 554
 STUN_SUBNET_MASK = "255.255.255.0"   # the app's isSameSubnet() mask
+# A fixed address for this host on the camera's LAN. The camera is told
+# where to send its media, and that address must not change when an
+# adapter's DHCP lease does -- a viewer address that moves is a session
+# that silently stops. Set it here (or pass --bind-ip) when running
+# against a local broker.
+STABLE_BIND_IP = "192.168.68.114"
 # Linux ephemeral range; these cameras bind their RTP listen port here.
 # A punch-only (no-token) camera that answers hellos is found by sweeping it
 # from the existing socket -- rebinding would change our source port and
@@ -2296,6 +2302,59 @@ def local_ip_for(target: str) -> str:
         s.close()
 
 
+def _local_addresses() -> list:
+    """This host's IPv4 addresses, without running any command."""
+    out = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                      socket.AF_INET):
+            addr = info[4][0]
+            if addr not in out:
+                out.append(addr)
+    except OSError:
+        pass
+    # The hostname does not always resolve to every address; ask the
+    # kernel for each interface by name (SIOCGIFADDR).
+    try:
+        import fcntl
+        import struct
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _, name in socket.if_nameindex():
+                packed = struct.pack("256s", name.encode()[:15])
+                try:
+                    raw = fcntl.ioctl(sock.fileno(), 0x8915, packed)
+                except OSError:
+                    continue
+                addr = socket.inet_ntoa(raw[20:24])
+                if addr not in out:
+                    out.append(addr)
+        finally:
+            sock.close()
+    except (OSError, ImportError):
+        pass
+    return out
+
+
+def _has_local_address(addr: str) -> bool:
+    """Is `addr` one of this host's addresses?
+
+    A secondary address (/32) on an interface is not reported by
+    SIOCGIFADDR, so the check that actually matters is whether the address
+    can be bound -- if the kernel has it, the bind succeeds.
+    """
+    if addr in _local_addresses():
+        return True
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((addr, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="ZIOT RTP/JPEG -> MJPEG bridge")
     ap.add_argument("--config", default="ziot_config.json")
@@ -2480,6 +2539,16 @@ def main():
             else:
                 log.warning("no IpcPrivateIP from the broker — binding on %s by default "
                             "route; pass --bind-ip if that is the wrong interface", bind_ip)
+        # A stable address matters when the camera is told where to send
+        # its media: the viewer's registered address must not change when
+        # an adapter's lease does. STABLE_BIND_IP is the broker's fixed
+        # address on this LAN -- use it when it is present and in the
+        # camera's subnet.
+        if not args.bind_ip and probe and same_subnet(STABLE_BIND_IP, probe):
+            if _has_local_address(STABLE_BIND_IP):
+                log.info("using the fixed address %s instead of %s",
+                         STABLE_BIND_IP, bind_ip)
+                bind_ip = STABLE_BIND_IP
         log.info("binding on %s (camera LAN %s), punch every %.1fs",
                  bind_ip, probe or "unknown", PUNCH_INTERVAL)
 
