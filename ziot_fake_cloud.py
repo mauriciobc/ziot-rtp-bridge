@@ -428,20 +428,95 @@ class StreamServer(socketserver.ThreadingTCPServer):
         super().__init__(addr, StreamHandler)
 
 
+def _stun_xor_addr(ip: str, port: int, cookie: bytes, txid: bytes) -> bytes:
+    """The address as RFC 5389's XOR-MAPPED-ADDRESS encodes it."""
+    try:
+        raw = socket.inet_aton(ip)
+    except OSError:
+        raw = b"\x00" * 4
+    mask = cookie + txid[:4]
+    xored = bytes(a ^ b for a, b in zip(raw, mask))
+    return b"\x00\x01" + struct.pack("!H", port ^ 0x2112) + xored
+
+
+def stun_binding_success(request: bytes, seen_ip: str, peer_port: int,
+                         own_ip: str, server_port: int) -> bytes:
+    """Build the vendor's STUN Binding Success for a Binding Request.
+
+    From the capture (DECOMPILATION_REPORT.md section 11): the request is
+    a bare 20-byte Binding Request (`0001 0000 <magic> <txid>`) and the
+    answer is
+
+        0101 0024 <magic> <txid>
+        0001 0008 0001 <port> <ip>        MAPPED-ADDRESS: the peer as seen
+        0004 0008 0001 <port> <ip>        this server's own address
+        8020 0008 0001 <port> <ip>        the peer again, XOR-obfuscated
+
+    The 0x8020 attribute is the vendor's own (XOR-MAPPED-ADDRESS lives at
+    0x0020; they use the comprehension-optional 0x8020 range). Its port
+    and address are XORed with the magic cookie and the top half of the
+    transaction id, exactly like RFC 5389's XOR-MAPPED-ADDRESS.
+
+    `seen_ip` and `peer_port` are the pair the peer is asking about: the
+    address its request came from and the port it came from. `own_ip` is
+    this server's address, which the peer learns at the same time.
+    """
+    if len(request) < 20:
+        return b""
+    msgtype = struct.unpack("!H", request[:2])[0]
+    if msgtype != 0x0001:            # not a Binding Request
+        return b""
+    cookie = request[4:8]
+    txid = request[8:20]
+
+    def attr(atype: int, value: bytes) -> bytes:
+        return struct.pack("!HH", atype, len(value)) + value
+
+    def addr_field(ip: str, port: int) -> bytes:
+        try:
+            raw = socket.inet_aton(ip)
+        except OSError:
+            raw = b"\x00" * 4
+        return b"\x00\x01" + struct.pack("!H", port) + raw
+
+    body = b"".join([
+        attr(0x0001, addr_field(seen_ip, peer_port)),
+        attr(0x0004, addr_field(own_ip, server_port)),
+        # The vendor's 0x8020 carries the port the peer's traffic arrives
+        # on, XOR-obfuscated. On the vendor's side that is the NAT-mapped
+        # port, which the server cannot know; here the peer is on the LAN
+        # with us, so its source port is that port.
+        attr(0x8020, _stun_xor_addr(seen_ip, peer_port, cookie, txid)),
+    ])
+    return struct.pack("!HH", 0x0101, len(body)) + cookie + txid + body
+
+
 class StunHandler(socketserver.BaseRequestHandler):
+    """Answer a STUN Binding Request the way the vendor's server does.
+
+    The camera asks this server to tell it its own address -- that is what
+    lets it register and be reached. Answering it is not optional for a
+    camera that has to talk to our broker instead of the vendor's.
+    """
+
     def handle(self):
         data, sock = self.request
         log("stun", self.client_address, data)
-        # Silence: the bridge's own STUN checks reject answers with a
-        # lower seqNo, and an unsolicited reply would poison nothing we
-        # run locally. Phase 2 decides what a valid answer looks like.
+        reply = stun_binding_success(data, self.client_address[0],
+                                     self.client_address[1],
+                                     self.server.own_ip,
+                                     self.server.server_address[1])
+        if reply:
+            sock.sendto(reply, self.client_address)
+            log("stun", self.client_address, b"-> " + reply[:24].hex().encode())
 
 
 class StunServer(socketserver.ThreadingUDPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr):
+    def __init__(self, addr, own_ip: str = ""):
+        self.own_ip = own_ip
         super().__init__(addr, StunHandler)
 
 
@@ -702,8 +777,9 @@ def claim_vendor_ips(args) -> int:
 
 
 def serve(kind: str, addr: tuple,
-          api: "HttpApi | None" = None) -> socketserver.BaseServer:
-    srv = StunServer(addr) if kind == "stun" \
+          api: "HttpApi | None" = None,
+          own_ip: str = "") -> socketserver.BaseServer:
+    srv = StunServer(addr, own_ip) if kind == "stun" \
         else StreamServer(addr, kind, api)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print(f"listening {kind} on {addr[0]}:{addr[1]}", flush=True)
@@ -1003,17 +1079,11 @@ def main() -> int:
         _log_file = open(args.log, "a", buffering=1)
 
     my_ip = args.bind_ip
+    if my_ip is None:
+        # The address the default route uses: what LAN peers can reach.
+        # The STUN server hands it to the camera as its own address.
+        my_ip = _detect_lan_ip()
     if args.dns:
-        if my_ip is None:
-            # The address the default route uses: what LAN peers can reach.
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                probe.connect(("10.255.255.255", 53))
-                my_ip = probe.getsockname()[0]
-            except OSError:
-                my_ip = "127.0.0.1"
-            finally:
-                probe.close()
         if args.upstream_dns:
             upstream = args.upstream_dns
         else:
@@ -1042,7 +1112,8 @@ def main() -> int:
         if port:
             try:
                 servers.append(serve(kind, (args.bind, port),
-                                      api if kind == "http" else None))
+                                      api if kind == "http" else None,
+                                      my_ip or _detect_lan_ip()))
             except OSError as e:
                 print(f"cannot bind {kind} port {port}: {e} -- ports below "
                       "1024 need root (see module docstring)", file=sys.stderr)

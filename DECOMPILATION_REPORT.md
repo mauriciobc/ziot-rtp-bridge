@@ -686,6 +686,30 @@ wrong: `send-stun-addr` returns `receiveTs`, `stun-addr` returns
 `updateTime` instead (both carry `IpcPublicIP/Port`,
 `IpcPrivateIP/Port` and `seqNo`).
 
+**The STUN server answers too.** `stunaddr.gps555.net:13478` is a plain
+STUN server, and the camera needs its answer: it is how the camera learns
+the address and port to register with. The captured exchange is a bare
+20-byte Binding Request (`0001 0000 <magic> <txid>`) answered with a
+Binding Success carrying three attributes:
+
+| Attribute | Meaning | In the capture |
+|---|---|---|
+| `0x0001` MAPPED-ADDRESS | the peer as the server sees it | `177.221.120.116:64668` |
+| `0x0004` | the server's own address | `172.16.110.64:13478` |
+| `0x8020` | the peer again, XOR-obfuscated | port and address XORed with the magic cookie |
+
+`0x8020` is the vendor's own attribute (XOR-MAPPED-ADDRESS is `0x0020`;
+they use the comprehension-optional range). Its **address** decodes back to
+the peer's public address with the RFC 5389 mask; its **port** is the
+NAT-mapped port, which the vendor's server could only know from its NAT
+and which changed between the two captured requests. The broker answers
+with the peer's source port in that field, which is the same value on a
+LAN.
+
+The broker's STUN answer matches the vendor's byte for byte in the header,
+the cookie, the transaction id, `0x0001` and `0x0004`; only the `0x8020`
+port differs, and it is the one field a server cannot derive.
+
 **The trailing slash draws a 301.** `GET /api/v1/ipc/?terminalFamilyId=…`
 answers `301 Moved Permanently` with `Location: /api/v1/ipc?terminalFamilyId=…`
 and a 71-byte HTML body; the app follows it and asks again without the

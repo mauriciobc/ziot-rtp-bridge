@@ -241,6 +241,74 @@ class ProvisionFrameTests(unittest.TestCase):
             fake.parse_provision_response(b"\x00" + good[1:])
 
 
+class StunTests(unittest.TestCase):
+    """The camera asks this server for its own address; the answer has to
+    look like the vendor's or the camera will not register."""
+
+    # The request and reply from the captured app session.
+    REQUEST = bytes.fromhex("00010000150e529c613d2c1d45cfa7fcd00f116e")
+    VENDOR_REPLY = bytes.fromhex(
+        "01010024150e529c613d2c1d45cfa7fcd00f116e"
+        "000100080001fc9cb1dd7874"     # MAPPED-ADDRESS
+        "00040008000134a6ac106e40"     # the server's own address
+        "802000080001e992a4d32ae8")     # the peer again, XOR-obfuscated
+
+    def attrs(self, reply):
+        out = {}
+        pos = 20
+        while pos + 4 <= len(reply):
+            atype = int.from_bytes(reply[pos:pos + 2], "big")
+            alen = int.from_bytes(reply[pos + 2:pos + 4], "big")
+            out[atype] = reply[pos + 4:pos + 4 + alen]
+            pos += 4 + alen
+        return out
+
+    def test_header_cookie_and_transaction_id_are_echoed(self):
+        reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
+                                          64668, "172.16.110.64", 13478)
+        # Binding Success, the same length, the same cookie and txid.
+        self.assertEqual(reply[:2], b"\x01\x01")
+        self.assertEqual(reply[2:4], b"\x00\x24")
+        self.assertEqual(reply[4:20], self.REQUEST[4:20])
+
+    def test_mapped_address_and_server_address_match_the_vendor(self):
+        reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
+                                          64668, "172.16.110.64", 13478)
+        ours, vendor = self.attrs(reply), self.attrs(self.VENDOR_REPLY)
+        self.assertEqual(ours[0x0001], vendor[0x0001])   # MAPPED-ADDRESS
+        self.assertEqual(ours[0x0004], vendor[0x0004])   # the server itself
+
+    def test_the_xor_attribute_decodes_back_to_the_peer(self):
+        reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
+                                          64668, "172.16.110.64", 13478)
+        val = self.attrs(reply)[0x8020]
+        port = int.from_bytes(val[2:4], "big") ^ 0x2112
+        mask = reply[4:8] + reply[8:12]
+        ip = bytes(x ^ y for x, y in zip(val[4:8], mask))
+        self.assertEqual(port, 64668)
+        self.assertEqual(".".join(str(b) for b in ip), "177.221.120.116")
+
+    def test_a_non_binding_request_is_not_answered(self):
+        self.assertEqual(fake.stun_binding_success(b"\x00" * 20, "1.2.3.4",
+                                                    1, "5.6.7.8", 13478), b"")
+
+    def test_the_server_answers_over_udp(self):
+        srv = fake.StunServer(("127.0.0.1", 0), "127.0.0.1")
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(3)
+        s.sendto(self.REQUEST, srv.server_address)
+        reply, _ = s.recvfrom(512)
+        s.close()
+        self.assertEqual(reply[:2], b"\x01\x01")
+        self.assertEqual(reply[4:20], self.REQUEST[4:20])
+        # The peer is told the address its request came from.
+        mapped = self.attrs(reply)[0x0001]
+        self.assertEqual(".".join(str(b) for b in mapped[4:8]), "127.0.0.1")
+
+
 class ClaimIpsTests(unittest.TestCase):
     """`--claim-ips` makes this host answer for the vendor's addresses, so
     a static route in the router can send the camera's cloud traffic here."""
