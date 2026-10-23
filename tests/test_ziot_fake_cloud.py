@@ -116,6 +116,20 @@ class DnsTests(unittest.TestCase):
         self.assertEqual(reply[-14:-12], b"\x00\x01")   # type A
         self.assertEqual(reply[-12:-10], b"\x00\x01")   # class IN
 
+    def test_answer_count_matches_the_records_sent(self):
+        """ANCOUNT is 1 when an A record follows, 0 when it does not. A
+        mismatch makes the resolver report the record as trailing bytes."""
+        query = self.query("ipc.gps555.net")
+        reply = fake._dns_answer(query, "192.168.68.114")
+        self.assertEqual(reply[6:8], b"\x00\x01")        # ANCOUNT = 1
+        self.assertEqual(len(reply) - len(query), 16)    # one A record
+
+        aaaa = bytearray(query)
+        aaaa[-4:-2] = b"\x00\x1c"
+        reply = fake._dns_answer(bytes(aaaa), "192.168.68.114")
+        self.assertEqual(reply[6:8], b"\x00\x00")        # ANCOUNT = 0
+        self.assertEqual(len(reply), len(aaaa))          # nothing extra
+
     def test_non_a_query_gets_no_records(self):
         """An AAAA query must not get an A record back."""
         query = bytearray(self.query("ipc.gps555.net"))

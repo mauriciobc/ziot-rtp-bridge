@@ -435,9 +435,16 @@ def _dns_answer(query: bytes, ip: str) -> bytes:
         raise ValueError("truncated question section")
     qtype = int.from_bytes(query[name_end:name_end + 2], "big")
     question = query[12:name_end + 4]     # name + QTYPE + QCLASS
-    header = query[:2] + b"\x81\x80" + b"\x00\x01\x00\x00\x00\x00\x00\x00"
-    if qtype != 1:              # not A: answer with no records
+    if qtype != 1:
+        # Not an A query: answer with no records, which is what a resolver
+        # expects and what keeps the camera from caching a bogus answer.
+        # ANCOUNT is 0.
+        header = (query[:2] + b"\x81\x80"
+                  + b"\x00\x01\x00\x00\x00\x00\x00\x00")
         return header + question
+    # ANCOUNT is 1: the record below is the answer, not trailing bytes.
+    header = (query[:2] + b"\x81\x80"
+              + b"\x00\x01\x00\x01\x00\x00\x00\x00")
     rr = (b"\xc0\x0c"                # name pointer to the question
           b"\x00\x01\x00\x01"        # type A, class IN
           b"\x00\x00\x00\x3c"        # TTL 60s
