@@ -202,6 +202,51 @@ class ProvisionFrameTests(unittest.TestCase):
             fake.parse_provision_response(b"\x00" + good[1:])
 
 
+class ClaimIpsTests(unittest.TestCase):
+    """`--claim-ips` makes this host answer for the vendor's addresses, so
+    a static route in the router can send the camera's cloud traffic here."""
+
+    def args(self, print_only=True):
+        return mock.Mock(claim_print_only=print_only, claim_iface="wlan0")
+
+    def test_route_entries_name_every_vendor_address(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = fake.claim_vendor_ips(self.args())
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        for ip in fake.VENDOR_IPS:
+            self.assertIn(ip, text)
+        # The router needs the gateway to be this host and a host route.
+        self.assertIn("255.255.255.255", text)
+
+    def test_print_only_does_not_touch_the_host(self):
+        with mock.patch.object(fake.subprocess, "run") as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                fake.claim_vendor_ips(self.args())
+        run.assert_not_called()
+
+    def test_already_assigned_counts_as_claimed(self):
+        """Re-running the command must not report failure."""
+        done = mock.Mock(returncode=2,
+                         stdout="",
+                         stderr="RTNETLINK answers: File exists\n"
+                                "Error: ipv4: Address already assigned.")
+        with mock.patch.object(fake.subprocess, "run", return_value=done):
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = fake.claim_vendor_ips(self.args(print_only=False))
+        self.assertEqual(rc, 0)
+
+    def test_real_failure_is_reported(self):
+        done = mock.Mock(returncode=1, stdout="",
+                         stderr="RTNETLINK answers: Operation not permitted")
+        with mock.patch.object(fake.subprocess, "run", return_value=done):
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = fake.claim_vendor_ips(self.args(print_only=False))
+        self.assertEqual(rc, 1)
+
+
 class EnvTests(unittest.TestCase):
     def test_env_values_are_loaded_and_comments_skipped(self):
         import tempfile, os

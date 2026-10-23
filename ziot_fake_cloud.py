@@ -50,6 +50,15 @@ import uuid
 VENDOR_DOMAINS = ("ipc.gps555.net", "sig.gps555.net", "stun.gps555.net",
                   "stunaddr.gps555.net", "ws.gps555.net", "gps555.net")
 
+# The addresses the vendor domains resolve to (2026-10-23). A camera
+# reaches the cloud through these, so a static route in the router can
+# point them at this host -- the camera then talks to us without ever
+# changing its own configuration.
+VENDOR_IPS = ("120.26.121.165",     # ipc.gps555.net
+              "47.110.77.193",      # sig.gps555.net
+              "47.238.125.111",    # stun.gps555.net, ws.gps555.net
+              "8.130.23.234")      # stunaddr.gps555.net
+
 _log_lock = threading.Lock()
 _log_file = None
 
@@ -436,6 +445,75 @@ def parse_provision_response(data: bytes) -> dict:
     return {"result": status == 0, "uid": uid}
 
 
+def claim_vendor_ips(args) -> int:
+    """Claim the vendor's addresses on this host and print the router routes.
+
+    The camera reaches the cloud through fixed addresses (VENDOR_IPS). If
+    this host owns those addresses and the router sends them here, the
+    camera talks to the local broker instead of the vendor -- without the
+    camera's own configuration being touched, and without DNS being
+    involved at all.
+
+    The address has to be local here so the kernel accepts the packet and
+    the reply carries the vendor address as its source: the camera must see
+    the vendor's address come back, or it drops the connection.
+
+    The router needs one static route per address (TP-Link Deco: More >
+    Advanced > Static Routing; destination, mask 255.255.255.255, gateway
+    this host).
+    """
+    own = _detect_lan_ip()
+    print(f"this host: {own}")
+    print("\nAdd these static routes in the router "
+          "(More > Advanced > Static Routing):\n")
+    for ip in VENDOR_IPS:
+        print(f"  destination {ip}  mask 255.255.255.255  gateway {own}")
+    print()
+
+    if args.claim_print_only:
+        return 0
+
+    failed = []
+    for ip in VENDOR_IPS:
+        cmd = ["sudo", "-n", "ip", "addr", "add", f"{ip}/32",
+               "dev", args.claim_iface]
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as e:
+            print(f"  {ip}: could not run ip ({e})", file=sys.stderr)
+            failed.append(ip)
+            continue
+        if done.returncode == 0:
+            print(f"  {ip}: claimed on {args.claim_iface}")
+            continue
+        msg = (done.stderr or done.stdout).strip()
+        # "Address already assigned" means the claim is in place -- the
+        # command is meant to be re-runnable.
+        if "already assigned" in msg:
+            print(f"  {ip}: already claimed on {args.claim_iface}")
+            continue
+        detail = msg.splitlines()
+        print(f"  {ip}: {detail[-1] if detail else 'failed'}",
+              file=sys.stderr)
+        failed.append(ip)
+
+    print("\ncheck:", flush=True)
+    try:
+        shown = subprocess.run(["ip", "-brief", "addr", "show",
+                                args.claim_iface],
+                               capture_output=True, text=True).stdout
+        for line in shown.splitlines():
+            print("  " + line)
+    except OSError:
+        pass
+
+    if failed:
+        print(f"\n{len(failed)} address(es) not claimed: {', '.join(failed)}",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def serve(kind: str, addr: tuple,
           api: "HttpApi | None" = None) -> socketserver.BaseServer:
     srv = StunServer(addr) if kind == "stun" \
@@ -696,6 +774,15 @@ def main() -> int:
                          "(default: first nameserver in /etc/resolv.conf)")
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--log", default=None, help="also write lines to this file")
+    ap.add_argument("--claim-ips", action="store_true",
+                    help="claim the vendor's addresses on this host so a "
+                         "static route in the router can point them here, "
+                         "and print the route entries to add. Needs "
+                         "privileges for 'ip addr add'")
+    ap.add_argument("--claim-iface", default="wlan0",
+                    help="interface to claim the vendor addresses on")
+    ap.add_argument("--claim-print-only", action="store_true",
+                    help="print the route entries without touching the host")
     ap.add_argument("--provision", action="store_true",
                     help="skip the listeners: build the BLE wifiConnect "
                          "frame, write it to the camera in 20-byte chunks "
@@ -720,6 +807,9 @@ def main() -> int:
 
     if args.provision:
         return ble_provision(args)
+
+    if args.claim_ips:
+        return claim_vendor_ips(args)
 
     global _log_file
     if args.log:

@@ -646,3 +646,63 @@ open AP `ZIOTA_<uid>` (`192.168.1.0/24`, camera at `192.168.1.1`). A
 camera's AP carries the same MAC as its STA side, so `ip neigh` always
 shows it on `192.168.1.1`; a join to the home LAN must be looked for on
 `192.168.68.x`, not by MAC alone.
+
+## 12. Taking an already-paired camera off the cloud — routing, not re-pairing, 2026-10-23
+
+The BLE provisioning path (§9, §10) is the clean end state: a camera
+re-provisioned with our own signalling server registers with us and never
+mentions the vendor. It is not working yet.
+
+But a camera that is *already paired* does not need it. Two facts make a
+camera avoidable without touching the camera:
+
+* The vendor's addresses are fixed and few: `ipc.gps555.net` →
+  `120.26.121.165`, `sig.gps555.net` → `47.110.77.193`, `stun.gps555.net`
+  and `ws.gps555.net` → `47.238.125.111`, `stunaddr.gps555.net` →
+  `8.130.23.234` (resolved 2026-10-23).
+* The camera resolves them by name and connects to them by address, so a
+  static route in the router sends that traffic to us instead.
+
+Two details make this work rather than merely redirect packets:
+
+1. **The address has to be local on our host.** `ip addr add <vendor
+   ip>/32 dev wlan0` makes the kernel accept the packet and put the
+   vendor's address in the reply's source field. A camera that sees the
+   reply come from an address it did not expect drops the connection, so
+   claiming the address is what preserves the illusion. The broker's
+   listeners already use the vendor's ports (80, 8882, 13478, 7080).
+2. **DNS is not involved.** The camera resolves the names normally through
+   the router and gets the real addresses; the router then diverts the
+   packets. The DNS hijack in `ziot_fake_cloud.py` is a second path to the
+   same place and is not needed for this.
+
+Router side (TP-Link Deco: *More → Advanced → Static Routing*), one entry
+per address, mask `255.255.255.255`, gateway = this host:
+
+| destination | vendor host |
+|---|---|
+| `120.26.121.165` | `ipc.gps555.net` |
+| `47.110.77.193` | `sig.gps555.net` |
+| `47.238.125.111` | `stun.gps555.net`, `ws.gps555.net` |
+| `8.130.23.234` | `stunaddr.gps555.net` |
+
+Host side is scripted: `python3 ziot_fake_cloud.py --claim-ips` claims the
+four addresses and prints these entries; `ziot-broker.service` runs the
+broker.
+
+Running the broker as a service needed one non-obvious step: port 80.
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` with `User=`/`Group=` gives an
+*unprivileged* service that capability, so the broker keeps running as the
+user and its log file stays readable — running it as root instead put the
+log where only root could read it, and `systemd`'s private `/tmp` made the
+first attempt's log vanish entirely.
+
+**Status.** Verified on this host: all four vendor addresses answer on the
+vendor's port 80 with the local API's answers, and the broker's signalling
+port answers. **Not yet verified:** a camera actually registering with the
+local broker, because the camera on hand is asleep (a battery camera that
+was silent for 100 s of capture) and the router routes have not been
+installed. Once it does register, its registration traffic is the missing
+camera→cloud protocol — the same trick the app capture played in §11, and
+the last piece needed for the broker to answer a camera rather than only a
+bridge.

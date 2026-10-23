@@ -251,7 +251,7 @@ python3 ziot_offline_probe.py --ble 192.168.68.107 --uid 140979857781
 ### Local cloud emulation (work in progress)
 
 `ziot_fake_cloud.py` is the start of removing the vendor cloud (goal and
-findings: `DECOMPILATION_REPORT.md` §8–§11). Two things work today:
+findings: `DECOMPILATION_REPORT.md` §8–§11). Three things work today:
 
 * **The HTTP API is answered locally.** Response shapes come from a live
   app capture (§11). Register a camera and point the bridge at the broker:
@@ -269,17 +269,68 @@ findings: `DECOMPILATION_REPORT.md` §8–§11). Two things work today:
   (byte-identical to the app's, §9) and writes it over raw ATT (§10). On the
   two units tried the camera acknowledged every write but did not act on
   it; that is still open.
+* **The camera can be routed to this host without touching the camera.**
+  The cloud addresses are fixed (`ipc.gps555.net` → `120.26.121.165`,
+  `sig.gps555.net` → `47.110.77.193`, `stun.gps555.net` and
+  `ws.gps555.net` → `47.238.125.111`, `stunaddr.gps555.net` →
+  `8.130.23.234`), so a static route in the router sends the camera's
+  cloud traffic here — no DNS, no camera configuration, no BLE.
 
 The signalling (8882), STUN (13478) and websocket (7080) listeners only log
 what a camera sends — what a valid answer looks like is unknown. A DNS
 hijack mode answers `*.gps555.net` with this host and forwards everything
-else upstream. Ports 53/80/13478/7080 need privileges:
+else upstream. Ports 53/80/13478/7080 need privileges.
+
+#### Taking the camera off the vendor cloud
+
+Three steps. The host side is scripted; the router side is two taps in the
+Deco app.
+
+**1 — Claim the vendor's addresses on this host.** The address must be
+*local* here, so the kernel accepts the packet and the reply carries the
+vendor's address as its source — a camera that sees a reply from an
+unexpected source drops the connection.
+
+```bash
+python3 ziot_fake_cloud.py --claim-ips
+```
+
+It adds `120.26.121.165/32`, `47.110.77.193/32`, `47.238.125.111/32` and
+`8.130.23.234/32` to the interface and prints the route entries. Re-running
+it is safe.
+
+**2 — Point the router at this host.** In the Deco app: *More → Advanced →
+Static Routing → +*. One entry per address, all with the gateway set to
+this host's LAN address:
+
+| Description | Network destination | Subnet mask | Default gateway |
+|---|---|---|---|
+| ZIOT ipc | `120.26.121.165` | `255.255.255.255` | `192.168.68.114` |
+| ZIOT sig | `47.110.77.193` | `255.255.255.255` | `192.168.68.114` |
+| ZIOT stun+ws | `47.238.125.111` | `255.255.255.255` | `192.168.68.114` |
+| ZIOT stunaddr | `8.130.23.234` | `255.255.255.255` | `192.168.68.114` |
+
+**3 — Run the broker and watch.** The API answers on the vendor's port 80,
+the signalling server on 8882, STUN on 13478 and the websocket on 7080. A
+camera that wakes up now finds only this host, and its registration lands
+in the broker log — that log is the camera→cloud protocol, which is the
+last piece still missing (§11).
 
 ```bash
 sudo python3 ziot_fake_cloud.py --log fake_cloud.log
 ```
 
-Then point the router's DHCP DNS at this host.
+Running it as a service needs port 80; `AmbientCapabilities=CAP_NET_BIND_SERVICE`
+gives an unprivileged service that capability, which keeps the log readable
+without running the broker as root. See `DECOMPILATION_REPORT.md` §11 for
+the unit file.
+
+Note: this is a *routing* redirect, so the camera keeps its vendor
+configuration. It talks to the local broker and nothing else — which is the
+point — but it also means a camera that insists on the vendor's behaviour
+has not been taught anything new. The alternative, re-provisioning a camera
+over BLE with this host as its signalling server, is the cleaner end state
+and is still open (§10).
 
 ### Docker (recommended)
 
