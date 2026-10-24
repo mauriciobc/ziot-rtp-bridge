@@ -7,3 +7,6 @@ __pycache__/
 *.xapk
 *.apk
 ZIOT_FINDINGS.md
+
+# broker state: camera/viewer registries, includes account data
+broker-data/

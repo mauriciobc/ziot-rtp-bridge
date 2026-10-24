@@ -13,8 +13,13 @@ re-serves it as MJPEG/WAV over HTTP. Three standalone scripts, no packages:
 ## Hard constraints
 
 - **Python 3.10+ standard library only. Never add third-party dependencies.**
-  The Docker image (`python:3.11-slim`) copies only `ziot_rtp_bridge.py`; if you
-  split the code into modules or add imports beyond stdlib, update the Dockerfile too.
+  The Docker image (`python:3.11-slim`) copies `ziot_rtp_bridge.py` and
+  `ziot_fake_cloud.py` (`compose.yaml` runs the broker from the same image); if
+  you split the code into modules or add imports beyond stdlib, update the
+  Dockerfile too.
+- Server deployment lives in `compose.yaml` (broker + bridge) and
+  `ziot-addresses.conf` (networkd drop-in holding the broker's addresses); the
+  address list there must match `VENDOR_IPS` (a test enforces it).
 - `ziot_config.json` holds a real account JWT, is gitignored, and must never be
   committed. Tests must not read it; they build their own temp configs.
 - Protocol behaviors are empirically verified against real firmware
