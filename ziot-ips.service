@@ -9,6 +9,11 @@
 # address that does not move when an adapter's DHCP lease changes.
 # 192.168.68.114 is that fixed address.
 #
+# The address list must stay identical to `VENDOR_IPS` in
+# `ziot_fake_cloud.py`. 47.97.71.82 was missing here while the broker
+# already listed it, so every camera attempt to the *current*
+# sig.gps555.net answer left the LAN unanswered.
+#
 # Install:
 #   sudo cp ziot-ips.service /etc/systemd/system/
 #   sudo systemctl enable --now ziot-ips.service
@@ -24,8 +29,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '/usr/sbin/ip addr replace 192.168.68.114/32 dev wlan1; for ip in 120.26.121.165 47.110.77.193 47.238.125.111 8.130.23.234; do /usr/sbin/ip addr replace $ip/32 dev wlan1; done'
-ExecStart=/bin/sh -c 'ip -brief addr show wlan1'
+# Claim on whichever interface holds the home LAN, so the router's static
+# routes reach this host. A hardcoded interface goes stale the moment an
+# adapter is renamed or DHCP moves.
+ExecStart=/bin/sh -c 'i=$(ip route get 192.168.68.1 | sed -n "s/.* dev \\([^ ]*\\).*/\\1/p"); echo "claiming on $i"; /usr/sbin/ip addr replace 192.168.68.114/32 dev $i; for ip in 120.26.121.165 47.110.77.193 47.97.71.82 47.238.125.111 8.130.23.234; do /usr/sbin/ip addr replace $ip/32 dev $i; done; ip -brief addr show $i'
 StandardOutput=append:/home/mauriciobc/ziot-ips.out
 StandardError=append:/home/mauriciobc/ziot-ips.err
 

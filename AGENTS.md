@@ -34,7 +34,7 @@ re-serves it as MJPEG/WAV over HTTP. Three standalone scripts, no packages:
 ## Commands
 
 ```bash
-python3 -m pytest tests -q                    # full suite (~106 tests + subtests, ~11 s)
+python3 -m pytest tests -q                    # full suite (~282 tests + subtests, ~30 s)
 python3 -m pytest tests/test_ziot_rtp_bridge.py::DirectPacketTests -q   # one class
 python3 -m pytest "tests/test_ziot_rtp_bridge.py::PunchIntervalTests::test_x" -q
 python3 -m unittest discover -s tests -v      # works too; tests are plain unittest

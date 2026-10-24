@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import socket
+import struct
 import sys
 import threading
 import time
@@ -39,7 +40,10 @@ class FakeCloudTests(unittest.TestCase):
         out = self.out.getvalue()
         self.assertIn("sig", out)
         self.assertIn("REG uid=140979857781 key=secret", out)
-        self.assertIn("[", out)  # hex column
+        # The hex column is complete and labelled, so a frame's bytes can
+        # be re-read from the log exactly as they went over the wire.
+        self.assertIn("hex=524547207569643d313430393739383537373831", out)
+        self.assertIn("0102", out)
 
     def test_stream_survives_idle_and_multiple_pdus(self):
         port = self.start("http")
@@ -84,7 +88,7 @@ class FakeCloudTests(unittest.TestCase):
         with contextlib.redirect_stderr(err), \
                 mock.patch.object(sys, "argv",
                                   ["fake", "--http", "0", "--sig", "0",
-                                   "--stun", "0", "--ws", "0"]):
+                                   "--stun", "0", "--ws", "0", "--dns", "0"]):
             rc = fake.main()
         self.assertEqual(rc, 1)
         self.assertIn("nothing to listen on", err.getvalue())
@@ -185,6 +189,9 @@ class ProvisionFrameTests(unittest.TestCase):
         # Worked example recovered from the app's own construction rules
         # (BlutterMine): ssid "MyWiFi", pwd "pass1234",
         # sig "sig.gps555.net:8882", tz +120 min, seq 1.
+        # The trailing 0d end symbol was added after the camera answered a
+        # frame without it -- it stays silent on an incomplete frame
+        # (DECOMPILATION_REPORT.md §14.1).
         frame = fake.wifi_connect_frame("MyWiFi", "pass1234",
                                         "sig.gps555.net:8882", 120)
         self.assertEqual(frame.hex(),
@@ -194,7 +201,17 @@ class ProvisionFrameTests(unittest.TestCase):
                          "08" "7061737331323334"
                          "13" "7369672e6770733535352e6e65743a38383832"
                          "0078"
-                         "33")
+                         "33" "0d")
+
+    def test_frame_ends_with_end_symbol_not_counted_by_length(self):
+        # The camera counts LEN over seq+dlen+payload+xor only: the end
+        # symbol is not part of it, and omitting the symbol draws silence.
+        frame = fake.wifi_connect_frame("s", "p", "h:1", 0)
+        self.assertTrue(frame.endswith(b"\x0d"))
+        dlen = (frame[6] << 8) | frame[7]
+        length = (frame[2] << 8) | frame[3]
+        self.assertEqual(length, 5 + dlen)
+        self.assertEqual(len(frame), 4 + length + 1)
 
     def test_negative_timezone_is_biased(self):
         frame = fake.wifi_connect_frame("s", "p", "h:1", -60)
@@ -239,6 +256,755 @@ class ProvisionFrameTests(unittest.TestCase):
             fake.parse_provision_response(good[:-1] + b"\x00")
         with self.assertRaisesRegex(ValueError, "header"):
             fake.parse_provision_response(b"\x00" + good[1:])
+
+
+class SignallingFrameTests(unittest.TestCase):
+    """The camera's registration frame, as captured on the wire.
+
+    Captured live from two cameras (uid 140979857781 and 141030191094)
+    on 2026-10-23, against the broker's signalling port.
+    """
+
+    # 86 86 | cmd=0001 | len=002c | seq=0019 | uidLen=000c |
+    # "140979857781" | "TXW817_A_V1.0.12.32" + NUL pad | xor | 0d
+    CAPTURED = (b"\x86\x86\x00\x01\x00\x2c\x00\x19\x00\x0c"
+                b"140979857781"
+                b"TXW817_A_V1.0.12.32" + b"\x00" * 13
+                + b"\x61\x0d")
+
+    def test_the_captured_constant_is_the_captured_frame(self):
+        # Guards the constant above against a hand-edited NUL count: the
+        # frame as logged by the broker on 2026-10-23 was 56 bytes with
+        # the body padded to 32.
+        self.assertEqual(len(self.CAPTURED), 56)
+        self.assertEqual(self.CAPTURED[22:41], b"TXW817_A_V1.0.12.32")
+        self.assertEqual(self.CAPTURED[41:54], b"\x00" * 13)
+        self.assertEqual(self.CAPTURED[54:], b"\x61\x0d")
+
+    def test_decodes_the_captured_frame(self):
+        d = fake.decode_signalling(self.CAPTURED)
+        self.assertEqual(d["cmd"], "0x0001")
+        self.assertEqual(d["len"], 44)      # uid(12) + body(32)
+        self.assertEqual(d["seq"], 0x19)
+        self.assertEqual(d["uid_len"], 12)
+        self.assertEqual(d["uid"], "140979857781")
+        self.assertTrue(d["body"].startswith("TXW817_A_V1.0.12.32"))
+        self.assertTrue(d["xor_ok"])
+
+    def test_rebuilds_the_captured_frame_byte_for_byte(self):
+        built = fake.signalling_frame(0x0001, 0x19, b"140979857781",
+                                      b"TXW817_A_V1.0.12.32")
+        self.assertEqual(built, self.CAPTURED)
+
+    def test_field_order_is_magic_len_seq(self):
+        # The length (constant) and the sequence (increments on every
+        # retransmission) were the two fields in question; the length is
+        # the one that counts the uid plus the body.
+        cmd, length, seq, uid_len = 0x0001, 44, 7, 12
+        frame = fake.signalling_frame(cmd, seq, b"u" * uid_len, b"x" * 32)
+        self.assertEqual(frame[2:4], b"\x00\x01")      # cmd
+        self.assertEqual(frame[4:6], (44).to_bytes(2, "big"))  # len
+        self.assertEqual(frame[6:8], (7).to_bytes(2, "big"))   # seq
+        self.assertEqual(frame[8:10], (12).to_bytes(2, "big"))  # uidLen
+
+    def test_checksum_covers_everything_before_it(self):
+        frame = fake.signalling_frame(1, 3, b"140979857781", b"hello")
+        self.assertEqual(frame[-1], 0x0D)
+        self.assertEqual(fake._xor(frame[:-2]), frame[-2])
+
+    def test_padded_and_unpadded_forms(self):
+        padded = fake.signalling_frame(1, 1, b"u" * 12, b"hi")
+        self.assertEqual(len(padded), 56)      # 10 + 12 + 32 + 2
+        unpadded = fake.signalling_frame(1, 1, b"u" * 12, b"hi", pad=False)
+        self.assertEqual(len(unpadded), 26)    # 10 + 12 + 2 + 2
+
+    def test_a_long_body_keeps_its_own_length(self):
+        body = b"seq:1, stun port:5000, stun ip:192.168.1.2"
+        frame = fake.signalling_frame(1, 1, b"u" * 12, body, pad=False)
+        self.assertEqual(frame[22:-2], body)
+        self.assertEqual(int.from_bytes(frame[4:6], "big"), 12 + len(body))
+
+    def test_the_punch_instruction_carries_the_viewer_address(self):
+        # The address the camera must send its media to is packed as
+        # binary fields -- the firmware's own "seq:%d, stun port:%d
+        # stun ip:%s" is a log template for parsed values, not the wire
+        # bytes, and the camera ignores text answers.
+        viewer = {"privateIp": "192.168.68.114", "privatePort": 48666}
+        cands = fake._ack_candidates(b"140979857781", 5, 44, viewer)
+        bodies = [frame[22:-2] for _, frame in cands]
+        packed = struct.pack("!H", 48666) + socket.inet_aton("192.168.68.114")
+        self.assertTrue(any(packed in b for b in bodies),
+                        "the viewer's address must reach the camera")
+
+    def test_rebuilds_the_vendors_own_registration_answer(self):
+        # The vendor's real answer, captured live from
+        # sig.gps555.net on 2026-10-23 (118 bytes). The body is flat
+        # fixed-width fields: a u16 lead, the relay address in a
+        # 20-byte slot with two ports, the STUN host in a 32-byte slot
+        # with its port, and the signalling address in a 32-byte slot
+        # with its port.
+        captured = bytes.fromhex(
+            "86868000006a0001000c3134303937393835373738310001"
+            "3135362e3234362e31362e363100000000000000022a2710"
+            "7374756e2e6770733535352e6e657400000000000000000000000000000000"
+            "0034a634372e39372e37312e38320000000000000000000000000000000000"
+            "0000000022b5cb0d")
+        built = fake.vendor_registration_answer(
+            "140979857781", 1, "156.246.16.61", 554, 10000,
+            "stun.gps555.net", 13478, "47.97.71.82", 0x22b5)
+        self.assertEqual(built, captured)
+        self.assertEqual(len(built), 118)
+
+    def test_rebuilds_the_vendors_answer_to_the_clock_request(self):
+        # The camera's cmd 0x0021 (a one-byte counter) asks the server
+        # for its clock; the vendor answers with the same command plus
+        # the response bit and a big-endian u32 timestamp.
+        captured = bytes.fromhex(
+            "8686802100100002000c313430393739383537373831" "6adbd02a" "f2" "0d")
+        built = fake.vendor_time_answer("140979857781", 2, 1792790570)
+        self.assertEqual(built, captured)
+
+    def test_rebuilds_the_vendors_answer_to_pullvideo(self):
+        # The camera's cmd 0x0002 is pullVideo -- the same command the
+        # app sends over the LAN. The vendor answers with the response
+        # bit set and a five-byte body, which is the camera's "go ahead".
+        captured = bytes.fromhex(
+            "8686800100110002000c313430393739383537373831" "0003000200" "99" "0d")
+        built = fake.vendor_pullvideo_answer("140979857781", 2)
+        self.assertEqual(built, captured)
+
+
+class CaptureComplianceTests(unittest.TestCase):
+    """The broker's answers must match the vendor's, field for field.
+
+    The app capture (PCAPdroid_29_ago._15_13_27.pcap) holds a live
+    session with the vendor: every request the app sent to
+    ipc.gps555.net:80 and the vendor's answer to each. The shapes and
+    the values are compared here, so the broker cannot drift from the
+    contract the app and the camera depend on.
+    """
+
+    CAPTURE = Path("/home/mauriciobc/Downloads/PCAPdroid_29_ago._15_13_27.pcap")
+    VENDOR = "120.26.121.165"
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.CAPTURE.exists():
+            raise unittest.SkipTest(f"capture not present: {cls.CAPTURE}")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "chk", Path(__file__).resolve().parents[1]
+            / "check_api_against_capture.py")
+        cls.chk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.chk)
+        pkts = cls.chk.pcap_streams(str(cls.CAPTURE))
+        cls.pairs = cls.chk.tcp_messages(pkts)
+
+    def _messages(self, stream):
+        buf = stream
+        out = []
+        while True:
+            head_end = buf.find(b"\r\n\r\n")
+            if head_end < 0:
+                break
+            head = buf[:head_end].decode("latin-1", "replace")
+            length = 0
+            for line in head.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":", 1)[1].strip())
+            total = head_end + 4 + length
+            if total > len(buf):
+                break
+            out.append((head, buf[head_end + 4:total]))
+            buf = buf[total:]
+        return out
+
+    def _captured(self, path):
+        """The vendor's answer to the first request of that path."""
+        for req, rsp in self.pairs:
+            for (head, _), (rhead, body) in zip(self._messages(req),
+                                                self._messages(rsp)):
+                parts = head.split("\r\n")[0].split()
+                if len(parts) < 2 or parts[1].split("?")[0] != path:
+                    continue
+                return rhead, body
+        return None, None
+
+    def test_the_capture_holds_the_vendor_session(self):
+        self.assertTrue(self.pairs, "no vendor HTTP traffic in the capture")
+
+    def test_the_device_list_shape_matches(self):
+        rhead, body = self._captured("/api/v1/ipc")
+        self.assertIsNotNone(body, "the capture has no device list")
+        vendor = json.loads(body)["data"]
+        api = fake.HttpApi()
+        api.add_camera("141030191094", "192.168.18.75", 53693)
+        answer = api.respond("GET", "/api/v1/ipc",
+                             "terminalFamilyId=3132031", b"")
+        broker = json.loads(answer.split(b"\r\n\r\n", 1)[1])["data"]
+        self.assertEqual(sorted(vendor.keys()), sorted(broker.keys()))
+        self.assertEqual(vendor["count"], broker["count"])
+        self.assertEqual(vendor["pageSize"], broker["pageSize"])
+
+    def test_the_device_record_has_the_vendors_fields(self):
+        rhead, body = self._captured("/api/v1/ipc/141030191094")
+        self.assertIsNotNone(body, "the capture has no device record")
+        vendor = json.loads(body)["data"]
+        api = fake.HttpApi()
+        api.add_camera("141030191094", "192.168.18.75", 53693)
+        broker = api._camera_row("141030191094")
+        missing = set(vendor) - set(broker)
+        self.assertEqual(missing, set(),
+                         f"the broker's record lacks {missing}")
+        extra = set(broker) - set(vendor)
+        self.assertEqual(extra, set(),
+                         f"the broker's record has extra {extra}")
+        # The values that are the camera's own state will differ; the
+        # contract is the field set and the types.
+        for key in vendor:
+            if key in ("startTime", "createdAt", "updatedAt", "commTime",
+                       "online_time", "remoteServiceEndTime", "power",
+                       "signal", "wifiSsid", "relay_ip", "server_ip"):
+                continue
+            self.assertEqual(type(vendor[key]), type(broker[key]),
+                             f"{key}: {vendor[key]!r} vs {broker[key]!r}")
+
+    def test_the_stun_answer_carries_the_camera_address(self):
+        rhead, body = self._captured("/api/v1/ipc/stun-addr/141030191094")
+        self.assertIsNotNone(body, "the capture has no stun-addr answer")
+        vendor = json.loads(body)["data"]
+        api = fake.HttpApi()
+        api.add_camera("141030191094", "192.168.18.75", 53693)
+        answer = api.respond("GET", "/api/v1/ipc/stun-addr/141030191094",
+                             "", b"")
+        broker = json.loads(answer.split(b"\r\n\r\n", 1)[1])["data"]
+        self.assertEqual(sorted(vendor.keys()), sorted(broker.keys()))
+        self.assertEqual(vendor["IpcPrivateIP"], broker["IpcPrivateIP"])
+        self.assertEqual(vendor["IpcPrivatePort"], broker["IpcPrivatePort"])
+
+    def test_the_trailing_slash_redirect_matches(self):
+        rhead, body = self._captured("/api/v1/ipc/")
+        self.assertIsNotNone(rhead, "the capture has no redirect")
+        self.assertIn("301", rhead.split("\r\n")[0])
+        location = [l.split(":", 1)[1].strip()
+                    for l in rhead.split("\r\n")
+                    if l.lower().startswith("location:")]
+        self.assertEqual(location, ["/api/v1/ipc?terminalFamilyId=3132031"])
+
+
+class KeepaliveTests(unittest.TestCase):
+    """The camera's session needs a message every couple of seconds.
+
+    The vendor keeps it alive with the pullVideo go-ahead; the broker
+    does the same, on its own timer: the camera goes quiet when it has
+    nothing to say, and a session that is not fed dies in about twelve
+    seconds.
+    """
+
+    def test_the_worker_feeds_a_silent_camera(self):
+        api = fake.HttpApi()
+        sent = []
+        api.camera_links["cam"] = _FakeSocket(sent)
+        api.viewers["cam"] = {"privateIp": "192.168.68.114",
+                              "privatePort": 5000}
+        api.last_seq["cam"] = 44
+        api.start_keepalive_worker(interval=0.05)
+        self.addCleanup(api.stop_keepalive_worker)
+        deadline = time.time() + 3
+        while not sent and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(sent, "the worker must feed a camera that is quiet")
+        api.stop_keepalive_worker()
+
+    def test_the_worker_stops(self):
+        api = fake.HttpApi()
+        thread = api.start_keepalive_worker(interval=0.05)
+        api.stop_keepalive_worker()
+        self.assertFalse(thread.is_alive())
+
+    def test_the_worker_does_not_feed_an_unknown_camera(self):
+        api = fake.HttpApi()
+        sent = []
+        api.camera_links["cam"] = _FakeSocket(sent)
+        api.start_keepalive_worker(interval=0.05)
+        self.addCleanup(api.stop_keepalive_worker)
+        time.sleep(0.2)
+        api.camera_links.clear()
+        before = len(sent)
+        time.sleep(0.2)
+        self.assertEqual(len(sent) - before, 0)
+
+    def test_the_first_keepalive_waits_a_full_interval(self):
+        api = fake.HttpApi()
+        # A camera that has just registered gets the full interval: the
+        # registration answer is the first message of the session.
+        self.assertFalse(api.keepalive_due("cam", now=1000.0))
+        self.assertFalse(api.keepalive_due("cam", now=1000.5))
+        self.assertTrue(api.keepalive_due("cam", now=1000.0 +
+                                          fake.KEEPALIVE_INTERVAL + 0.1))
+
+    def test_the_keepalive_is_periodic_not_per_frame(self):
+        api = fake.HttpApi()
+        api.keepalive_due("cam", now=1000.0)          # arms the timer
+        sent = []
+        # Two seconds of frames, 0.1s apart, crossing the interval.
+        for i in range(21):
+            now = 1000.0 + i * 0.1
+            if api.keepalive_due("cam", now=now):
+                sent.append(now)
+        self.assertEqual(len(sent), 1)
+        self.assertGreaterEqual(sent[0], 1000.0 + fake.KEEPALIVE_INTERVAL)
+
+    def test_the_keepalive_echoes_the_last_sequence_number(self):
+        api = fake.HttpApi()
+        api.last_seq["cam"] = 44
+        sent = []
+        api.camera_links["cam"] = _FakeSocket(sent)
+        api.viewers["cam"] = {"privateIp": "192.168.68.114",
+                              "privatePort": 5000}
+        api.keepalive("cam")
+        self.assertTrue(sent)
+        for frame in sent:
+            self.assertEqual(int.from_bytes(frame[6:8], "big"), 44)
+
+    def test_concurrent_sends_do_not_interleave(self):
+        """Two writers on one socket must not interleave their frames."""
+        api = fake.HttpApi()
+        sink = _FakeSocket([])
+        api.camera_links["cam"] = sink
+        errors = []
+
+        def writer(tag):
+            try:
+                for _ in range(50):
+                    api.send_to("cam", tag * 64)
+            except Exception as e:       # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(bytes([n]),))
+                   for n in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        # Every frame on the wire is one writer's, whole.
+        for frame in sink.sink:
+            self.assertEqual(len(frame), 64)
+            self.assertEqual(len(set(frame)), 1)
+
+    def test_a_send_without_a_connection_fails_cleanly(self):
+        api = fake.HttpApi()
+        self.assertFalse(api.send_to("nobody", b"hello"))
+
+
+
+
+class RelayTriggerTests(unittest.TestCase):
+    """Media starts with two frames, not a search.
+
+    The firmware made this exact: the registration answer (`0x8000`)
+    arms a UDP RTP target (the camera sendto's JPEG + PCMU there) and
+    an unsolicited `0x8005` -- empty body, `len` 12 -- sets the
+    relay-start flag it pushes from (`ziot-fw/SIGNALLING_PROTOCOL.md`
+    §5-§6). These tests pin the pair: the trigger's exact bytes, the
+    seq echo, the trigger being held until --relay-start (fired
+    unsolicited on 2026-10-24 it broke the handshake, so it is off by
+    default and flies once per arm), the keepalive carrying only the
+    validated go-ahead, and a camera with no connection being logged
+    rather than written to.
+    """
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+
+    UID = "140979857781"
+
+    def make(self, relay_start: bool = True):
+        api = fake.HttpApi(relay_start=relay_start)
+        api.camera_links[self.UID] = _FakeSocket([])
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 48666}
+        api.last_seq[self.UID] = 7
+        return api
+
+    def frames(self, api):
+        link = api.camera_links.get(self.UID)
+        return link.sink if link is not None else []
+
+    def triggers(self, api):
+        """The frames that carry the relay trigger."""
+        out = []
+        for frame in self.frames(api):
+            d = fake.decode_signalling(frame)
+            if int(d["cmd"], 16) == 0x8005:
+                out.append(d)
+        return out
+
+    def test_the_trigger_is_the_bare_frame_the_firmware_expects(self):
+        api = self.make()
+        self.assertTrue(api.push_relay_trigger(self.UID))
+        frames = self.frames(api)
+        self.assertEqual(len(frames), 1)
+        # 86 86 | 80 05 | len 000c | seq 0007 | uidLen 000c | uid | xor | 0d
+        self.assertEqual(len(frames[0]), 24)
+        self.assertEqual(frames[0][:5], b"\x86\x86\x80\x05\x00")
+        self.assertEqual(frames[0][-1:], b"\x0d")
+        d = fake.decode_signalling(frames[0])
+        self.assertEqual(d["cmd"], "0x8005")
+        self.assertEqual(d["len"], 12)          # the uid, and nothing else
+        self.assertEqual(d["seq"], 7)           # the camera's own counter
+        self.assertEqual(d["uid"], self.UID)
+        self.assertEqual(d["bytes"], 24)
+
+    def test_the_keepalive_carries_only_the_go_ahead(self):
+        # The trigger is NOT on the keepalive beat: firing it every two
+        # seconds put the camera into a reconnect loop and produced no
+        # media. It goes out on an explicit live-view press only.
+        api = self.make()
+        self.assertTrue(api.keepalive(self.UID))
+        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
+        self.assertEqual(cmds, ["0x8001"])
+        self.assertEqual(self.triggers(api), [])
+
+    def test_the_keepalive_feeds_the_session_without_a_viewer(self):
+        api = fake.HttpApi()
+        api.camera_links[self.UID] = _FakeSocket([])
+        api.last_seq[self.UID] = 3
+        self.assertTrue(api.keepalive(self.UID))
+        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
+        self.assertEqual(cmds, ["0x8001"])
+
+    def test_push_start_fires_the_trigger(self):
+        api = self.make()
+        api.push_start(self.UID)
+        self.assertEqual(len(self.triggers(api)), 1)
+        self.assertIn("relay-trigger", self.out.getvalue())
+
+    def test_push_start_with_no_connection_is_logged_not_sent(self):
+        api = self.make()
+        api.camera_links.clear()
+        api.push_start(self.UID)          # must not raise
+        self.assertEqual(self.triggers(api), [])
+        self.assertIn("not connected", self.out.getvalue())
+
+    def test_the_trigger_is_held_without_relay_start(self):
+        # Firing the unsolicited 0x8005 made the camera reconnect-loop
+        # live, so it is opt-in until a capture shows the media.
+        api = self.make(relay_start=False)
+        self.assertFalse(api.push_relay_trigger(self.UID))
+        self.assertEqual(self.triggers(api), [])
+        self.assertIn("--relay-start off", self.out.getvalue())
+
+    def test_a_trigger_needs_a_connection_to_fly(self):
+        api = self.make()
+        api.camera_links.clear()
+        self.assertFalse(api.push_relay_trigger(self.UID))
+        self.assertEqual(self.triggers(api), [])
+
+    def test_only_event_type_1_fires_a_push(self):
+        api = self.make()
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=20")
+        self.assertEqual(self.triggers(api), [])
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        self.assertEqual(len(self.triggers(api)), 1)
+
+
+class RelayTriggerTimingTests(unittest.TestCase):
+    """The delayed `0x8005` lands on a settled session or not at all.
+
+    Firing the trigger inside the handshake broke the camera's session
+    live (2026-10-24), so when --relay-start opts in, the fire waits
+    RELAY_START_DELAY_S and is only sent while the camera is still
+    connected; a camera that dropped during the wait is discarded, and
+    its next register schedules it again.
+    """
+
+    UID = "141030191094"
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+
+    def make(self, relay_start: bool = True):
+        api = fake.HttpApi(relay_start=relay_start)
+        api.camera_links[self.UID] = _FakeSocket([])
+        api.last_seq[self.UID] = 7
+        return api
+
+    def frame_cmds(self, api):
+        link = api.camera_links.get(self.UID)
+        if link is None:
+            return []
+        return [fake.decode_signalling(f)["cmd"] for f in link.sink]
+
+    def test_the_arm_schedules_one_fire_a_delay_out(self):
+        api = self.make()
+        api.schedule_relay_trigger(self.UID)
+        self.assertIn(self.UID, api.relay_trigger_at)
+        # Nothing flies while it is not yet due.
+        self.assertEqual(api.serve_due_relay_triggers(), 0)
+        self.assertEqual(self.frame_cmds(api), [])
+
+    def test_a_due_fire_flies_exactly_once(self):
+        api = self.make()
+        api.schedule_relay_trigger(self.UID)
+        late = time.monotonic() + fake.RELAY_START_DELAY_S + 1
+        self.assertEqual(api.serve_due_relay_triggers(late), 1)
+        self.assertEqual(self.frame_cmds(api), ["0x8005"])
+        self.assertFalse(api.relay_trigger_at)      # one pending, no more
+        self.assertEqual(api.serve_due_relay_triggers(late), 0)
+
+    def test_a_fire_for_a_dropped_camera_is_discarded(self):
+        api = self.make()
+        api.schedule_relay_trigger(self.UID)
+        api.camera_links.clear()
+        late = time.monotonic() + fake.RELAY_START_DELAY_S + 1
+        self.assertEqual(api.serve_due_relay_triggers(late), 0)
+        self.assertFalse(api.relay_trigger_at)
+        self.assertIn("not connected", self.out.getvalue())
+
+    def test_a_second_arm_does_not_crowd_out_the_first_fire(self):
+        api = self.make()
+        api.schedule_relay_trigger(self.UID)
+        api.schedule_relay_trigger(self.UID)   # next register, still pending
+        self.assertEqual(len(api.relay_trigger_at), 1)
+
+    def test_scheduling_is_a_noop_without_relay_start(self):
+        api = self.make(relay_start=False)
+        api.schedule_relay_trigger(self.UID)
+        self.assertFalse(api.relay_trigger_at)
+
+
+class ArmTargetTests(unittest.TestCase):
+    """The registration answer must arm a UDP RTP sink, not an RTSP server.
+
+    The camera never speaks RTSP on this leg (no ANNOUNCE/RECORD exists in
+    the firmware): after `0x8005` it opens a UDP socket and sendto's its
+    RTP to the armed ip:port. So the armed target has to be the socket
+    that actually reads those datagrams -- the bridge's own media socket
+    -- and not `ziot_relay.py`, which waits for an ANNOUNCE that never
+    comes.
+    """
+
+    UID = "141030191094"
+
+    def test_the_viewer_socket_wins_over_the_configured_relay(self):
+        viewer = {"privateIp": "192.168.68.114", "privatePort": 58918}
+        self.assertEqual(
+            fake.arm_target(viewer, "192.168.68.114", 8554, "192.168.68.114"),
+            ("192.168.68.114", 58918))
+
+    def test_the_registration_answer_carries_the_viewer_port_in_both_slots(self):
+        api = fake.HttpApi()                       # no --relay-port
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 58918}
+        srv = fake.StreamServer(("127.0.0.1", 0), "sig", api,
+                                "192.168.68.114", "192.168.68.114", 0, 0)
+        self.addCleanup(srv.server_close)
+        handler = fake.StreamHandler.__new__(fake.StreamHandler)
+        handler.server = srv
+        frame, target = handler._vendor_answer(self.UID, 1,
+                                               "192.168.68.108", api)
+        self.assertEqual(target, ("192.168.68.114", 58918))
+        cmd, length, seq, uid_len = struct.unpack_from(">HHHH", frame, 2)
+        self.assertEqual(cmd, 0x8000)
+        body = frame[10 + uid_len:10 + uid_len + length]
+        # The camera's dispatcher reads offset 0x18; both slots agree.
+        self.assertEqual(struct.unpack_from(">H", body, 0x16)[0], 58918)
+        self.assertEqual(struct.unpack_from(">H", body, 0x18)[0], 58918)
+        self.assertEqual(body[2:22].rstrip(b"\x00"), b"192.168.68.114")
+
+    def test_with_nothing_known_the_register_is_still_answered(self):
+        # An unanswered register retransmits forever, so the answer must
+        # exist even with no viewer and no relay: it arms this host.
+        self.assertEqual(
+            fake.arm_target({}, "192.168.68.114", 0, "192.168.68.114"),
+            ("192.168.68.114", 0))
+
+
+class CameraLinkTests(unittest.TestCase):
+    """camera_links maps a uid to the very socket the camera is on.
+
+    A link left behind after its socket closed is what made 22 pushes
+    end `Bad file descriptor` in one morning: the handler's finish()
+    drops them now, and only the ones bound to the socket that died.
+    """
+
+    UID = "140979857781"
+
+    def serve(self):
+        api = fake.HttpApi()
+        srv = fake.serve("sig", ("127.0.0.1", 0), api)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return api, srv.server_address[1]
+
+    def link(self, port):
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        s.sendall(fake.signalling_frame(0x0001, 1, self.UID.encode(), b"reg"))
+        return s
+
+    def test_a_closed_camera_connection_is_forgotten(self):
+        api, port = self.serve()
+        s = self.link(port)
+        deadline = time.time() + 3
+        while not api.camera_links and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertIn(self.UID, api.camera_links)
+        s.close()
+        deadline = time.time() + 3
+        while api.camera_links and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(api.camera_links, {}, "the dead link survives")
+
+    def test_a_replaced_connection_survives_the_old_close(self):
+        """A camera that reconnects must not lose its new link when the
+        old socket's handler is still unwinding."""
+        api, port = self.serve()
+        old = self.link(port)
+        deadline = time.time() + 3
+        while self.UID not in api.camera_links and time.time() < deadline:
+            time.sleep(0.02)
+        # The dict holds the server-side accepted socket, not our client
+        # end, so the swap is observed through the dict rather than by
+        # comparing against `old`/`new`.
+        first = api.camera_links[self.UID]
+        new = self.link(port)
+        deadline = time.time() + 3
+        while api.camera_links.get(self.UID) is first and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertIsNot(api.camera_links.get(self.UID), first,
+                         "the reconnect never replaced the link")
+        second = api.camera_links[self.UID]
+        old.close()                      # the OLD socket goes away
+        # Give the old handler time to unwind through finish(): it must
+        # not drop the link the reconnect installed.
+        time.sleep(0.3)
+        self.assertIn(self.UID, api.camera_links, "the new link was dropped")
+        self.assertIs(api.camera_links.get(self.UID), second)
+        new.close()
+
+
+class IdleWindowTests(unittest.TestCase):
+    """The sig connection must outlive the camera's silent wait.
+
+    A camera holds its connection 40-90 s without saying a word while
+    it waits for the server push; the old flat 10 s timeout closed it
+    underneath every push. The windows are pinned so the constants
+    cannot drift away from the camera's measured cycle.
+    """
+
+    UID = "141030191094"
+
+    def test_the_idle_windows_match_the_measured_cycle(self):
+        # 75 s: just over the longest observed silent gap; 2 s: the
+        # keepalive beat, same as the vendor's.
+        self.assertEqual(fake.STREAM_IDLE_S, 75.0)
+        self.assertEqual(fake.KEEPALIVE_INTERVAL, 2.0)
+
+    def test_a_sig_connection_idles_out_and_drops_its_link(self):
+        old = fake.STREAM_IDLE_S
+        fake.STREAM_IDLE_S = 0.25
+        self.addCleanup(setattr, fake, "STREAM_IDLE_S", old)
+        api = fake.HttpApi()
+        srv = fake.serve("sig", ("127.0.0.1", 0), api)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        port = srv.server_address[1]
+        s = socket.create_connection(("127.0.0.1", port), timeout=3)
+        s.sendall(fake.signalling_frame(0x0001, 1, self.UID.encode(), b"reg"))
+        # The connection says nothing more: after the idle window the
+        # handler gives it back, and the link goes with it.
+        seen = False
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if api.camera_links:
+                seen = True
+            if seen and not api.camera_links:
+                break
+            time.sleep(0.02)
+        self.assertTrue(seen, "the camera was never linked")
+        self.assertFalse(api.camera_links,
+                         "the idle connection was never closed")
+        s.close()
+
+
+class TokenWarnTests(unittest.TestCase):
+    """A token the broker did not mint is noticed, once, not enforced:
+    enforcing it would put the bridge into its dead-end 401 path."""
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+        self.addCleanup(fake._warned_tokens.clear)
+
+    def test_a_foreign_token_is_logged_once(self):
+        fake._warned_tokens.clear()
+        api = fake.HttpApi()
+        api.respond("GET", "/api/v1/ipc", token="vendor.jwt.rest")
+        api.respond("GET", "/api/v1/ipc", token="vendor.jwt.rest")
+        self.assertEqual(
+            self.out.getvalue().count("not issued by this broker"), 1)
+
+    def test_a_locally_minted_token_is_not_logged(self):
+        fake._warned_tokens.clear()
+        api = fake.HttpApi()
+        api.respond("GET", "/api/v1/ipc", token=fake.mint_local_token())
+        self.assertNotIn("not issued by this broker", self.out.getvalue())
+
+    def test_no_token_logs_nothing(self):
+        fake._warned_tokens.clear()
+        api = fake.HttpApi()
+        api.respond("GET", "/api/v1/ipc")
+        self.assertNotIn("not issued by this broker", self.out.getvalue())
+
+
+
+
+class LocalTokenTests(unittest.TestCase):
+    """The local cloud issues its own token, in the vendor's shape."""
+
+    def test_the_minted_token_is_accepted(self):
+        token = fake.mint_local_token()
+        self.assertTrue(fake.local_token_valid(token))
+        self.assertEqual(token.count("."), 2)
+
+    def test_the_minted_token_carries_the_vendors_claims(self):
+        import base64
+        token = fake.mint_local_token()
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(
+            payload + "=" * (-len(payload) % 4)))
+        # The same claims the vendor's token has (read from a live one).
+        for key in ("email", "exp", "family_id", "lang", "orig_iat",
+                    "role_id", "user_id", "username"):
+            self.assertIn(key, claims)
+
+    def test_a_token_with_a_broken_signature_is_rejected(self):
+        token = fake.mint_local_token()
+        head, payload, _ = token.split(".")
+        self.assertFalse(fake.local_token_valid(f"{head}.{payload}.AAAA"))
+        self.assertFalse(fake.local_token_valid("not-a-token"))
+
+
+class _FakeSocket:
+    """A stand-in for a camera's signalling connection."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def sendall(self, data):
+        self.sink.append(data)
 
 
 class StunTests(unittest.TestCase):
@@ -392,7 +1158,7 @@ class VendorConformanceTests(unittest.TestCase):
         "sdPolicy", "infraredLight", "lampLight", "vflip", "hflip", "led",
         "mediaState", "ringing", "ringingTime", "charged",
         "isShowRemoteService", "isRemoteServiceExpired",
-        "remoteServiceEndTime", "unReadEventCount",
+        "remoteServiceEndTime", "showAd", "unReadEventCount",
     ]
 
     def setUp(self):

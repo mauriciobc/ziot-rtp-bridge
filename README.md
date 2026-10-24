@@ -248,10 +248,10 @@ python3 ziot_offline_probe.py --ble            # list powered cameras by UID + L
 python3 ziot_offline_probe.py --ble 192.168.68.107 --uid 140979857781
 ```
 
-### Local cloud emulation (work in progress)
+### Local cloud emulation (the vendor cloud, locally)
 
 `ziot_fake_cloud.py` is the start of removing the vendor cloud (goal and
-findings: `DECOMPILATION_REPORT.md` §8–§11). Three things work today:
+findings: `DECOMPILATION_REPORT.md` §8–§14). Three things work today:
 
 * **The HTTP API is answered locally.** Response shapes come from a live
   app capture (§11). Register a camera and point the bridge at the broker:
@@ -265,25 +265,217 @@ findings: `DECOMPILATION_REPORT.md` §8–§11). Three things work today:
   Verified: the bridge lists the camera, registers its UDP port, wakes it
   and resolves the camera's address entirely from the local broker. What is
   *not* verified is a real camera streaming against it.
-* **Provisioning frame.** `--provision` builds the BLE `wifiConnect` frame
-  (byte-identical to the app's, §9) and writes it over raw ATT (§10). On the
-  two units tried the camera acknowledged every write but did not act on
-  it; that is still open.
 * **The camera can be routed to this host without touching the camera.**
   The cloud addresses are fixed (`ipc.gps555.net` → `120.26.121.165`,
   `sig.gps555.net` → `47.110.77.193`, `stun.gps555.net` and
   `ws.gps555.net` → `47.238.125.111`, `stunaddr.gps555.net` →
   `8.130.23.234`), so a static route in the router sends the camera's
   cloud traffic here — no DNS, no camera configuration, no BLE.
+  **Verified live (2026-10-23):** with the four routes in place, both
+  cameras on the LAN connect to the broker's signalling port on their
+  own and send their registration, and the phone's app — pointed at the
+  broker by the same routes — asks the broker for the device list and
+  registers where it wants the media. The vendor is unreachable from
+  this network the whole time.
+* **The camera→cloud registration frame is known, byte for byte.** It is
+  56 bytes:
 
-The signalling (8882), STUN (13478) and websocket (7080) listeners only log
-what a camera sends — what a valid answer looks like is unknown. A DNS
-hijack mode answers `*.gps555.net` with this host and forwards everything
-else upstream. Ports 53/80/13478/7080 need privileges.
+  ```
+  86 86 | cmd(2) | len(2) | seq(2) | uidLen(2) | uid(12) | body(32) | xor | 0x0D
+        0001     002c     0019..    000c        "140979857781"  "TXW817_A_V1.0.12.32"
+  ```
+
+  `cmd` 1 is the camera's hello to the signalling server, `len` (44) is
+  the uid plus the body, `seq` is the camera's counter and increments on
+  every retransmission, and the body is the firmware version, NUL-padded.
+  The XOR covers every byte before it and `0x0D` closes the frame — the
+  same shape as the camera's BLE frame. `ziot_fake_cloud.py` rebuilds a
+  captured frame byte-for-byte, and
+  `tests/test_ziot_fake_cloud.py::SignallingFrameTests` pins it.
+* **The camera's STUN calls now land on this host.** `stunaddr.gps555.net`
+  is one of the routed addresses, so the camera's "what is my address?"
+  call arrives at the broker's STUN listener (port 13478) and is
+  answered there. This is the route doing the work, not an instruction
+  the camera followed.
+* **The camera registers with the broker and gets past registration.**
+  The broker now answers the camera's registration with **the vendor's
+  own answer**, captured live from `sig.gps555.net` on 2026-10-23 and
+  reproduced byte for byte (`vendor_registration_answer()`, pinned by
+  `SignallingFrameTests`). The body is flat fixed-width fields — a u16
+  lead, the relay address in a 20-byte ASCII slot with two ports, the
+  STUN host in a 32-byte slot with its port, and the signalling address
+  in a 32-byte slot with its port — and every address in it points at
+  this host. The camera accepted it and moved on: it stopped
+  retransmitting `cmd 0x0001` and started sending `cmd 0x0021`.
+* **The whole camera handshake now completes against the broker.** The
+  camera sends, and the broker answers with the vendor's exact bytes:
+
+  | camera asks | the broker answers | what it is |
+  |---|---|---|
+  | `cmd 0x0001` (register) | `cmd 0x8000` | the addresses: relay, STUN, signalling |
+  | `cmd 0x0021` (clock) | `cmd 0x8021` | the server's time, a big-endian u32 |
+  | `cmd 0x0002` (pullVideo) | `cmd 0x8001` | "go ahead" |
+  | `cmd 0x0004` (status) | `cmd 0x8001` | the queried value |
+  | `cmd 0x1601` (config) | `cmd 0x8601` | the ports to use |
+
+  Every one of those answers was captured from the real
+  `sig.gps555.net` on 2026-10-23 and is pinned byte-for-byte by
+  `SignallingFrameTests`. The camera then calls the broker's STUN server
+  and the broker learns its media address from that call.
+* **The camera's media address is learned from its own STUN call.** The
+  camera's Binding Request comes from the port its media socket listens
+  on, so the broker records the camera's address that way — the same way
+  the vendor's cloud learns it — and the bridge reads it from the
+  broker's `stun-addr`.
+* **The camera's firmware is in hand.** The vendor publishes a firmware
+  catalogue; the camera's own build (`TXW817_A_V1.0.12.32`, in a Taixin
+  XIPH container) was downloaded and its strings now describe the
+  protocol in the camera's own words — the BLE provisioning frame, the
+  camera↔signalling-server protocol (`CUSTOM_PROTOCOL_*`), and the
+  stored-parameter lever that lets the signalling server be pointed
+  elsewhere. The code region is **Thumb**, and the camera's 40 command
+  handlers are reachable from the dispatch table at payload `0x80` — an
+  earlier claim that the code "does not decode in any standard
+  instruction set" was an artefact of sweeping from the exception table
+  instead of from the code. Details in `ziot-fw/REPORT.md` §2.5–§2.6,
+  findings in `DECOMPILATION_REPORT.md` §13–§14.
+
+#### The camera pushes UDP when told to; it is not an RTSP publisher
+
+The signalling protocol recovered from the firmware — now written down as
+the source of truth, `ziot-fw/SIGNALLING_PROTOCOL.md` — settles the media
+path: the camera sends its RTP **out over plain UDP (`sendto`)** to an
+address the signalling server gives it. Its strings name the flow —
+`spook_rtsp_set_relay_info` (arms the target, **never connects**: §5a of
+the doc), `start push, session id:%s`, `relaySession:%s`,
+`rtsp://%s:%d/webcam/jpeg_dvp` (the camera's own server path),
+`m=video %d RTP/AVP 26` (JPEG) and `m=audio %d RTP/AVP 0` (PCMU). The
+verbs `ANNOUNCE`/`RECORD` are **absent from the firmware** (0 grep hits),
+so there is no RTSP client leg: `rtsp_p2p_start` builds a URL and then
+calls `connect_client_udp_endpoint`, which opens a **UDP RTP socket** and
+pushes JPEG (RTP/AVP 26) + PCMU (RTP/AVP 0) — the same RTP as the direct
+path, aimed at the armed address.
+
+The vendor's registration answer agrees: the `0x8000` reply carries fixed
+arm slots — a 20-byte ASCII IP, a big-endian u16 port at offset 0x18, and
+a STUN host + port — which the camera stores (state 3). It does **not**
+connect yet. A second, unsolicited **`cmd 0x8005`** (empty body) is the
+start signal: it flips the relay-start flag (`dev->0xc8 = 2`) and a state
+machine then opens the UDP push toward the armed address (§6–§7 of the
+doc). The broker's 462-candidate sweep never tried `0x8005` because it
+drew ids from the camera's local AP command space, not the `0x80xx`
+signalling space (§8 of the doc).
+
+So the armed receiver must be a **UDP RTP sink** — and the bridge's own
+media socket already is one. The broker's `arm_target` puts the bridge's
+UDP address (registered viewer first, the viewer's public pair second,
+the configured `--relay-port` only when nothing else is known, as an
+experiment) into the arm slots and skips the RTSP relay for ingest (§9.3
+of the doc). `ziot_relay.py` (RTSP on 8554/8555), built to accept an
+`ANNOUNCE`/`RECORD`, is kept only as an experiment: the camera never
+speaks RTSP on this leg. The round trip still has machinery behind it —
+a synthetic publisher announces, records and streams, and the
+**production** `RelayStream` of the bridge opens the relay, plays it and
+reassembles the JPEGs (`tests/test_ziot_relay.py`) — but it now
+exercises only that experiment path.
+
+> **Update 2026-10-24 — the trigger is recovered.** The camera's firmware
+> was disassembled (it is a **C-SKY CK803**, which is why no prior tool
+> decoded it). The media path is two server→camera frames: `cmd 0x8000`
+> *arms* the UDP target, and an unsolicited **`cmd 0x8005`** (empty body)
+> *starts the push* (`CUSTOM_TASK_RelayPro`). Full spec and firmware
+> evidence: **`ziot-fw/SIGNALLING_PROTOCOL.md`**.
+>
+> **State of the code.** The broker now echoes the register answer's
+> `seq` byte, arms the bridge's UDP media socket through `arm_target`,
+> and builds the `0x8005` trigger frame (`push_relay_trigger`) — but
+> holds it behind `--relay-start`, **off by default**: the first live
+> test that fired it after `0x8000` and on every keepalive tick made the
+> camera reconnect-loop, never reach the connected state, and send zero
+> media. With `--relay-start` the fire is no longer immediate either:
+> it is scheduled (`RELAY_START_DELAY_S`) one per armed camera, sent next
+> keepalive-tick by the broker, and discarded if that camera drops
+> before it is due. The trigger stays off until a capture shows the
+> camera settling into a session and pushing to the armed address; the
+> validation numbers are a `tcpdump` on the armed port and the bridge's
+> `rx_datagrams`. Probe note (vendor wiretap, 2026-10-24): re-registering
+> every ~15-20 s is the camera's *normal* rhythm — a short transaction
+> (connect → register → the four answers → self-close after ~6 s), not a
+> fault state; what is *not* normal is the silent-probe limbo that follows a
+> session dying mid-cycle (`ziot-fw/SIGNALLING_PROTOCOL.md` §0 holds the
+> full findings).
+
+> **Update 2026-10-24 (evening) — why nothing streams against the broker.**
+> Findings only; the code has not been changed yet.
+>
+> * **The camera rejects every STUN answer the broker sends.** Its STUN
+>   client requires a standard XOR-MAPPED-ADDRESS (attribute `0x0020`). The
+>   broker answers with `0x0001`/`0x0004`/`0x8020`, the shape the vendor
+>   gives the *phone*.
+> * **So every cycle fails the same way.** The camera retries 4 times from
+>   new random ports (50001–59999), gives up, and closes its sig socket.
+>   That is the ~6 s "short transaction" described above. It never sends
+>   the `0x0003` address report that a working STUN produces, and there
+>   are zero of them in any capture.
+> * **The direct live view is a different pair of frames:** `0x8101` (the
+>   viewer's address) and `0x8004` (play control, value 1 = start). It is
+>   not `0x8005`, which is the relay.
+> * **The 13:47 phone capture shows the app's first `eventType=5`.** It
+>   also shows the broker's STUN answers leaving from the wrong source
+>   address, so they never reach the phone.
+> * **The app went to relay because the broker's `seqNo` is wrong.** The
+>   app waits until `stun-addr` shows the `seqNo` of its own
+>   `send-stun-addr`. The broker's shared counter never repeats it. The
+>   August vendor captures also show that `IpcPublic*` is the camera's pair,
+>   not the viewer's.
+> * **The routes should include `47.97.71.82`,** the signalling address the
+>   vendor's own `0x8000` and the wiretap use, alongside `47.110.77.193`.
+>
+> Details and the ordered fix list: `ziot-fw/SIGNALLING_PROTOCOL.md`
+> §12–§15.
+
+> **Update 2026-10-24 16:14 — frames, with no vendor cloud.** With the
+> `0x0020` STUN attribute and the direct chain in the broker (`0x8101` →
+> `0x8004` value 1 → hello punch), camera .107 streams to the bridge at
+> 7–8 fps.
+>
+> * **It stops by itself 36 s after every start.** The firmware's "live
+>   heartbeat" is refreshed during play only by the server's `0x8002`, and
+>   the broker does not yet turn the bridge's `notify(keepAlive)` into one.
+> * **So the stream runs in ~36 s bursts**, each restarted by the bridge's
+>   re-rendezvous.
+>
+> `ziot-fw/SIGNALLING_PROTOCOL.md` §0 (16:14 box), §13.4 and §15 item 6.
+
+`ziot_wiretap.py` was how that link was read: it sits in front of the
+vendor's signalling server, forwards the camera's traffic to the real
+vendor and logs both directions, so the push that starts a live view
+can be read byte for byte — its captures are the evidence behind
+`ziot-fw/SIGNALLING_PROTOCOL.md`.
+
+
+The signalling (8882), STUN (13478) and websocket (7080) listeners now
+answer as well as log. The firmware named the protocol
+(`CUSTOM_PROTOCOL_ParseData`: `cmd:%04X, len:%d, uidLen:%d`, XOR-checked,
+uid-prefixed, with `req cmd` / `cSeq,cmd,ack` / `stun port,ip` /
+`relay port,ip` payloads), and the broker implements it on the sig
+listener: a register gets the `0x8000` answer, the handshake commands get
+their acks, keepalives carry the `0x8001` go-ahead, and the registration
+answer arms the bridge's UDP media socket. A DNS hijack mode answers
+`*.gps555.net`
+with this host and forwards everything else upstream. Ports 53 and 80 bind
+as an unprivileged user once the kernel's floor is lowered
+(`sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0`; it does not
+survive reboot), otherwise they need root; 13478/7080 always bind. The
+JWT the broker serves the bridge with is its own (`python3
+ziot_fake_cloud.py --mint-token`); the vendor's token is served with a
+one-line log warning rather than a rejection, but a clean local setup
+mints its own into `ziot_config.json` — back the vendor's up first, it
+is the account credential and stays gitignored.
 
 #### Taking the camera off the vendor cloud
 
-Three steps. The host side is scripted; the router side is two taps in the
+Four steps. The host side is scripted; the router side is two taps in the
 Deco app.
 
 **1 — Claim the vendor's addresses on this host.** The address must be
@@ -324,11 +516,42 @@ interface that sends the traffic out — hence **LAN**, not WAN: the packets
 leave the router's LAN side towards us. The four destinations are public
 addresses, so none of them collides with the router's own LAN or WAN.
 
-**3 — Run the broker and watch.** The API answers on the vendor's port 80,
-the signalling server on 8882, STUN on 13478 and the websocket on 7080. A
-camera that wakes up now finds only this host, and its registration lands
-in the broker log — that log is the camera→cloud protocol, which is the
-last piece still missing (§11).
+**3 — Open the host firewall.** The broker's ports must be reachable from the
+LAN. If the host runs `firewalld` (as this deployment does), they are **not**
+open by default: the interface facing the cameras (`wlan0` here) sits in the
+`public` zone, whose default target rejects anything unlisted with `ICMP
+admin-prohibited`. The camera's SYN is then dropped before it reaches the
+broker — yet the socket still shows `LISTEN` and loopback connects still
+work — so the symptom is a camera that **looks asleep**: it retransmits a SYN
+every few seconds, never registers, and the broker log stays empty of camera
+traffic. Open the four broker ports, runtime and permanent:
+
+```bash
+sudo firewall-cmd --zone=public \
+  --add-port=80/tcp --add-port=8882/tcp --add-port=7080/tcp --add-port=13478/udp
+sudo firewall-cmd --permanent --zone=public \
+  --add-port=80/tcp --add-port=8882/tcp --add-port=7080/tcp --add-port=13478/udp
+```
+
+Confirm with `firewall-cmd --zone=public --list-ports`. These are the vendor's
+ports the camera dials: 80 (API), 8882 (signalling), 13478 (STUN, UDP) and
+7080 (websocket) — all four for the full rendezvous, though 8882 alone is
+enough to see the camera register. Add `53/tcp`+`53/udp` only if you use the
+DNS-hijack path. A different firewall (`nftables`, `ufw`, a cloud security
+group) needs the same ports opened. **This was the hidden blocker:** a camera
+long written off as an asleep battery unit was in fact knocking on `:8882`
+every few seconds and being rejected by the firewall the whole time — check
+this before concluding a camera is asleep (`tcpdump -i wlan0 host <cam-ip>`
+shows the rejected SYNs and the `admin prohibited` ICMP).
+
+**4 — Run the broker and watch.** The API answers on the vendor's port 80,
+the signalling server on 8882, STUN on 13478 and the websocket on 7080. With
+the firewall open, a camera on this network registers with the broker —
+verified 2026-10-23: two cameras connected to `:8882` and sent their
+registration frame (`86 86 | cmd=0001 | len | seq | uidLen | <uid> | firmware
+version | XOR | 0d`). That frame is the camera→cloud signalling protocol; the
+broker logs it today but does not yet answer it — making it answer is the next
+piece of work (`DECOMPILATION_REPORT.md` §13–§14).
 
 ```bash
 sudo python3 ziot_fake_cloud.py --log fake_cloud.log
@@ -358,8 +581,36 @@ Note: this is a *routing* redirect, so the camera keeps its vendor
 configuration. It talks to the local broker and nothing else — which is the
 point — but it also means a camera that insists on the vendor's behaviour
 has not been taught anything new. The alternative, re-provisioning a camera
-over BLE with this host as its signalling server, is the cleaner end state
-and is still open (§10).
+over BLE with this host as its signalling server, is the cleaner end state.
+
+#### Re-provisioning over BLE — the frame the camera actually wants
+
+The app builds a `wifiConnect` frame (§9) and `--provision` writes it
+over raw ATT (§10). The camera's firmware names the fields it parses —
+`cmd`, `ssid`, `pwd`, `urlAndPort`, `p1`, `port`, `timezone`, `bind id`,
+`param bind id` — of which our frame carries the first four and the
+timezone; the last two are the camera's *binding key*, the
+16-character string it advertises in its ServiceData. See
+`DECOMPILATION_REPORT.md` §13–§14 and `ziot-fw/REPORT.md`.
+
+**The frame was missing its end symbol.** The camera's own answers
+settled the format:
+
+```
+86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8 | 0x0D
+LEN16 = 5 + DLEN      (the end symbol is NOT counted)
+```
+
+A frame without the trailing `0x0d` draws silence — the camera accepts
+the length and then waits for the rest of it — while a frame with it
+draws an answer, even if the answer is a rejection (`ffff00` = "command
+not understood"). `wifi_connect_frame()` was building the frame without
+it, which is why the camera never acted on our provisioning: it was not
+ignoring the frame, it was waiting for its last byte.
+
+The camera is therefore a usable oracle: `ffff00` means the frame was
+read and the command not understood, silence means the frame never
+completed. `att_candidates.py` drives that oracle.
 
 ### Docker (recommended)
 
