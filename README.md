@@ -446,6 +446,12 @@ exercises only that experiment path.
 >   re-rendezvous.
 >
 > `ziot-fw/SIGNALLING_PROTOCOL.md` §0 (16:14 box), §13.4 and §15 item 6.
+>
+> **Fixed on `frigate-continuous-stream`, not yet validated live.** The
+> broker now forwards each `eventType=0` keepAlive to the camera as
+> `0x8002`, so a live view lasts as long as its viewer keeps sending
+> keepAlives. The live check: the camera's `0x0002` shows up on sig about
+> every 10 s, and no `0x0004` value 0 follows 36 s after a value 1.
 
 `ziot_wiretap.py` was how that link was read: it sits in front of the
 vendor's signalling server, forwards the camera's traffic to the real
@@ -700,6 +706,7 @@ should come back up rather than sit dead.
       "streaming": true,
       "fps": 6.5,
       "frames_total": 1234,
+      "frames_dropped": 3,
       "audio_pkts": 5678,
       "rx_datagrams": 9012,
       "rx_errors": 0,
@@ -731,7 +738,11 @@ from the app's /24 rule, or `static-lan` when `--offline` pins the
 configured IP and takes only the STUN private port. `re_rendezvous_count`
 and `backoff_s` are the recovery loop. `foreign_ssrc` counts datagrams
 dropped for carrying another camera's SSRC, `rx_errors` counts packets
-whose handling raised.
+whose handling raised. `frames_dropped` counts frames whose first or middle
+packet never arrived. They are held back rather than served broken,
+because a JPEG joined around a hole decodes with smeared blocks that
+Frigate's motion detector reads as motion. A few per thousand is normal
+Wi-Fi loss; a share in the percent range points at the camera's signal.
 
 `rx_datagrams` counts every datagram that arrived on the direct socket, before
 any filtering. It is the one number that separates *"the camera is silent"*
@@ -948,6 +959,17 @@ camera's JPEG, no transcode. You can verify by checking
 **ffmpeg logs `overread 8`.**
 Cosmetic. The camera's entropy data has a few trailing bytes ffmpeg's MJPEG
 decoder is strict about; every frame still decodes.
+
+**ffmpeg logs `bad vlc` or `error count: …`.**
+That is a frame with a missing packet. Bridges before
+`frames_dropped` existed joined the frame around the hole and served it
+broken. The current bridge drops it instead and counts it in `/health`.
+
+**Video plays at a third of real speed when ffmpeg reads `/cam/<uid>`
+directly.**
+Multipart MJPEG carries no timestamps, so ffmpeg assumes 25 fps against the
+camera's ~8. Read it through the shipped go2rtc config, which is the tested
+path, or give ffmpeg `-use_wallclock_as_timestamps 1`.
 
 **Colors look washed out / tinted.**
 The sensor, not the decoder. The camera's chroma quantization table is pinned

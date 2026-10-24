@@ -168,6 +168,83 @@ class DirectPacketTests(unittest.TestCase):
         self.assertTrue(emitted[0].startswith(b"\xff\xd8"))
         self.assertTrue(emitted[0].endswith(b"\xff\xd9"))
 
+    def frame_packets(self, ts, chunks):
+        """One frame as the camera's packetizer sends it: each offset is
+        the byte position of its data, the tables ride the first packet
+        and the marker the last."""
+        pkts, off = [], 0
+        for i, chunk in enumerate(chunks):
+            payload = jpeg_payload(
+                frag_off=off, q=128 if off == 0 else 0,
+                quant=b"\x10" * 64 if off == 0 else None, data=chunk)
+            pkts.append(rtp_packet(26, payload, ts=ts,
+                                   marker=i == len(chunks) - 1))
+            off += len(chunk)
+        return pkts
+
+    def test_a_frame_missing_a_middle_packet_is_dropped_not_emitted(self):
+        # Joining around a lost packet made JPEGs ffmpeg decodes with
+        # "bad vlc" -- smeared blocks Frigate reads as motion.
+        emitted, dropped = [], []
+        asm = bridge.RtpJpegReassembler(emitted.append,
+                                        lambda: dropped.append(1))
+        first, _lost, last = self.frame_packets(33, [b"AA", b"BB", b"CC"])
+        self.assertTrue(asm.feed(first))
+        self.assertTrue(asm.feed(last))
+        self.assertEqual(emitted, [])
+        self.assertEqual(dropped, [1])
+        # Nothing of the broken frame lingers.
+        self.assertEqual(asm._frags, {})
+        self.assertEqual(asm._meta, {})
+
+    def test_a_frame_missing_its_first_packet_is_dropped(self):
+        emitted, dropped = [], []
+        asm = bridge.RtpJpegReassembler(emitted.append,
+                                        lambda: dropped.append(1))
+        _lost, second, last = self.frame_packets(34, [b"AA", b"BB", b"CC"])
+        asm.feed(second)
+        asm.feed(last)
+        self.assertEqual(emitted, [])
+        self.assertEqual(dropped, [1])
+        self.assertEqual(asm._frags, {})
+
+    def test_a_whole_frame_out_of_order_emits_in_offset_order(self):
+        emitted, dropped = [], []
+        asm = bridge.RtpJpegReassembler(emitted.append,
+                                        lambda: dropped.append(1))
+        first, middle, last = self.frame_packets(35, [b"AA", b"BB", b"CC"])
+        for pkt in (middle, first, last):
+            asm.feed(pkt)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(emitted[0].endswith(b"AABBCC\xff\xd9"))
+
+    def test_the_receive_loop_counts_dropped_frames(self):
+        rx = bind_loopback()
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.bind(("127.0.0.1", 0))
+        self.addCleanup(rx.close)
+        self.addCleanup(tx.close)
+        cam = make_camera()
+        cam.sock = rx
+        cam.addr = ("127.0.0.1", tx.getsockname()[1])
+        broken = self.frame_packets(36, [b"AA", b"BB", b"CC"])
+        del broken[1]
+        whole = self.frame_packets(37, [b"DD", b"EE"])
+        worker = threading.Thread(target=cam._receive, daemon=True)
+        worker.start()
+        try:
+            with cam.video.subscribe() as q:
+                for pkt in broken + whole:
+                    tx.sendto(pkt, ("127.0.0.1", rx.getsockname()[1]))
+                self.assertTrue(q.get(timeout=5).endswith(b"DDEE\xff\xd9"))
+            self.assertEqual(cam.stats["frames"], 1)
+            self.assertEqual(cam.stats["frames_dropped"], 1)
+            self.assertEqual(cam.health()["frames_dropped"], 1)
+        finally:
+            cam._stop.set()
+            worker.join(timeout=5)
+
     def test_structural_rejections_leave_state_untouched(self):
         cases = [
             # truncated restart-marker header (jtype >= 64, fewer than 12 bytes)
@@ -429,10 +506,12 @@ class MediaIngestParityTests(unittest.TestCase):
     QUANT = bytes(range(128))
 
     def frame_pair(self):
+        # The second fragment starts where the first one's 4 data bytes
+        # end: offsets are scan-data positions (RFC 2435).
         return [
             rtp_packet(26, jpeg_payload(frag_off=0, q=255, quant=self.QUANT),
                        ts=500),
-            rtp_packet(26, jpeg_payload(frag_off=64, q=255), ts=500,
+            rtp_packet(26, jpeg_payload(frag_off=4, q=255), ts=500,
                        marker=True),
         ]
 

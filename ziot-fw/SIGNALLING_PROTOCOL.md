@@ -39,7 +39,9 @@ they disagree.
 >    * The bridge sees the stream die after 10 s and starts it again: about
 >      36 s on, 14 s off.
 > 3. **The next fix:** send each `eventType=0` on to the camera as an
->    `0x8002`. The camera does not read the body (§15 item 6).
+>    `0x8002`. The camera does not read the body (§15 item 6). It is
+>    written on branch `frigate-continuous-stream` and not yet validated
+>    live.
 > 4. **Camera .108 (`141030191094`) proves nothing either way.** It has
 >    been off the network since 16:14:26 (no sig, no ping), so its zero
 >    frames say nothing about the path. At 16:12:52 it did report
@@ -1205,6 +1207,14 @@ The camera's media-state report, read from the firmware to explain the
 
 Items 2, 4 and 7, and the rest of item 6, are not. With what is in,
 camera .107 streams in 36 s bursts (§0, §13.4).
+
+**Branch `frigate-continuous-stream`** adds item 6's `eventType=0` →
+`0x8002`:
+* `vendor_heartbeat` builds the frame (empty body, `len` 12);
+* `HttpApi.live_heartbeat` sends one for each keepAlive.
+
+It has not been validated against a camera yet. The live check is in item
+9.
 
 In order of expected payoff:
 

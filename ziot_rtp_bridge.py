@@ -615,11 +615,33 @@ _MAX_PENDING_TS = 8
 _KEEP_NEWEST_TS = 4
 
 
+def _scan_data(parts: dict) -> bytes | None:
+    """Join one frame's fragments, or None when one is missing.
+
+    RFC 2435's fragment offset is the byte position of a packet's data in
+    the frame's scan data, and the camera's packetizer writes exactly that
+    (firmware `rtp-jpeg`, 0x18010e00: the position starts at 0 and grows
+    by each packet's data length). So a whole frame is an unbroken chain
+    from 0. Joining around a packet lost on Wi-Fi makes a JPEG that
+    decodes with smeared blocks -- ffmpeg's "bad vlc" -- which Frigate's
+    motion detector reads as motion.
+    """
+    expected = 0
+    for off in sorted(parts):
+        if off != expected:
+            return None
+        expected += len(parts[off])
+    return b"".join(parts[off] for off in sorted(parts))
+
+
 class RtpJpegReassembler:
-    def __init__(self, emit):
+    def __init__(self, emit, on_drop=None):
         self._frags = defaultdict(dict)
         self._meta = {}
         self._emit = emit
+        # Called once per frame that ended (marker seen) but could not be
+        # emitted: its first packet (the tables) or a middle one was lost.
+        self._on_drop = on_drop
 
     def reset(self):
         self._frags.clear()
@@ -655,11 +677,19 @@ class RtpJpegReassembler:
             self._meta[ts] = (width, height, p[off + 4:off + 4 + qlen], jtype, dri)
             off += 4 + qlen
         self._frags[ts][frag_off] = p[off:]
-        if marker and ts in self._meta:
-            w, h, qt, jt, dri = self._meta.pop(ts)
+        if marker:
             parts = self._frags.pop(ts)
-            body = b"".join(parts[o] for o in sorted(parts))
-            self._emit(build_jpeg_header(w, h, qt, jt, dri) + body + b"\xff\xd9")
+            meta = self._meta.pop(ts, None)
+            body = _scan_data(parts) if meta is not None else None
+            if body is None:
+                # Never a partial frame: a broken JPEG is worse than one
+                # frame fewer for anything that decodes it.
+                if self._on_drop is not None:
+                    self._on_drop()
+            else:
+                w, h, qt, jt, dri = meta
+                self._emit(build_jpeg_header(w, h, qt, jt, dri) + body
+                           + b"\xff\xd9")
         if len(self._frags) > _MAX_PENDING_TS:
             for old in sorted(self._frags)[:-_KEEP_NEWEST_TS]:
                 self._frags.pop(old, None)
@@ -1071,8 +1101,8 @@ class ZiotCamera:
         self.addr = None
         self.sock = None
         self._sock_lock = threading.Lock()  # guards socket swap
-        self.stats = {"frames": 0, "audio_pkts": 0, "rx_errors": 0,
-                      "foreign_ssrc": 0, "rx_datagrams": 0}
+        self.stats = {"frames": 0, "frames_dropped": 0, "audio_pkts": 0,
+                      "rx_errors": 0, "foreign_ssrc": 0, "rx_datagrams": 0}
         self._last_rx = 0.0
         # Media identity. None means this UID carries no usable SSRC, so the
         # direct path can only check which socket a datagram arrived on.
@@ -1825,6 +1855,9 @@ class ZiotCamera:
         self._frame_times.append(time.monotonic())
         self.video.publish(jpeg)
 
+    def _on_dropped_frame(self) -> None:
+        self.stats["frames_dropped"] += 1
+
     def _on_direct_audio(self, pcm: bytes) -> None:
         self.stats["audio_pkts"] += 1
         self.audio.publish(pcm)
@@ -1887,7 +1920,7 @@ class ZiotCamera:
                                 self._on_direct_audio, self._mark_rx)
 
     def _receive(self):
-        asm = RtpJpegReassembler(self._on_frame)
+        asm = RtpJpegReassembler(self._on_frame, self._on_dropped_frame)
         while not self._stop.is_set():
             if self.relayed:
                 self._stop.wait(0.5)
@@ -1931,8 +1964,10 @@ class ZiotCamera:
             moves = self._endpoint_moves
             rr = self._re_rendezvous_count
             if streaming:
-                log.info("[%s] %.1f fps, %d frames total, %d endpoint moves, %d re-rendezvous",
-                         self.uid, fps, self.stats["frames"], moves, rr)
+                log.info("[%s] %.1f fps, %d frames total, %d incomplete "
+                         "dropped, %d endpoint moves, %d re-rendezvous",
+                         self.uid, fps, self.stats["frames"],
+                         self.stats["frames_dropped"], moves, rr)
             else:
                 # "0s ago" for a camera that has never sent anything reads as
                 # "a packet just landed", which is the opposite of the truth
@@ -1963,6 +1998,9 @@ class ZiotCamera:
             "streaming": self.is_streaming,
             "fps": round(self.fps, 1),
             "frames_total": self.stats["frames"],
+            # Frames that ended with a packet missing (Wi-Fi loss between
+            # the camera and this host), held back rather than served broken.
+            "frames_dropped": self.stats["frames_dropped"],
             "audio_pkts": self.stats["audio_pkts"],
             "rx_datagrams": self.stats["rx_datagrams"],
             "rx_errors": self.stats["rx_errors"],

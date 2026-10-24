@@ -536,6 +536,23 @@ def vendor_play_ctrl(uid: str, seq: int, value: int) -> bytes:
     return signalling_frame(0x8004, seq, uid.encode(), body, pad=False)
 
 
+def vendor_heartbeat(uid: str, seq: int) -> bytes:
+    """The server's cmd 0x8002 -- the live view's heartbeat (§13.4).
+
+    Handler 0x1801b6ca stamps `dev->0x34`, the tick the media state
+    machine checks while a live view plays: 36 s without a stamp and the
+    camera logs `live heartbeat timeout, stop live` and stops
+    (0x1801a628). Once PlayLiveview is in, nothing else stamps it -- the
+    P2P thread that stamped it for every viewer datagram has exited --
+    so the viewer's keepAlive has to reach the camera as this frame. The
+    body is not read; on the first and then every fifth one the camera
+    sends its own cmd 0x0002.
+
+    The body is empty and the length counts the uid alone, like 0x8005.
+    """
+    return signalling_frame(0x8002, seq, uid.encode(), b"", pad=False)
+
+
 def vendor_config_answer(uid: str, seq: int) -> bytes:
     """The vendor's answer to the camera's cmd 0x1601.
 
@@ -1279,6 +1296,22 @@ class HttpApi:
         # vendor sending on this beat.
         return True
 
+    def live_heartbeat(self, uid: str) -> bool:
+        """Pass a viewer's keepAlive on to its camera as `0x8002`.
+
+        With the keepAlive only logged, every live view ended 35-36 s
+        after its start (live, 2026-10-24): the camera's own heartbeat
+        timeout (SIGNALLING_PROTOCOL.md §13.4). The bridge then saw 10 s
+        of silence and started it again, so Frigate got ~36 s of video
+        and ~14 s of nothing, over and over. Driven by the viewer's
+        keepAlive rather than the broker's own beat, so a camera nobody
+        watches still stops 36 s after its viewer goes away.
+
+        Returns False when the camera has no signalling connection.
+        """
+        seq = self.last_seq.get(uid, 0)
+        return self.send_to(uid, vendor_heartbeat(uid, seq))
+
     def push_start(self, uid: str) -> None:
         """Tell a camera to start sending its media.
 
@@ -1732,13 +1765,17 @@ class HttpApi:
             event = one.get("eventType", "")
             log("notify", ("-", 0),
                 f"uid={uid} event={event}".encode())
-            # The event reaches the camera over the signalling connection.
-            # Only eventType "1" is "start live" (verified in the app
-            # capture). The other event types the app sends must not fire
-            # the punch: a push fired on a stop event makes the
-            # rotation's reaction -- which can only be read in the
-            # bridge's datagram count -- unattributable.
-            if event == "1":
+            # The event reaches the camera over the signalling connection
+            # (SIGNALLING_PROTOCOL.md §13.6). eventType "0" (keepAlive) is
+            # the live view's heartbeat, `0x8002`: without it the camera
+            # stops 36 s after each start. Only eventType "1" is "start
+            # live" (verified in the app capture). The other event types
+            # the app sends must not fire the punch: a push fired on a
+            # stop event makes the rotation's reaction -- which can only
+            # be read in the bridge's datagram count -- unattributable.
+            if event == "0":
+                self.live_heartbeat(uid)
+            elif event == "1":
                 self.schedule_p2p_live(uid)
                 self.p2p_fire_at[uid] = time.monotonic() + 1.0
             data = "ok"

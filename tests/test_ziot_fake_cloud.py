@@ -705,14 +705,89 @@ class RelayTriggerTests(unittest.TestCase):
         self.assertFalse(api.push_relay_trigger(self.UID))
         self.assertEqual(self.triggers(api), [])
 
-    def test_only_event_type_1_fires_a_push(self):
+    def test_an_unknown_event_sends_nothing(self):
         api = self.make()
         api.respond("GET", "/api/v1/ipc/notify-live-event",
                     f"uid={self.UID}&eventType=20")
-        self.assertEqual(self.triggers(api), [])
+        self.assertEqual(self.frames(api), [])
+
+    def test_event_type_1_starts_the_direct_chain_not_the_relay(self):
+        # Start live is 0x8101 (the viewer's pairs) and then 0x8004, not
+        # the relay's 0x8005 (SIGNALLING_PROTOCOL.md §13): that chain is
+        # what made camera .107 stream to the bridge on 2026-10-24.
+        api = self.make()
         api.respond("GET", "/api/v1/ipc/notify-live-event",
                     f"uid={self.UID}&eventType=1")
-        self.assertEqual(len(self.triggers(api)), 1)
+        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
+        self.assertEqual(cmds, ["0x8101"])
+        self.assertIn(self.UID, api.p2p_fire_at)
+        self.assertEqual(self.triggers(api), [])
+
+
+class LiveHeartbeatTests(unittest.TestCase):
+    """The viewer's keepAlive reaches the camera as `0x8002`.
+
+    While a live view plays, the camera's only liveness clock is the
+    server's `0x8002` (SIGNALLING_PROTOCOL.md §13.4): with keepAlive only
+    logged, camera .107 ended every live view 35-36 s after its start
+    (2026-10-24), and Frigate saw the stream drop every ~50 s.
+    """
+
+    UID = "140979857781"
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+
+    def make(self):
+        api = fake.HttpApi(relay_start=True)
+        api.camera_links[self.UID] = _FakeSocket([])
+        api.last_seq[self.UID] = 7
+        return api
+
+    def frames(self, api):
+        return api.camera_links[self.UID].sink
+
+    def test_the_heartbeat_is_the_bare_frame_the_firmware_expects(self):
+        frame = fake.vendor_heartbeat(self.UID, 7)
+        # 86 86 | 80 02 | len 000c | seq 0007 | uidLen 000c | uid | xor | 0d
+        self.assertEqual(len(frame), 24)
+        self.assertEqual(frame[:4], b"\x86\x86\x80\x02")
+        d = fake.decode_signalling(frame)
+        self.assertEqual(d["cmd"], "0x8002")
+        self.assertEqual(d["len"], 12)          # the uid, and nothing else
+        self.assertEqual(d["seq"], 7)
+        self.assertEqual(d["uid"], self.UID)
+        self.assertTrue(d["xor_ok"])
+
+    def test_each_keepalive_sends_one_heartbeat(self):
+        api = self.make()
+        for _ in range(3):
+            self.assertEqual(
+                api.respond("GET", "/api/v1/ipc/notify-live-event",
+                            f"uid={self.UID}&eventType=0")[:12],
+                b"HTTP/1.1 200")
+        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
+        self.assertEqual(cmds, ["0x8002"] * 3)
+        # A keepAlive is not a start: no viewer pairs, no play control.
+        self.assertEqual(api.p2p_fire_at, {})
+
+    def test_the_heartbeat_echoes_the_cameras_last_seq(self):
+        api = self.make()
+        api.last_seq[self.UID] = 41
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=0")
+        self.assertEqual(fake.decode_signalling(self.frames(api)[0])["seq"],
+                         41)
+
+    def test_a_keepalive_for_a_disconnected_camera_is_answered(self):
+        api = fake.HttpApi(relay_start=True)
+        self.assertFalse(api.live_heartbeat(self.UID))
+        reply = api.respond("GET", "/api/v1/ipc/notify-live-event",
+                            f"uid={self.UID}&eventType=0")
+        self.assertEqual(reply[:12], b"HTTP/1.1 200")
 
 
 class RelayTriggerTimingTests(unittest.TestCase):
@@ -1032,10 +1107,35 @@ class StunTests(unittest.TestCase):
     def test_header_cookie_and_transaction_id_are_echoed(self):
         reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
                                           64668, "172.16.110.64", 13478)
-        # Binding Success, the same length, the same cookie and txid.
+        # Binding Success, the same cookie and txid. The length is the
+        # vendor's three attributes (0x24) plus the camera's 0x0020 (12).
         self.assertEqual(reply[:2], b"\x01\x01")
-        self.assertEqual(reply[2:4], b"\x00\x24")
+        self.assertEqual(reply[2:4], b"\x00\x30")
         self.assertEqual(reply[4:20], self.REQUEST[4:20])
+
+    def test_the_camera_reads_its_address_the_way_its_firmware_does(self):
+        # The camera's own request: RFC 5389 cookie, the fixed txid both
+        # units send. Its STUN client (CUSTOM_TASK_StunXorAddr, 0x180190e8)
+        # wants type 0x0101, walks the attributes by length, takes ONLY
+        # 0x0020 and XORs it with 0x2112 / 21 12 A4 42
+        # (SIGNALLING_PROTOCOL.md §12.2). Without it every camera STUN
+        # failed and no session ever reached the live view.
+        request = bytes.fromhex("000100002112a442"
+                                "63c7117e0714278f5ded3221")
+        reply = fake.stun_binding_success(request, "192.168.68.107", 52688,
+                                          "192.168.68.114", 13478)
+        self.assertEqual(reply[:2], b"\x01\x01")
+        pos, found = 20, None
+        while pos + 4 <= len(reply):
+            atype, alen = struct.unpack("!HH", reply[pos:pos + 4])
+            if atype == 0x0020:
+                found = reply[pos + 4:pos + 4 + alen]
+            pos += 4 + alen
+        self.assertIsNotNone(found)
+        port = struct.unpack("!H", found[2:4])[0] ^ 0x2112
+        ip = bytes(a ^ b for a, b in zip(found[4:8], b"\x21\x12\xa4\x42"))
+        self.assertEqual(port, 52688)
+        self.assertEqual(socket.inet_ntoa(ip), "192.168.68.107")
 
     def test_mapped_address_and_server_address_match_the_vendor(self):
         reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
