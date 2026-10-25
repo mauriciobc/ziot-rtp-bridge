@@ -331,6 +331,20 @@ class DirectPacketTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
 
 
+class MediaSocketTests(unittest.TestCase):
+    def test_the_media_socket_asks_for_a_big_receive_buffer(self):
+        # Best-effort: the kernel caps the request at net.core.rmem_max.
+        try:
+            rmem_max = int(Path("/proc/sys/net/core/rmem_max").read_text())
+        except (OSError, ValueError):
+            self.skipTest("rmem_max unreadable")
+        sock = bridge._media_socket()
+        self.addCleanup(sock.close)
+        got = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        self.assertGreaterEqual(
+            got, min(bridge.MEDIA_RCVBUF_BYTES, rmem_max))
+
+
 class RxDatagramTests(unittest.TestCase):
     """Counted before any filter runs, so an empty /health can distinguish
     "the camera is silent" from "packets arrive and we drop them all"."""
