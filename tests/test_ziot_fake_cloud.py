@@ -95,6 +95,83 @@ class FakeCloudTests(unittest.TestCase):
         self.assertIn("nothing to listen on", err.getvalue())
 
 
+class FatalBindTests(unittest.TestCase):
+    """A requested listener that cannot bind makes main() exit non-zero
+    (Docker restarts on exit, not on a failing healthcheck)."""
+
+    flags = ("--strict-bind",)
+
+    def run_main(self, *argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(sys, "argv", ["fake", "--bind", "127.0.0.1",
+                                                *self.flags, *argv]), \
+                mock.patch.object(fake, "_wait_forever",
+                                  side_effect=KeyboardInterrupt):
+            rc = fake.main()
+        return rc, err.getvalue()
+
+    def occupy(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(s.close)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        return s.getsockname()[1]
+
+    def test_occupied_sig_port_is_fatal(self):
+        port = self.occupy()
+        rc, err = self.run_main("--http", "0", "--sig", str(port),
+                                "--stun", "0", "--ws", "0", "--dns", "0")
+        self.assertEqual(rc, 1)
+        self.assertIn(f"cannot bind sig port {port}", err)
+        self.assertIn(f"sig:{port}", err)
+
+    def test_all_failures_reported_in_one_run(self):
+        sig, ws = self.occupy(), self.occupy()
+        rc, err = self.run_main("--http", "0", "--sig", str(sig),
+                                "--stun", "0", "--ws", str(ws), "--dns", "0")
+        self.assertEqual(rc, 1)
+        self.assertIn(f"sig:{sig}", err)
+        self.assertIn(f"ws:{ws}", err)
+
+    def test_bound_servers_are_closed_on_fatal_exit(self):
+        sig = self.occupy()
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        http = free.getsockname()[1]
+        free.close()
+        rc, _ = self.run_main("--http", str(http), "--sig", str(sig),
+                              "--stun", "0", "--ws", "0", "--dns", "0")
+        self.assertEqual(rc, 1)
+        again = socket.socket()
+        self.addCleanup(again.close)
+        again.bind(("127.0.0.1", http))  # released, no leaked listener
+
+    def test_occupied_sig_port_without_strict_bind_continues(self):
+        self.flags = ()
+        port = self.occupy()
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        http = free.getsockname()[1]
+        free.close()  # a bindable listener so main has something to serve
+        rc, err = self.run_main("--http", str(http), "--sig", str(port),
+                                "--stun", "0", "--ws", "0", "--dns", "0")
+        self.assertEqual(rc, 0)
+        self.assertIn("cannot bind sig port", err)
+        self.assertNotIn("fatal:", err)
+
+    def test_dns_bind_failure_stays_non_fatal(self):
+        with mock.patch.object(fake, "DnsServer", side_effect=OSError("busy")):
+            rc, err = self.run_main("--http", "0", "--sig", "0",
+                                    "--stun", "0", "--ws", "0",
+                                    "--dns", "5353")
+        self.assertEqual(rc, 1)  # nothing else to listen on
+        self.assertIn("cannot bind dns port", err)
+        self.assertIn("nothing to listen on", err)
+        self.assertNotIn("fatal: could not bind", err)
+
+
 class DnsTests(unittest.TestCase):
     def query(self, name):
         parts = b"".join(bytes([len(l)]) + l.encode() for l in name.split("."))
