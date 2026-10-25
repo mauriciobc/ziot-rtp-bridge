@@ -373,6 +373,52 @@ class RelayConsumeTests(unittest.TestCase):
         on_rx.assert_not_called()
 
 
+class RelayAddressTests(unittest.TestCase):
+    """Where the bridge looks for the camera's published media.
+
+    The camera is an RTSP publisher, so the broker's device-list row
+    carries the relay address (`relay_ip`) and the bridge plays it. The
+    port has to travel with the host: the local relay does not listen
+    on the vendor's 554, and a URL built without it would point at a
+    port nothing owns.
+    """
+
+    ROW = {"uid": "140979857781", "deviceType": "X5",
+           "version": "TXW817_A_V1.0.12.32"}
+
+    def test_a_relay_host_with_a_port_keeps_both(self):
+        urls = bridge.relay_urls(dict(self.ROW,
+                                      relay_ip="192.168.68.114:8554"))
+        self.assertIn("rtsp://192.168.68.114:8554/live/140979857781", urls)
+
+    def test_a_relay_host_without_a_port_falls_back_to_the_vendor_port(self):
+        urls = bridge.relay_urls(dict(self.ROW, relay_ip="156.246.16.114"))
+        self.assertIn("rtsp://156.246.16.114:554/live/140979857781", urls)
+
+    def test_no_relay_address_yields_no_urls(self):
+        self.assertEqual(bridge.relay_urls(dict(self.ROW)), [])
+
+    def test_both_url_forms_are_offered(self):
+        """The firmware gate that picks /live/ vs /rtp/ is inferred, so
+        both are tried."""
+        urls = bridge.relay_urls(dict(self.ROW,
+                                      relay_ip="192.168.68.114:8554"))
+        self.assertIn("rtsp://192.168.68.114:8554/rtp/79857781", urls)
+
+    def test_the_device_list_row_is_what_carries_the_relay(self):
+        """`relay_ip` must survive into the cloud row the bridge reads."""
+        cam = {
+            "relay_ip": "192.168.68.114:8554",
+            "deviceType": "X5",
+            "version": "TXW817_A_V1.0.12.32",
+            "onlineState": "1",
+            "mediaState": "0",
+        }
+        net = bridge.ZiotCamera.__new__(bridge.ZiotCamera)
+        net._load_cloud(cam)
+        self.assertEqual(net.cloud["relay_ip"], "192.168.68.114:8554")
+
+
 class MediaIngestParityTests(unittest.TestCase):
     """The direct and relay transports must produce identical media from
     identical packets: one frame from a JPEG fragment pair, one PCM chunk
@@ -607,6 +653,106 @@ class RouteTests(unittest.TestCase):
         self.assertNotIn(b"object at 0x", body)
 
 
+class StableBindIpTests(unittest.TestCase):
+    """The camera is told where to send its media, so that address must
+    not move when an adapter's DHCP lease changes."""
+
+    def test_local_address_detection_finds_a_bound_address(self):
+        # 127.0.0.1 is always local.
+        self.assertTrue(bridge._has_local_address("127.0.0.1"))
+        # An address that is not ours cannot be bound.
+        self.assertFalse(bridge._has_local_address("203.0.113.99"))
+
+    def test_a_fixed_address_is_preferred_over_the_lease(self):
+        """With a camera on the same subnet, the fixed address wins."""
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name]
+
+        calls = []
+
+        class Cam:
+            uid = "AAA"          # cloud.register records the camera by it
+            cloud = {}           # read by CloudState._run / cloud_is_on
+            is_streaming = False
+
+            def __init__(self, api, cam, bind_ip, **kw):
+                calls.append({"bind_ip": bind_ip, **kw})
+
+            def update_cloud(self, row):
+                self.cloud = dict(row)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera", Cam), \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.68.111"), \
+                mock.patch.object(bridge, "_has_local_address",
+                                  return_value=True):
+            gps.return_value.list_cameras.return_value = [
+                {"uid": "AAA", "onlineState": "1"}]
+            gps.return_value.get_stun_addr.return_value = {
+                "IpcPrivateIP": "192.168.68.50", "IpcPrivatePort": 5000}
+            bridge.main()
+        # The camera was constructed with the fixed address.
+        self.assertTrue(calls, "the camera was never started")
+        self.assertEqual(calls[0].get("bind_ip"), bridge.STABLE_BIND_IP)
+
+    def test_an_explicit_bind_ip_wins(self):
+        old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), old_argv)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"token": "t", "user_id": 1, "port": 0}, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name,
+                    "--bind-ip", "192.168.68.111"]
+
+        calls = []
+
+        class Cam:
+            uid = "AAA"          # cloud.register records the camera by it
+            cloud = {}           # read by CloudState._run / cloud_is_on
+            is_streaming = False
+
+            def __init__(self, api, cam, bind_ip, **kw):
+                calls.append({"bind_ip": bind_ip, **kw})
+
+            def update_cloud(self, row):
+                self.cloud = dict(row)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(bridge, "GPS555") as gps, \
+                mock.patch.object(bridge, "ThreadingHTTPServer"), \
+                mock.patch.object(bridge, "ZiotCamera", Cam), \
+                mock.patch.object(bridge, "local_ip_for",
+                                  return_value="192.168.68.111"), \
+                mock.patch.object(bridge, "_has_local_address",
+                                  return_value=True):
+            gps.return_value.list_cameras.return_value = [
+                {"uid": "AAA", "onlineState": "1"}]
+            gps.return_value.get_stun_addr.return_value = {
+                "IpcPrivateIP": "192.168.68.50", "IpcPrivatePort": 5000}
+            bridge.main()
+        self.assertTrue(calls)
+        self.assertEqual(calls[0].get("bind_ip"), "192.168.68.111")
+
+
 class PunchIntervalTests(unittest.TestCase):
     def setUp(self):
         self.old_interval = bridge.PUNCH_INTERVAL
@@ -653,6 +799,81 @@ class PunchIntervalTests(unittest.TestCase):
             self.assertAlmostEqual(bridge.PUNCH_INTERVAL, 1.999)
             gps.assert_called_once_with("t")
             gps.return_value.list_cameras.assert_called_once_with(1)
+
+
+class ApiBaseTests(unittest.TestCase):
+    """`api_base` points the bridge's signalling at a local broker."""
+
+    def setUp(self):
+        self.old_argv = sys.argv[:]
+        self.addCleanup(sys.argv.__setitem__, slice(None), self.old_argv)
+        self.old_interval = bridge.PUNCH_INTERVAL
+        self.addCleanup(setattr, bridge, "PUNCH_INTERVAL", self.old_interval)
+
+    def run_main(self, config):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump(config, f)
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
+        sys.argv = ["ziot_rtp_bridge.py", "--config", f.name]
+
+    def test_configured_base_reaches_the_client(self):
+        self.run_main({"token": "t", "user_id": 1, "port": 0,
+                       "api_base": "http://127.0.0.1:8089/api/"})
+        with mock.patch.object(bridge, "GPS555") as gps:
+            gps.return_value.list_cameras.return_value = []
+            bridge.main()
+        # A trailing slash would double up in BASE + "/v1/..." paths.
+        gps.assert_called_once_with("t", "http://127.0.0.1:8089/api")
+
+    def test_blank_base_falls_back_to_the_vendor_default(self):
+        for value in ("", "   ", 5, []):
+            with self.subTest(value=value):
+                self.run_main({"token": "t", "user_id": 1, "port": 0,
+                               "api_base": value})
+                with mock.patch.object(bridge, "GPS555") as gps:
+                    gps.return_value.list_cameras.return_value = []
+                    bridge.main()
+                gps.assert_called_once_with("t")
+
+    def test_requests_go_to_the_configured_base(self):
+        seen = []
+
+        class Reply:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"code":200,"msg":"OK","data":{"list":[]}}'
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            return Reply()
+
+        client = bridge.GPS555("t", "http://10.0.0.5:80/api")
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            client.list_cameras(7)
+            client.send_cmd("u", "20")
+        self.assertTrue(seen[0].startswith("http://10.0.0.5:80/api/v1/ipc?"),
+                        seen)
+        self.assertEqual(seen[1], "http://10.0.0.5:80/api/v1/cmd/send-cmd")
+
+    def test_default_client_still_uses_the_vendor_cloud(self):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req.full_url)
+            raise OSError("stop")
+
+        with mock.patch.object(bridge.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            with self.assertRaises(OSError):
+                bridge.GPS555("t").get_stun_addr("u")
+        self.assertTrue(seen[0].startswith("https://ipc.gps555.net/api/"))
 
 
 class PunchLoopTests(unittest.TestCase):

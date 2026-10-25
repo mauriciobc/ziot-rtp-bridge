@@ -105,6 +105,12 @@ RELAY_RETRY_DIRECT = 120.0      # while relayed, retry a direct rendezvous this 
 RELAY_FIRMWARE_PIVOT = "TXW817_A_V1.0.11.52"   # app's CameraInfoModel gate
 RELAY_DEFAULT_PORT = 554
 STUN_SUBNET_MASK = "255.255.255.0"   # the app's isSameSubnet() mask
+# A fixed address for this host on the camera's LAN. The camera is told
+# where to send its media, and that address must not change when an
+# adapter's DHCP lease does -- a viewer address that moves is a session
+# that silently stops. Set it here (or pass --bind-ip) when running
+# against a local broker.
+STABLE_BIND_IP = "192.168.68.114"
 # Linux ephemeral range; these cameras bind their RTP listen port here.
 # A punch-only (no-token) camera that answers hellos is found by sweeping it
 # from the existing socket -- rebinding would change our source port and
@@ -462,8 +468,20 @@ def parse_static_endpoints(raw: dict) -> dict:
 
 
 
+def _make_api(token: str, base_url: str = BASE_URL):
+    """Build the cloud client.
+
+    The base URL is only passed on when it differs from the vendor default,
+    so the default path constructs the client exactly as before.
+    """
+    if base_url == BASE_URL:
+        return GPS555(token)
+    return GPS555(token, base_url)
+
+
 class GPS555:
-    def __init__(self, token: str):
+    def __init__(self, token: str, base_url: str = BASE_URL):
+        self._base = base_url.rstrip("/")
         self._h = {
             "Authorization": f"Bearer {token}",
             "language": "pt",
@@ -471,7 +489,7 @@ class GPS555:
         }
 
     def _get(self, path: str, timeout: float = CLOUD_TIMEOUT, **params) -> dict:
-        url = BASE_URL + path
+        url = self._base + path
         if params:
             url += "?" + urllib.parse.urlencode({k: str(v) for k, v in params.items()})
         req = urllib.request.Request(url, headers=self._h)
@@ -518,7 +536,7 @@ class GPS555:
 
     def _post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
-            BASE_URL + path, data=json.dumps(body).encode(),
+            self._base + path, data=json.dumps(body).encode(),
             headers={**self._h, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
@@ -1208,34 +1226,47 @@ class ZiotCamera:
                      self.uid, kind, self.bind_ip, STUN_SUBNET_MASK)
             self._endpoint_kind = kind
 
+    def _close_sock(self, sock) -> None:
+        """Close a socket the rendezvous was holding and un-register it.
+
+        A failure path used to close the socket but leave self.sock
+        pointing at it: mode kept saying "direct" over a dead
+        transport, the receive thread kept dying on it, and the next
+        rendezvous treated the closed socket as live -- getsockname()
+        on it failing with EBADF before a single byte went out. Only
+        the registered socket itself is cleared: a socket installed
+        from another thread is not ours to forget.
+        """
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+        with self._sock_lock:
+            if self.sock is sock:
+                self.sock = None
+                self.addr = None
+
     def _rendezvous(self) -> bool:
         """Full rendezvous: bind socket, register port, wake camera, get address.
         Returns True if we got a valid camera address."""
-        # Close old socket if any
-        old_sock = None
+        # The socket is kept across rendezvous: the camera is told where
+        # to send its media (in the registration answer, which it asks
+        # for once a minute), so a port that changes on every retry
+        # leaves the camera sending to a port nobody listens on.
         with self._sock_lock:
-            if self.sock:
-                old_sock = self.sock
-                self.sock = None
-        if old_sock:
-            try:
-                old_sock.close()
-            except Exception:
-                pass
-
-        # Create fresh socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((self.bind_ip, 0))
+            sock = self.sock
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((self.bind_ip, 0))
         port = sock.getsockname()[1]
 
         if self.api is None:
             # Punch-only: no broker to register with and nothing to wake.
             # A port of 0 means "IP known, sweep for the listen port".
             if self._static_addr is None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                self._close_sock(sock)
                 return False
             # Install the socket before anything is sent. The camera, if it
             # answers at all, sends RTP back to the source port of the hello,
@@ -1322,10 +1353,7 @@ class ZiotCamera:
                         "%s:%d", self.uid, addr[0], addr[1])
         if not addr:
             log.error("[%s] no address from broker", self.uid)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return False
 
         # Install the new socket
@@ -2284,6 +2312,59 @@ def local_ip_for(target: str) -> str:
         s.close()
 
 
+def _local_addresses() -> list:
+    """This host's IPv4 addresses, without running any command."""
+    out = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None,
+                                      socket.AF_INET):
+            addr = info[4][0]
+            if addr not in out:
+                out.append(addr)
+    except OSError:
+        pass
+    # The hostname does not always resolve to every address; ask the
+    # kernel for each interface by name (SIOCGIFADDR).
+    try:
+        import fcntl
+        import struct
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _, name in socket.if_nameindex():
+                packed = struct.pack("256s", name.encode()[:15])
+                try:
+                    raw = fcntl.ioctl(sock.fileno(), 0x8915, packed)
+                except OSError:
+                    continue
+                addr = socket.inet_ntoa(raw[20:24])
+                if addr not in out:
+                    out.append(addr)
+        finally:
+            sock.close()
+    except (OSError, ImportError):
+        pass
+    return out
+
+
+def _has_local_address(addr: str) -> bool:
+    """Is `addr` one of this host's addresses?
+
+    A secondary address (/32) on an interface is not reported by
+    SIOCGIFADDR, so the check that actually matters is whether the address
+    can be bound -- if the kernel has it, the bind succeeds.
+    """
+    if addr in _local_addresses():
+        return True
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((addr, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
 def main():
     ap = argparse.ArgumentParser(description="ZIOT RTP/JPEG -> MJPEG bridge")
     ap.add_argument("--config", default="ziot_config.json")
@@ -2342,6 +2423,18 @@ def main():
     PUNCH_INTERVAL = interval
 
     offline = bool(args.offline or cfg.get("offline"))
+    # The API base is configurable so this bridge can talk to a local broker
+    # (ziot_fake_cloud.py) instead of the vendor cloud -- that is the whole
+    # point of provisioning a camera with our own sig server. The vendor
+    # default stays in place when the key is absent.
+    base_url = cfg.get("api_base") or BASE_URL
+    if not isinstance(base_url, str) or not base_url.strip():
+        log.error("api_base %r must be a non-empty URL -- using %s",
+                  base_url, BASE_URL)
+        base_url = BASE_URL
+    base_url = base_url.rstrip("/")
+    if base_url != BASE_URL:
+        log.info("cloud API base: %s", base_url)
     static: dict = {}
     if offline:
         try:
@@ -2358,9 +2451,9 @@ def main():
         # used for signalling (send-stun-addr / notify / keepalive) so
         # --offline actually streams; without one we punch the LAN only.
         token = cfg.get("token")
-        api = GPS555(token) if token else None
+        api = _make_api(token, base_url) if token else None
     else:
-        api = GPS555(cfg["token"])
+        api = _make_api(cfg["token"], base_url)
 
     # The device list needs an account id. The config may carry it, or the
     # JWT's user_id claim does. Resolved once, here, because every use site
@@ -2456,6 +2549,16 @@ def main():
             else:
                 log.warning("no IpcPrivateIP from the broker — binding on %s by default "
                             "route; pass --bind-ip if that is the wrong interface", bind_ip)
+        # A stable address matters when the camera is told where to send
+        # its media: the viewer's registered address must not change when
+        # an adapter's lease does. STABLE_BIND_IP is the broker's fixed
+        # address on this LAN -- use it when it is present and in the
+        # camera's subnet.
+        if not args.bind_ip and probe and same_subnet(STABLE_BIND_IP, probe):
+            if _has_local_address(STABLE_BIND_IP):
+                log.info("using the fixed address %s instead of %s",
+                         STABLE_BIND_IP, bind_ip)
+                bind_ip = STABLE_BIND_IP
         log.info("binding on %s (camera LAN %s), punch every %.1fs",
                  bind_ip, probe or "unknown", PUNCH_INTERVAL)
 

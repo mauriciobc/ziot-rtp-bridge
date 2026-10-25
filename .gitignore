@@ -6,3 +6,7 @@ __pycache__/
 # analysis artifacts
 *.xapk
 *.apk
+ZIOT_FINDINGS.md
+
+# packet captures can carry account tokens
+*.pcap
