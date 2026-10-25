@@ -69,19 +69,27 @@ class FakeCloudTests(unittest.TestCase):
         self.assertIn("stun", self.out.getvalue())
         self.assertIn("probe", self.out.getvalue())
 
-    def test_unbindable_low_port_reports_and_continues(self):
-        # Port 80 needs privileges; without them main must report the
-        # failure on stderr and still serve the bindable ports.
+    def test_an_occupied_port_is_reported_and_the_rest_continue(self):
+        # The test occupies the port itself, so the outcome does not
+        # depend on privileges (root, ip_unprivileged_port_start=0):
+        # without --strict-bind main must report the failure on stderr
+        # and still serve the bindable ports.
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(blocker.close)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        busy = blocker.getsockname()[1]
         err = io.StringIO()
         with contextlib.redirect_stderr(err), \
                 mock.patch.object(sys, "argv",
-                                  ["fake", "--http", "80", "--sig", "18882",
+                                  ["fake", "--bind", "127.0.0.1",
+                                   "--http", str(busy), "--sig", "18882",
                                    "--stun", "0", "--ws", "0"]), \
                 mock.patch.object(fake, "_wait_forever",
                            side_effect=KeyboardInterrupt):
             rc = fake.main()
         self.assertEqual(rc, 0)
-        self.assertIn("cannot bind http port 80", err.getvalue())
+        self.assertIn(f"cannot bind http port {busy}", err.getvalue())
         self.assertIn("listening sig", self.out.getvalue())
 
     def test_zero_ports_exits_nonzero(self):
@@ -1346,10 +1354,51 @@ class DirectChainResendFloorTests(unittest.TestCase):
         self.assertNotIn(self.UID, api.p2p_ready)
         self.assertGreater(api.p2p_fire_at[self.UID], stale)
 
-    def test_the_register_path_forces_the_0x8101(self):
-        import inspect
-        self.assertIn("api.schedule_p2p_live(uid, force=True)",
-                      inspect.getsource(fake.StreamHandler))
+    def _register_burst(self, connections):
+        """Send `connections` = [n_registers, ...] to a real sig server,
+        one TCP connection each; return the (uid, force) of every
+        schedule_p2p_live call the registers made."""
+        calls = []
+        api = fake.HttpApi()
+        real = api.schedule_p2p_live
+
+        def spy(uid, force=False):
+            calls.append((uid, force))
+            return real(uid, force=force)
+
+        api.schedule_p2p_live = spy
+        # A viewer with a media port, so the register arms a real target.
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 51111}
+        srv = fake.serve("sig", ("127.0.0.1", 0), api)
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        port = srv.server_address[1]
+        for n in connections:
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            self.addCleanup(s.close)
+            want = len(calls) + n
+            for i in range(n):
+                s.sendall(fake.signalling_frame(
+                    0x0001, 30 + i, self.UID.encode(), b"reg"))
+                time.sleep(0.05)
+            deadline = time.time() + 3
+            while len(calls) < want and time.time() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.2)
+        return calls
+
+    def test_a_register_forces_the_0x8101_once_per_connection(self):
+        # Live 2026-10-25 15:13: three registers in 3 s on one
+        # connection forced three 0x8101s and left the camera deaf.
+        calls = self._register_burst([3])
+        self.assertEqual(calls, [(self.UID, True), (self.UID, False),
+                                 (self.UID, False)])
+
+    def test_a_new_connection_forces_the_0x8101_again(self):
+        calls = self._register_burst([2, 1])
+        self.assertEqual(calls, [(self.UID, True), (self.UID, False),
+                                 (self.UID, True)])
 
 
 class RelayTriggerTests(unittest.TestCase):

@@ -1060,7 +1060,26 @@ class StreamHandler(socketserver.BaseRequestHandler):
             # disarmed the direct path and left the cameras on the
             # network, registering, and sending no media at all.
             if cmd == "0x0001" and armed[1] and api is not None:
-                api.schedule_p2p_live(uid, force=True)
+                # force=True bypasses the 30 s same-pair resend floor
+                # because a freshly registered camera's state is new --
+                # but only the FIRST register of a connection is new.
+                # Live 2026-10-25 15:13:13-16 (homelab cutover): .108
+                # reconnected and re-sent its 0x0001 three times in 3 s
+                # on one connection (camera seq 30, 31, 32) because our
+                # answers were slow; each forced a fresh 0x8101, the
+                # camera re-bound its P2P port three times, its "socket
+                # bound" report missed the play deadline and the view
+                # started only on the bridge's retry a minute later.
+                # Bursts of 0x8101 leave these cameras deaf
+                # (SIGNALLING_PROTOCOL.md §18.7). Later registers on the
+                # same connection take the normal pending-chain check
+                # and resend floor; a new connection forces again.
+                forced = self.__dict__.setdefault("_forced_uids", set())
+                if uid in forced:
+                    api.schedule_p2p_live(uid)
+                else:
+                    forced.add(uid)
+                    api.schedule_p2p_live(uid, force=True)
                 # The relay trigger rides the arm as well: the camera
                 # sets its relay-start flag when the 0x8005 arrives, and
                 # the armed address is where it would push. It is a

@@ -127,7 +127,28 @@ CLOUD_TIMEOUT = 10.0
 NOTIFY_TIMEOUT = 3.0
 STUN_ADDR_TIMEOUT = 5.0
 
+# Receive buffer requested for the camera media socket. The kernel default
+# (212992 bytes) is too small for the start-up burst: on the homelab server
+# (load average ~10, Frigate transcoding) camera .107's socket dropped 1323
+# datagrams (`ss -uam` skmem d1323, Udp RcvbufErrors 1383) -- a camera sends
+# ~85 datagrams/s of up to 1424 bytes and bursts after PlayLiveview. The
+# kernel caps the request at net.core.rmem_max and doubles it for
+# bookkeeping; a smaller grant is fine, this is best-effort.
+MEDIA_RCVBUF_BYTES = 4 * 1024 * 1024
+
 log = logging.getLogger("ziot")
+
+
+def _media_socket() -> socket.socket:
+    """A fresh UDP socket for camera media, with the enlarged receive buffer
+    set before bind (the only creation site; the socket is never rebound)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF,
+                        MEDIA_RCVBUF_BYTES)
+    except OSError as e:
+        log.debug("SO_RCVBUF %d refused: %s", MEDIA_RCVBUF_BYTES, e)
+    return sock
 
 
 class Fanout:
@@ -1288,7 +1309,7 @@ class ZiotCamera:
         with self._sock_lock:
             sock = self.sock
         if sock is None:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock = _media_socket()
             sock.bind((self.bind_ip, 0))
         port = sock.getsockname()[1]
 
