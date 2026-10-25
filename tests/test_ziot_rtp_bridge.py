@@ -373,6 +373,52 @@ class RelayConsumeTests(unittest.TestCase):
         on_rx.assert_not_called()
 
 
+class RelayAddressTests(unittest.TestCase):
+    """Where the bridge looks for the camera's published media.
+
+    The camera is an RTSP publisher, so the broker's device-list row
+    carries the relay address (`relay_ip`) and the bridge plays it. The
+    port has to travel with the host: the local relay does not listen
+    on the vendor's 554, and a URL built without it would point at a
+    port nothing owns.
+    """
+
+    ROW = {"uid": "140979857781", "deviceType": "X5",
+           "version": "TXW817_A_V1.0.12.32"}
+
+    def test_a_relay_host_with_a_port_keeps_both(self):
+        urls = bridge.relay_urls(dict(self.ROW,
+                                      relay_ip="192.168.68.114:8554"))
+        self.assertIn("rtsp://192.168.68.114:8554/live/140979857781", urls)
+
+    def test_a_relay_host_without_a_port_falls_back_to_the_vendor_port(self):
+        urls = bridge.relay_urls(dict(self.ROW, relay_ip="156.246.16.114"))
+        self.assertIn("rtsp://156.246.16.114:554/live/140979857781", urls)
+
+    def test_no_relay_address_yields_no_urls(self):
+        self.assertEqual(bridge.relay_urls(dict(self.ROW)), [])
+
+    def test_both_url_forms_are_offered(self):
+        """The firmware gate that picks /live/ vs /rtp/ is inferred, so
+        both are tried."""
+        urls = bridge.relay_urls(dict(self.ROW,
+                                      relay_ip="192.168.68.114:8554"))
+        self.assertIn("rtsp://192.168.68.114:8554/rtp/79857781", urls)
+
+    def test_the_device_list_row_is_what_carries_the_relay(self):
+        """`relay_ip` must survive into the cloud row the bridge reads."""
+        cam = {
+            "relay_ip": "192.168.68.114:8554",
+            "deviceType": "X5",
+            "version": "TXW817_A_V1.0.12.32",
+            "onlineState": "1",
+            "mediaState": "0",
+        }
+        net = bridge.ZiotCamera.__new__(bridge.ZiotCamera)
+        net._load_cloud(cam)
+        self.assertEqual(net.cloud["relay_ip"], "192.168.68.114:8554")
+
+
 class MediaIngestParityTests(unittest.TestCase):
     """The direct and relay transports must produce identical media from
     identical packets: one frame from a JPEG fragment pair, one PCM chunk
@@ -630,8 +676,15 @@ class StableBindIpTests(unittest.TestCase):
         calls = []
 
         class Cam:
+            uid = "AAA"          # cloud.register records the camera by it
+            cloud = {}           # read by CloudState._run / cloud_is_on
+            is_streaming = False
+
             def __init__(self, api, cam, bind_ip, **kw):
                 calls.append({"bind_ip": bind_ip, **kw})
+
+            def update_cloud(self, row):
+                self.cloud = dict(row)
 
             def start(self):
                 return True
@@ -668,8 +721,15 @@ class StableBindIpTests(unittest.TestCase):
         calls = []
 
         class Cam:
+            uid = "AAA"          # cloud.register records the camera by it
+            cloud = {}           # read by CloudState._run / cloud_is_on
+            is_streaming = False
+
             def __init__(self, api, cam, bind_ip, **kw):
                 calls.append({"bind_ip": bind_ip, **kw})
+
+            def update_cloud(self, row):
+                self.cloud = dict(row)
 
             def start(self):
                 return True

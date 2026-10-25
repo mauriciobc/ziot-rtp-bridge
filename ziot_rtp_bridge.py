@@ -1226,34 +1226,47 @@ class ZiotCamera:
                      self.uid, kind, self.bind_ip, STUN_SUBNET_MASK)
             self._endpoint_kind = kind
 
+    def _close_sock(self, sock) -> None:
+        """Close a socket the rendezvous was holding and un-register it.
+
+        A failure path used to close the socket but leave self.sock
+        pointing at it: mode kept saying "direct" over a dead
+        transport, the receive thread kept dying on it, and the next
+        rendezvous treated the closed socket as live -- getsockname()
+        on it failing with EBADF before a single byte went out. Only
+        the registered socket itself is cleared: a socket installed
+        from another thread is not ours to forget.
+        """
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+        with self._sock_lock:
+            if self.sock is sock:
+                self.sock = None
+                self.addr = None
+
     def _rendezvous(self) -> bool:
         """Full rendezvous: bind socket, register port, wake camera, get address.
         Returns True if we got a valid camera address."""
-        # Close old socket if any
-        old_sock = None
+        # The socket is kept across rendezvous: the camera is told where
+        # to send its media (in the registration answer, which it asks
+        # for once a minute), so a port that changes on every retry
+        # leaves the camera sending to a port nobody listens on.
         with self._sock_lock:
-            if self.sock:
-                old_sock = self.sock
-                self.sock = None
-        if old_sock:
-            try:
-                old_sock.close()
-            except Exception:
-                pass
-
-        # Create fresh socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((self.bind_ip, 0))
+            sock = self.sock
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind((self.bind_ip, 0))
         port = sock.getsockname()[1]
 
         if self.api is None:
             # Punch-only: no broker to register with and nothing to wake.
             # A port of 0 means "IP known, sweep for the listen port".
             if self._static_addr is None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                self._close_sock(sock)
                 return False
             # Install the socket before anything is sent. The camera, if it
             # answers at all, sends RTP back to the source port of the hello,
@@ -1340,10 +1353,7 @@ class ZiotCamera:
                         "%s:%d", self.uid, addr[0], addr[1])
         if not addr:
             log.error("[%s] no address from broker", self.uid)
-            try:
-                sock.close()
-            except Exception:
-                pass
+            self._close_sock(sock)
             return False
 
         # Install the new socket
