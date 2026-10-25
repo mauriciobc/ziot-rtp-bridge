@@ -16,6 +16,61 @@ they disagree.
 
 ## 0. The answer in one paragraph
 
+> **⚑ Update 2026-10-24 22:28 - camera .108 streams, end to end.**
+> The direct chain works, with the vendor's own protocol shapes. Measured
+> on camera `141030191094` (`.108`), 8.0-8.4 fps, continuous:
+>
+> 1. **The `0x8001` ack must carry the camera's own counter.** The body
+>    is `cSeq:2 | cmd:2 | ack:1`, and in **all 1134** acks of the 2 h
+>    vendor wiretap the body's first u16 equals the camera's *latest*
+>    sequence number for that command -- 535 x `00 03 00 02 00` and 535
+>    x `00 04 00 04 00`, with a tail of `00 04 00 02 00`, `00 05 00 04
+>    00`, `00 08 00 02 00`. The frame's *header* sequence echoes the
+>    frame being answered, and can be one behind. Ours were constant,
+>    so no ack we sent ever matched; the camera answered by re-asking
+>    (thirty `0x0002`s in a burst) and then going silent.
+> 2. **The play follows the camera's own report.** The camera's `0x0004`
+>    carries the media state (wire id 3); **3 = "P2P socket bound,
+>    waiting for the viewer"** -- the precondition `0x8004` PlayLiveview
+>    checks (§13.3). The `0x8004` must not be fired on a timer.
+> 3. **The hello comes first, at the camera's freshest RTP port.** The
+>    `0x8101` makes the camera re-run STUN, draw a new RTP port and
+>    report it (`0x0003`); the hello goes there *before* the play,
+>    because PlayLiveview closes the socket the camera was waiting on
+>    (§13.2, §13.3, §14.1).
+> 4. **Unknown commands get the vendor's shape, not the candidate
+>    sweep.** A camera command with no vendor answer (`0x0005` and
+>    friends) used to get one of the sweep's frames, including a
+>    `0x8001` with **no body at all** -- which the camera's
+>    `cSeq/cmd/ack` parser cannot read. It is now a `0x8001` with the
+>    camera's number and its command id. (The camera's `0x0005` is
+>    *not* fatal: `.108` sends one every session and keeps streaming.)
+> 5. **The `0x8002` heartbeat keeps the view open.** `re_rendezvous`
+>    stayed at 84 for the whole run: no 36 s stop, no bursts.
+>
+> The wire, for the record (`.108`, 22:28):
+>
+> ```
+> 22:28:17  0x0001 register        -> 0x8000 arm + 0x8101 viewer
+> 22:28:19  0x0004  id3 = 3        (P2P socket bound)
+> 22:28:19  STUN from :50293      (the new RTP port)
+> 22:28:21  hello x3 -> :50293    (the fresh port, first)
+> 22:28:21  0x8004 play-liveview  (p2p bound)
+> 22:28:22  0x0004  id3 = 0 -> 1   (direct live)
+> ```
+>
+> Verified end to end: the bridge's `/cam/<uid>` serves baseline
+> **640x480** JPEGs (66 frames in 8 s) and `/audio/<uid>` serves a RIFF
+> WAV stream.
+>
+> **Camera `.107` still fails, and the difference is on its side.** Its
+> handshake completes and it reports the same states (`id3 = 3`, then
+> `0` then `1` = direct live), but its frames then stop for ~30 s,
+> arrive as a 14-frame burst, and the session dies. A healthy camera
+> settles into one `0x0002` every 10 s and stays. Its own TCP ports
+> are all dead, i.e. its RTSP/spook media engine is not running -- the
+> §0 15:01 finding. A power cycle is what revives it.
+
 > **⚑ Update 2026-10-24 16:14 — first frames through the broker, and the
 > 36 s stop.** Observed live on camera .107 (`140979857781`). Details in
 > §13.4, §13.5, §13.7 and §15.
@@ -39,9 +94,7 @@ they disagree.
 >    * The bridge sees the stream die after 10 s and starts it again: about
 >      36 s on, 14 s off.
 > 3. **The next fix:** send each `eventType=0` on to the camera as an
->    `0x8002`. The camera does not read the body (§15 item 6). It is
->    written on branch `frigate-continuous-stream` and not yet validated
->    live.
+>    `0x8002`. The camera does not read the body (§15 item 6).
 > 4. **Camera .108 (`141030191094`) proves nothing either way.** It has
 >    been off the network since 16:14:26 (no sig, no ping), so its zero
 >    frames say nothing about the path. At 16:12:52 it did report
@@ -719,7 +772,13 @@ above:
    The broker's push sweep drew from the local ids (and the misread `0x20–0x4F`)
    and applied them to the sig channel — see §8. On these station-mode units the
    local 16532 port is closed, so the local `CmdAPType` path is unreachable
-   anyway; the cloud `0x80xx` path is the only one in play.
+   anyway; the cloud `0x80xx` path is the only one in play. The one `CmdAPType`
+   command this repo does speak is `cmd 1` = `wifiConnect` over BLE:
+   `00 01 | <len><ssid> | <len><pwd> | <len><urlAndPort> | <tz:2> | [regCode:4]`
+   inside the `86 86` frame. The camera's firmware prints nine field names
+   because its parser serves several ids at once — `p1`, `port` and the two
+   `bind id`s belong to the setup/pull command, not to `wifiConnect`
+   (`DECOMPILATION_REPORT.md` §14.0).
 3. **The cloud's `eventType → cmd` translation is not numeric.** The app sends
    HTTP `notify-live-event?eventType=0..5`; the firmware's sig cmd space has no
    `0x8003` and uses `0x8000` for the register answer, so it is *not*
@@ -1009,7 +1068,7 @@ matches one app call field for field.
 | `eventType=3` stop | `0x8004`, value 3 | stop |
 | `eventType=0` keepAlive | `0x8002` | stamps the liveness tick |
 | `eventType=5` relay | `0x8005` | RelayPro, mode 2 |
-| `eventType=4` connected | ? | not identified |
+| `eventType=4` connected | (no camera frame identified) | the app's "P2P established" notify; **sent instead of `eventType=1` when `supportCacheStun()` is false — which is every X5 newer than `V1.0.11.46`, i.e. both our units** (§17.2). What the cloud sends the camera for it was never captured; **(inferred)** the same `0x8004`/1 play, since it is the unit's only live-start arm |
 | `stun-addr/<uid>` (read) | served from the camera's `0x0003` | the `0x0003` body is the four `Ipc*` fields |
 
 There is no `0x8003` because start/pause/stop are one command with the event
@@ -1208,14 +1267,6 @@ The camera's media-state report, read from the firmware to explain the
 Items 2, 4 and 7, and the rest of item 6, are not. With what is in,
 camera .107 streams in 36 s bursts (§0, §13.4).
 
-**Branch `frigate-continuous-stream`** adds item 6's `eventType=0` →
-`0x8002`:
-* `vendor_heartbeat` builds the frame (empty body, `len` 12);
-* `HttpApi.live_heartbeat` sends one for each keepAlive.
-
-It has not been validated against a camera yet. The live check is in item
-9.
-
 In order of expected payoff:
 
 1. **Give the camera a `0x0020` XOR-MAPPED-ADDRESS.** Port XOR `0x2112`,
@@ -1299,3 +1350,646 @@ In order of expected payoff:
     port. So the punch and the bridge must use the newest report, as they
     do now. **(inferred)** The previous session's socket on the same port
     takes the reply.
+
+---
+
+## 16. Live runs, 2026-10-24 22:28–23:41: what they added
+
+This section follows the 22:28 box in §0. It covers:
+- the broker from the main checkout, running since 21:33 on the 21:32 code;
+- the bridge, running since 20:11.
+
+Times are from the broker log unless marked otherwise.
+
+### 16.1 The heartbeat holds: 16 minutes unbroken on `.108`
+
+The run went from 22:28 to 22:44:
+- 7.4–8.4 fps, 7,815 frames;
+- the bridge's `re_rendezvous` stayed flat at 84 the whole time.
+
+There was no 36 s stop. The `0x8002` forward (§13.4, §15 item 6) is
+validated live.
+
+The run ended because the *host* went to sleep, not the camera (§16.6).
+
+### 16.2 The camera can be live before the bridge sees a frame
+
+This is `.108` after a power cycle:
+
+| time | event |
+|---|---|
+| 23:32:24 | `0x0001` register; the broker sends `0x8101` with the bridge's pair `192.168.68.114:46320` |
+| 23:32:27 | `id3 = 3` (P2P socket bound) |
+| 23:32:30 | broker hello ×3 → `:52241`, then `0x8004` |
+| 23:32:31 | `id3 = 0 → 1`: direct live |
+| 23:32:50 | the bridge leaves its 60 s backoff ("stream dead 445s"), re-rendezvouses and starts punching from `:46320`; the broker sends `0x8101` again, with the same pair |
+| 23:32:57 | hello, `0x8004`, `id3 = 0 → 1` |
+| ~23:33:00 | the bridge's first new frames (7,815 → 7,840) |
+
+The camera was live from 23:32:31, but the bridge received nothing for the
+next 19 s. That only changed once the bridge was punching from the socket
+named in the `0x8101`.
+
+The broker's own hello comes from a throwaway socket (`punch_camera`). So
+the camera seems to send its RTP to the source of the hellos it hears (the
+P2P thread logs each sender, §13.2), not just to the `0x8101` pair.
+**(inferred; not checked in the firmware)**
+
+If that holds, the broker's hello only satisfies the P2P thread. The
+bridge's punch is what lands the stream.
+
+### 16.3 The bridge's retry kills the broker's chain
+
+This is `.107`:
+
+| time | event |
+|---|---|
+| 23:35:15 | `0x0001` register → `0x8101` |
+| 23:35:17–:20 | `id3 = 3`, three times |
+| 23:35:22 | bridge log: cloud state `1/0 → 1/3`, so the bridge *knows* the socket is up |
+| 23:35:23 | hello ×3 → `:54739`, `0x8004` (p2p bound) |
+| 23:35:30 | bridge log: "109 direct attempts failed — trying the relay" → `eventType=5` (`0x8005` held) |
+| 23:35:31 | bridge `send-stun-addr` + `eventType=1` → the broker sends `0x8101` again |
+| 23:35:39 | no `id3 = 3` since; the broker sends `0x8004` on its 6 s fallback |
+| 23:35:40 | `id3 = 0` |
+
+The bridge retries on its own ~60 s cycle, whatever the camera is doing.
+Each retry's `notify(1)` becomes a `0x8101`, and §13.1 says a `0x8101`
+stops a view that is playing. Here the retry landed 8 s after the play, so
+the view never came up. `.108` at 23:32 survived because its retry landed
+19 s *after* it went live.
+
+Two consequences:
+* **The fallback play still fires.** `P2P_PLAY_FALLBACK_S` sends `0x8004`
+  6 s after a `0x8101` that the camera never answered with `id3 = 3`. The
+  22:28 box (§0, item 2) says that must not happen. It fired at 23:32:36
+  and again at 23:35:39, after the bridge's retries.
+  **Fixed 2026-10-25:** the 6 s is now only a deadline. With no
+  `id3 = 3` the pending play is dropped, not sent.
+* **Either side can break the cycle.** The bridge could skip the retry while
+  its cloud state reads `/3` or `/1`. Or the broker could hold a repeat
+  `0x8101` within ~30 s of the last chain. Neither is implemented.
+
+### 16.4 `.107` fails without the collision too
+
+| time | event |
+|---|---|
+| 23:31:55 | register → `0x8101` |
+| 23:31:58 | `id3 = 3` |
+| 23:32:01 | hello → `:59890`, then `0x8004` (p2p bound) |
+| 23:32:18 | `id3 = 0`, without passing through 1 |
+
+The next bridge retry came only at 23:32:28.
+
+Everything visible was the same for both cameras:
+- the same sequence of frames;
+- a `0x0005` with the same `vendor-ack`;
+- one redraw of the RTP port after the first `0x8101` (`.107` `53298 →
+  59890`, `.108` `52508 → 52241`).
+
+The 22:28 box says a power cycle revives `.107`. This one, at ~23:31, did
+not. **Open.**
+
+### 16.5 The app no longer tries P2P (23:37 and 23:40)
+
+Two app sessions on `.107` went through the broker (phone
+`192.168.68.106`). Both took the same path within 10–16 s:
+1. `/ipc/<uid>`
+2. `current-package`
+3. `notify-live-event?eventType=5`
+4. one `eventType=0`, at 23:40:15
+5. `send-cmd` ×2
+6. `eventType=3`
+
+There was no `run-info`, no `send-stun-addr` and no `stun-addr` polling.
+No STUN from the phone reached the broker between 23:20 and 23:39. At
+13:47 (§14) the same app tried P2P first.
+
+What differs. None of these is confirmed **(inferred)**:
+1. **`relay_ip` in the device row.** The broker runs with `--relay-port
+   58918`, so the row carries `relay_ip = 192.168.68.114:58918` and
+   `server_ip`. But the vendor's rows carried a `relay_ip` too
+   (`156.246.16.114:554`, README).
+2. **`.107`'s sig link.** It was "not connected" by 23:38:35, yet the row's
+   `onlineState` is always `"1"`.
+3. **The app may remember** the 13:47 P2P failure.
+
+The test that separates them:
+- start the broker without `--relay-port`;
+- stop the bridge (its retries re-registered its own viewer mid-session, at
+  23:38:35);
+- register `.107` fresh;
+- open the app once.
+
+> **Partly resolved statically, 2026-10-25 (§17.3).** What is proven:
+> the app has a punch-timeout → relay fallback — the punch completion
+> callback maps `1` (established) → `start` and `0` (timeout) → **relay**,
+> logging `公网 IP 获取异常, 走转发`; `natType` is never read by the app
+> (only `fromJson`/`toJson`), killing hypothesis 2's neighbour field; and
+> `relay_ip` is read only *inside* the relay branch, so hypothesis 1 cannot
+> *select* relay — an empty `relay_ip` only makes the relay attempt itself
+> fail. Still open: at 23:37 the app sent no `send-stun-addr`, and the
+> punch runs only *after* `send-stun-addr` inside `_prepareForStun`, so the
+> app apparently reached relay without punching at all. The entry point
+> that sets `connectType` to relay on page open is not traced
+> (`HomePageAction.debugActionForForwardConnect` is a debug-only action;
+> the normal path is not). A capture of the app's own log at that moment
+> (`P2P Server 连接超时` vs `获取转发地址异常`) would settle it.
+
+### 16.6 Two lab conditions that looked like protocol failures
+
+* **The host went to sleep.** GNOME's `gsd-power` idle-suspended the laptop
+  at 22:44:45 for 41 min. The sig links died, and `.108` did not come back
+  until it was power-cycled. The telltale is a gap in the bridge log where
+  even the 30 s stats line stops.
+* **The cameras transmitted but did not receive (21:17).** `.108` broadcast
+  `who-has 192.168.68.1` 24 times in 25 s and got no answer. Neither
+  camera answered the host's ARP, and sig never completed. A power cycle
+  cleared it.
+
+Read `ip neigh` and an ARP capture before reading a protocol fault into a
+silent camera. That is the same lesson as the firewalld episode.
+
+### 16.7 Compliance against the 21:32 broker
+
+This audits the main checkout against this document (camera plane) and the
+13:47 capture (app plane).
+
+* **Matches:**
+  - the frame layout, the XOR and the `0x0D` end byte;
+  - STUN `0x0020`;
+  - the `0x8000`, `0x8101` (offsets 20/40/42/62), `0x8004` and `0x8002`
+    bodies;
+  - `mediaState` taken from `0x0004`;
+  - `0x8005` off by default;
+  - the AGENTS.md rules.
+* **Fixed by 21:32** (open in §15):
+  - `IpcPublic*` is the camera's own pair, from `0x0003`;
+  - `seqNo` is per camera and shown only after the camera reports;
+  - STUN replies go out via `IP_PKTINFO`;
+  - unknown commands get a vendor-shaped `0x8001`; the sweep sits behind
+    `ack_sweep`, off.
+* **Still open:**
+  - **The unknown-command `vendor-ack` body is 6 bytes:** `00 | cSeq | cmd
+    | 00`. For example `00 00 0b 00 05 00` answers `.108`'s `0x0005` seq
+    11 (23:32:30); this is proven from the broker's log and code. Read with
+    the 5-byte layout, it says cSeq `0x0000`, cmd `0x0b00`.
+
+    What the vendor sends for `0x0005` is **not known**. Every one of the
+    vendor's 1,138 `0x8001`s in the 2 h wiretap (`~/ziot-wiretap.log`,
+    2026-10-23) is 5 bytes, `cSeq | cmd | ack`: 570 answer `0x0002` and 568
+    answer `0x0004`, all with ack = 0. The broker's own `0x0002`/`0x0004`
+    acks match that. But in that session the camera sent only `0x0001`,
+    `0x0002`, `0x0004`, `0x0021` and `0x1601`, never `0x0005`. So a 5-byte
+    answer to `0x0005` is an extrapolation **(inferred)**.
+
+    The 13:47 phone capture cannot settle it. It holds no sig traffic
+    at all: no port 8882, and nothing to or from 47.110.77.193 or
+    47.97.71.82.
+
+    It is not shown to do harm: `.108` gets this ack every session and
+    streams.
+  - `eventType=5` → `0x8005` is held by design (`--relay-start`).
+  - `GET /api/v1/lang/pt` answers 404. The app asks for
+    `/v1/lang/applang` (§17.5); the vendor's answer shape is unknown and
+    the app carries on without it.
+  - The bridge's ~60 s retry can still send a fresh `0x8101` into a view
+    that is coming up (§16.3). That retry lives in the bridge, not the
+    broker.
+
+---
+
+## 17. What the app's own code settles (2026-10-25, Blutter)
+
+Read from the app's AOT snapshot (`/tmp/opencode/out`, same build as
+`DECOMPILATION_REPORT.md`; Dart addresses are that snapshot's). This maps
+the *app-side* of the connect flow — the part the wire captures could only
+hint at. Where a claim is an inference it is marked.
+
+### 17.1 The connect pipeline
+
+Opening a camera runs `CameraPageController.connectType` →
+`handleActionForPrepare` (`0x86dd74`) → `handleCameraConnect`
+(`0x71e0f8`), which switches on the `CameraConnectState` index (§1.4):
+
+| state | what the app does |
+|---|---|
+| `prepare` (1) | the cached-stun fast path if `isCacheStun()` (§17.3), else `_prepareForStun` (§17.4) |
+| `start` (2) | immediately recurses into `p2p` |
+| `p2p` (3) | `requestSendConnectState` (§17.2) + `requestSendHeart` (eventType=0) + `_startFCMediaRTSP` (the local ZLMediaKit player) |
+| `relay` (4) | reads `infoModel.relay_ip` (logs `当前转发地址是: `), `setupRelayVideo(relay_ip, cb)`, then `requestSendRelay` = `eventType=5`; empty `relay_ip` does **not** prevent the notify — the player callback reports `获取转发地址异常` and exits |
+| `directConnect` (5) | `directConnectVideoRtpPush` if the `rtpPush` arg is `"1"`, else `directConnectVideo(directUrl)` |
+| `stop` (6) | `requestSendStop`: teardown notify — `eventType=2` (pause) only for CacheStun devices, otherwise **`eventType=3` (stop)** — then `_stopP2PSocket` + `_stopFCMedia` |
+
+`handleActionForPrepare` first gates on `isFree()` (§2.1): if the device
+row's `mediaState` is not `"0"` it logs `设备繁忙, 请稍后再试` and
+**exits without connecting**. The broker must serve `mediaState "0"` when
+idle or the app refuses to open the camera at all.
+
+### 17.2 `eventType=4` is these units' live-start notify
+
+`requestSendConnectState` (`0x725a4c`) picks its event by
+`infoModel.supportCacheStun()` (`0x65a54c`):
+
+```dart
+requestSendEvent(supportCacheStun() ? CameraEventType.start   // 1
+                                    : CameraEventType.connected); // 4
+```
+
+`supportCacheStun()` is `deviceNeedUpdate(version, "TXW817_A_V1.0.11.46")`
+for an X5 — **true only when the firmware is older than V1.0.11.46** — and
+unconditionally true for every other camera type. Both units run
+`TXW817_A_V1.0.12.32`, so on our cameras the app's "P2P established"
+notify is **`eventType=4` (connected), never `eventType=1`**. The vendor-era
+captures' `eventType=1` (§14.1) must predate this app/firmware pair
+**(inferred)**.
+
+There is no firmware handler identified for "connected" (§4 has no such
+arm); **(inferred)** the cloud triggers the same `0x8004`/1 play it would
+for start.
+
+### 17.3 The cached-stun fast path — dead code for our units
+
+`isCacheStun()` (`0x7275b0`) = `supportCacheStun()` **and**
+`StunManager.cacheUID() == uid`. On an X5 ≥ V1.0.11.46 it is always false,
+so `handleCameraConnect` always logs `旧的逻辑` ("old logic") and runs
+`_prepareForStun`. The cached path (worth knowing, dead here): it reads the
+per-uid `StunState` (`rtpPortWithUid`, `0x72754c`) and picks **`p2p`** if
+the state is `success`/`heartLive`/`pause`, else **`relay`** — this, not
+the punch, is the app's "remembered P2P works/failed" switch.
+`StunState` (`pp.txt`): working(0) success(1) failed(2) init(3) none(4)
+pause(5) heartStart(6) heartLive(7) relay(8).
+
+### 17.4 The P2P punch, from the app's side
+
+`_prepareForStun` (`0x725b84`):
+
+1. Draws the viewer punch port: `Random().nextInt(10001) + 50000`
+   → **50000–60000** (stored in a static; this is the port that goes into
+   `send-stun-addr` as `privatePort`).
+2. `checkStunPublicAddress` ×2 (the phone's own STUN); both null → toast
+   `网络异常` and give up.
+3. `requestStunAddress` = `GET send-stun-addr` with the four fields.
+4. `_startConnectDevice` → `_startP2PConnect` (`0x725fe0`).
+
+`_startP2PConnect` binds a UDP socket on `anyIPv4` (log `UDP Server
+listening on `), starts the **1 s** punch `Timer.periodic`
+(Duration 1,000,000 µs — the §4.3 constant), and listens:
+
+* every datagram **from the camera** decrements a counter seeded at **20**
+  and logs `P2P Serve 接收到消息, 需要重新发几次` ("received, must resend
+  a few more times") while the counter is > 9;
+* when the counter drops to ≤ 9 — **~10 datagrams in** — it logs
+  `P2P Serve 连接设备: 成功 success`, closes the socket, and calls the
+  completion with **1**;
+* a timeout path logs `P2P Server 连接超时` and calls the completion with
+  **0**.
+
+The completion (`0x726af4`) maps `1` → callback(**2**), `0` →
+callback(**4**); the `handleActionForPrepare` closure (`0x86df24`) maps
+`2` → `CameraConnectState.start`, `4` → `CameraConnectState.relay`
+(anything else → log `公网 IP 获取异常, 走转发` → relay).
+
+Two consequences:
+
+* **The punch succeeds only if the camera answers.** The success criterion
+  is *receiving* ~10 datagrams, so the camera must send datagrams back to
+  the viewer while it waits **(inferred from the app; the firmware's P2P
+  thread, §13.2, is only documented to recvfrom and stamp — its reply, if
+  any, is not traced)**. That turns §16.2's inference ("the camera sends
+  its RTP to the source of the hellos it hears") into a functional
+  requirement on both sides: no camera replies → no live view, straight to
+  relay.
+* **A silent camera produces relay, not an error.** This is the fallback
+  behind §16.5.
+
+### 17.5 `get-sig-ip` and `lang` — the two former 404s, from the app's side
+
+* **`GET /v1/ipc-function/get-sig-ip`** (`CameraAPI.requestSigIPAddress`,
+  `0x782dbc`): sent with param `supportLoadBalance=1`. The app reads
+  `answer["code"]` and **when it equals 400** takes `answer["data"]` (a
+  string) and passes it to `Application.saveSigAddress` →
+  `SpUtil.putString("icpSigAddress", …)`. That `icpSigAddress` is exactly
+  the `urlAndPort` the BLE `wifiConnect` frame carries
+  (`DECOMPILATION_REPORT.md` §14.0). So **serving
+  `{"code": 400, "data": "<bridge-LAN-addr>:8882"}` makes the app
+  provision cameras with the bridge's sig server** — the cleanest adoption
+  lever there is. The broker serves that answer (`HttpApi.sig_address`,
+  2026-10-25). (The vendor using `code 400` as the success marker here
+  is what the code says; not confirmed against the vendor's answer.)
+* **`lang`**: a field of the `POST /v1/login` body; the app also fetches
+  dictionaries from `/v1/lang/applang` (path built in `request.dart`,
+  `/v1/lang/` + `applang`) and caches them under `lang_data_map_<…>`. The
+  answer shape is unrecovered; the app carries on without it (§16.7).
+
+### 17.6 `natType` is never read
+
+`natType` appears only in `CameraInfoModel.fromJson`/`toJson` (`0x60c444`,
+`0x60d45c`). No Dart code branches on it. Any theory that makes the app's
+connect path depend on the device row's `natType` is dead.
+
+### 17.7 Broker implications (in the broker as of 2026-10-25)
+
+1. **`eventType=4` is mapped like `eventType=1`** (`schedule_p2p_live` →
+   `0x8101`, then `0x8004` value 1 once the camera reports `id3 = 3`).
+   On these units the app sends `connected`, not `start`.
+2. **`GET /v1/ipc-function/get-sig-ip`** answers
+   `{"code": 400, "data": "<this broker>:8882"}` (`HttpApi.sig_address`).
+   The app saves that as `icpSigAddress` and puts it in the BLE
+   `wifiConnect` frame (§17.5). The sig plane off (`--sig 0`) answers
+   `data: ""`.
+3. **`mediaState` is `"0"` whenever nothing is live.** A sig link
+   closing resets it (the camera can no longer report the stop), and
+   loading the camera file at startup does the same. A non-zero value
+   makes the app exit with `设备繁忙` (§17.1).
+4. **The punch needs camera replies** (§17.4): the app's punch only
+   completes after ~10 datagrams back from the camera. If a firmware stops
+   answering hellos on its RTP port while `peerToPeerFlag == 1` (§13.2),
+   app-side live view dies to the relay fallback even when the bridge's own
+   punch still works. That reply is the camera's, not something the
+   broker can send.
+
+---
+
+## 18. Live run, 2026-10-25 07:39–08:55: the overnight stop, and a restart on the 08:27 broker
+
+Sources: the broker log (`~/ziot-broker.nohup`), the bridge log
+(`~/ziot-bridge.nohup`), and a 4-minute capture of both cameras taken
+across the restart (08:45:28–08:49:28, `tcpdump -i any`).
+
+### 18.1 What stopped the stream overnight
+
+It was the host, not the protocol. This is the §16.6 condition again.
+* At 00:00:27 GNOME idle-suspended the laptop (`sleep-inactive-ac-type =
+  'suspend'`, 900 s, on AC power). It resumed at 07:39:30. The bridge
+  log has a gap from 00:00:34 to 07:39:31, then
+  `send-stun-addr: Network is unreachable`.
+* At 07:39:38 `.108` re-registered **without having rebooted** (its sig
+  counter carried on at 210). The chain ran: `0x8101`, `id3 = 3`, hello,
+  then `0x8004 (p2p bound)` at 07:39:47. The camera went `3 → 0` and never
+  reached 1.
+* Its sig TCP then stalled for 31 s. At 07:40:33 the stall ended with 15
+  coalesced `0x0002`s in one 360-byte read, and the link dropped. `.108`
+  stayed off sig until it was power-cycled at 08:36:15 (counter back to 1).
+  `.107` behaved the same way.
+* After the 08:36 power cycle, `.108` streamed on the *21:32* broker,
+  without a code change.
+
+### 18.2 `.107`: transmits, does not receive
+
+From 08:37:18 to at least 08:49, `.107` broadcast `who-has
+192.168.68.114` about once a second: 225 requests in the 4-minute
+capture. The host answered all 225, and the camera kept asking. The
+host's own ARP probes to `.107` went unanswered (`ip neigh` stayed in
+`PROBE`). The bridge's punches (280 datagrams) went out, and nothing came
+back.
+
+So the camera's unicast receive path was dead. It could not reach sig
+and could not send media. `.107` had gone `id3 = 1` at 08:37:17 (after
+the old broker's fallback play) and dropped sig one second later. A
+power cycle cleared it at 08:56.
+
+This was first read as a radio fault. §18.6 shows the chain failing on
+our side first, so that reading is withdrawn: `.107` streamed through
+this broker on 2026-10-24 16:14.
+
+### 18.3 The camera streams to the `0x8101` viewer pair, not the hello source
+
+The 08:45:30 restart of both processes settles §16.2's inference, and
+settles it the other way.
+* The restored viewer file made the register-time `0x8101` (08:45:31)
+  name the *old* bridge port `:46320`. The new bridge process was on
+  `:59394`.
+* From 08:45:33 the new bridge punched the camera's RTP port `:54095`
+  from `:59394` (24 datagrams by 08:45:52).
+* After the play (08:45:40) the camera streamed **from `:54095` to
+  `:46320`**: 1,004 packets, 08:45:42–08:45:53, ~85/s. That is a port
+  nobody was listening on.
+* Media moved to `:59394` only at 08:45:52. That was after the bridge's
+  retry had sent a `0x8101` naming `:59394` (08:45:48), the camera had
+  re-bound on `:58310`, and a new play had gone out (08:45:53).
+* Before each play, the camera's P2P socket sent single datagrams to the
+  `0x8101` pair: 08:45:37, :40 and :41, from `:54095` to `:46320`.
+  These look like its own punches. They are the datagrams §17.4 says the
+  app's punch counts **(inferred)**.
+
+So the hello only satisfies the P2P thread. **The media goes to the pair
+in the `0x8101`.** A `0x8101` naming a stale port wastes the whole view.
+
+### 18.4 The registration number the camera echoes is the `0x8101` *header* seq
+
+In every chain since 22:27, the `0x0003`'s field at body offset 44
+equals the header seq of the `0x8101` just sent. It never equals the
+body's bytes 0–1, where the broker puts `pending_seq`. The redraw report
+that follows carries 0.
+
+| `0x8101` sent | header seq | camera's `0x0003` n |
+|---|---|---|
+| 22:27:47 `.107` | 1 | 1 |
+| 22:28:24 `.108` | 13 | 13 |
+| 23:32:50 `.108` | 15 | 15 |
+| 07:39:38 `.108` | 210 | 210 |
+| 08:36:39 `.108` | 15 | 15 |
+| 08:45:48 `.108` | 87 | 87 |
+
+So `stun-addr`'s `seqNo` is the camera's own sig counter. It never equals
+the number `send-stun-addr` answered with. §14.1's round trip, where the
+app waits for its own number, cannot close as the broker is built. It
+also falls back to 1 when the camera reboots, and the bridge then logs
+`stale stun rejected: seqNo 1 < 210` until its next re-rendezvous.
+§12.1's "registration number" field is real; it is fed from the header,
+not from the body.
+
+### 18.5 The restart, on the 08:27 broker
+
+Both processes were restarted at 08:45:30, with unchanged flags.
+* `.108` re-dialled sig 1 s after the old broker died: it got RST, then
+  SYN-ACK at 08:45:30.5. It re-registered at 08:45:31.
+* The chain was `(p2p bound)` both times; the dropped fallback never
+  fired.
+* The camera went live at 08:45:42 to the stale port (§18.3), and live
+  to the bridge at 08:45:54.
+* From then on: 7.4–8.0 fps, `re_rendezvous` flat at 2, 3,579 frames by
+  08:53:41. A grabbed MJPEG burst decodes as 640×480 frames. One frame
+  in 25 (the first one served) was truncated; main's bridge does not
+  carry the frigate branch's drop-incomplete-frames fix.
+
+The ~20 s of dead air at boot comes from `schedule_p2p_live`. The
+bridge's first `send-stun-addr` with its new port (08:45:33) was a no-op,
+because a chain was already pending with the restored, stale pair. The
+right pair went out only on the bridge's next retry.
+
+### 18.6 `.107` fails because the hello goes to the wrong port, and the host firewall hides the right one
+
+Every `.107` chain since 22:27 sent one or two `0x0003` reports after the
+`0x8101`. One was the report that answers it (`n` = the `0x8101`'s
+header seq), and one was a redraw with `n = 0`. The broker sends its
+hello to the **newest** port (§0, the 22:28 box). The outcome follows
+whether the two ports agree:
+
+| `.107` chain | answering report | redraw | hello to | result |
+|---|---|---|---|---|
+| 22:27:47 | 53693 | 55684 | 55684 | live, then died ~30 s |
+| 23:31:55 | 53298 | 59890 | 59890 | 3 → 0 |
+| 23:35:15 | 53298 | 54739 | 54739 | never live |
+| 23:48:22 | 52506 | 55727 | 55727 | never live |
+| 07:40:06 | 53298 | 58851 | 58851 | 3 → 0 |
+| 08:36:23 | 53298 | 53830 | 53830 | 3 → 0 |
+| **08:56:41** | **52901** | **52901** | **52901** | **live** |
+| 08:58:14 | 53298 | 54611 | 54611 | never live |
+| 09:02:05 | 53691 | 50156 | 50156 | never live |
+
+The 08:58 capture shows where the P2P socket really was.
+* From 08:58:21 to 08:58:37 the camera sent its own 18-byte punch every
+  2 s from **:53298**, the answering report's port, to the `0x8101` pair
+  (`.114:51608`). The broker's hello and the bridge's punches all went
+  to :54611.
+* At 09:02 it was the same: punches came from :53691, and the hello went
+  to :50156.
+* So `.107`'s waiting socket is the *answering* port, and it never heard
+  a hello. `.108` has gone live with the hello on the redraw port
+  (22:28, 08:36), so the broker has to punch **both**.
+* `.107` boots with 53298 as its first port almost every time, which is
+  why it fails so consistently.
+
+**The host firewall hides the camera's own punches.** firewalld's
+`public` zone (where `wlan1` sits) opens the broker's ports (80/8882/
+7080/13478) but not the bridge's UDP ports, which are ephemeral.
+* A camera datagram reaches the bridge only if it matches a conntrack
+  entry made by the bridge's own punch, i.e. only from the exact port
+  the bridge punched.
+* Every `.107` punch from :53298 and :53691 was answered with `ICMP host
+  unreachable - admin prohibited` (17 in the `.107` capture).
+* So was all of `.108`'s media to the stale `:46320` after the restart
+  (§18.3).
+* With the firewall in the way, the bridge never sees the camera's real
+  port, and media from a port it did not punch is dropped.
+
+**What the camera does after a failed chain.**
+* At 08:58:22.372 our `0x8004` was never acked. The TCP retransmits ran
+  to 08:58:35, and the camera re-sent its own ping because it never saw
+  our acks.
+* It closed sig at 08:59:08 and re-registered **with seq 1** at 09:02:05,
+  i.e. it rebooted.
+* In the 08:56:50 cycle it streamed for 24 s, then everything stopped
+  at 08:57:15.1. It re-registered with seq 1 at 08:58:14, 59 s later,
+  close to the 61 s sig watchdog (§13.4).
+* Nothing unusual was sent to it before that stop: `.108` gets the same
+  heartbeats, acks and 60 bridge punches a minute, and holds. That death
+  stays **open**.
+
+Fixes:
+* **Broker:** punch every port the camera reported since the last
+  `0x8101`.
+* **Broker:** re-send a pending `0x8101` when the viewer pair changes
+  (§18.5).
+* **Host:** accept UDP from the cameras in firewalld. On the homelab
+  server, which runs ufw, the same rule is needed.
+
+### 18.7 A burst of `0x8101`s takes a live camera off the network
+
+09:14, broker with the §18.6 port fix, before the firewall rule was in:
+* `.108` reported two ports (51873, then 51781). The hello went to both,
+  and it went live at 09:14:43. **It streamed from :51783, a port it
+  never reported.** The bridge had punched only :51781, so firewalld
+  rejected the whole stream (`admin prohibited`). The camera's media
+  port cannot be predicted from its reports, so the firewall rule is
+  required. Conntrack luck is not enough.
+* The bridge saw nothing and retried: a `0x8101` with the same pair at
+  09:14:53, 09:15:03 and 09:15:23. The camera never reported `id3 = 3`
+  again, and each play was dropped.
+* At 09:15:32 its sig TCP flushed a 365-byte coalesced burst, and the
+  link dropped. `.108` was still off sig at 09:38: neighbour `DELAY`,
+  no reconnect.
+
+This is the same shape as `.108` at 07:40 and `.107` at 08:37: repeated
+`0x8101`/plays into a camera that is live or coming up, then a stall,
+then a deaf camera. The vendor app sends one `0x8101` per session. The
+broker now holds a same-pair `0x8101` sent within `P2P_RESEND_MIN_S`
+(30 s) of the last one. A changed pair, or a camera that has just
+registered, always gets one. Why the camera wedges is not traced in the
+firmware **(open)**.
+
+### 18.8 `stun-addr` must serve the report that answers the `0x8101`, not the latest one
+
+10:23, after a power cycle, with the firewall rule in and the §18.6/§18.7
+broker. **`.108` streamed, `.107` did not:**
+
+| | answering report (`n` = `0x8101` header seq) | redraw (`n = 0`) | the bridge punched | camera punched us from | result |
+|---|---|---|---|---|---|
+| `.108` | 51323 | 58952 | **51323** | — | live; media from :58954 |
+| `.107` | **52508** | 56481 | 56481 | **52508** | play never acked |
+
+* The broker's hello reached both ports, including `.107`'s P2P socket
+  `:52508` at 10:23:11.466.
+* What differed is the **bridge's** punch, which comes from the viewer
+  address named in the `0x8101`. The bridge punches `stun-addr`'s
+  `IpcPrivatePort`, and the broker serves the *latest* report.
+  * For `.108`, the bridge's 5 s poll landed between the two reports,
+    so it kept punching the answering port.
+  * For `.107`, the poll landed after the redraw, so the P2P socket only
+    ever heard the broker's hello, from `.119`.
+* `.107`'s 08:56 success fits too: both reports named :52901, so the
+  bridge punched the P2P socket.
+* Once more, `.107` stopped acking sig at the play: our `0x8004`
+  (10:23:11.917) was retransmitted, and the camera re-sent its own status
+  because it never saw our acks.
+
+The vendor's record behaves the other way (§14.1). `stun-addr` moved to
+seqNo N when the camera's `0x0003` echoed N, and `IpcPrivatePort` stayed
+fixed across reports. So the broker now remembers the report whose `n`
+equals the last `0x8101`'s header seq (§18.4) and serves that pair from
+`stun-addr`. A redraw no longer moves the bridge's punch target.
+
+**(inferred)** PlayLiveview sets the flag to 2 and closes the P2P socket
+(§13.3). It seems to need the viewer's datagrams arriving on that socket
+to finish cleanly. Without them, the camera's receive path wedges.
+
+**Correction, 10:29: the bridge's punch is not required for `.108`.** At
+10:27:53, on the broker with this fix, `.108` reported :58952 (answering
+`0x8101` seq 42) and then :55702. It went live at 10:27:59, and media
+reached the bridge from :55704. All that time the bridge was still
+punching **:51323**, the previous chain's port; it does not re-poll
+`stun-addr` while media flows. The camera answered each of those
+punches with `ICMP port unreachable` (410 between 10:23 and 10:29). So
+the only datagrams on `.108`'s P2P socket were the broker's hello from
+`.119`, and that was enough.
+
+What actually decides `.107` is therefore still **open**. Serving the
+answering report matches the vendor (§14.1) and is kept. It recreates
+`.107`'s one success (08:56, the bridge punching the P2P socket), but it
+is not shown to be the cause. `.108`'s frame rate swinging between
+2 and 8 fps (45–85 packets/s on a ~90 s cycle, no gaps, no rejects) comes
+from the camera's own output, not the transport.
+
+### 18.9 Both cameras stream: 10:31, broker with §18.6–§18.8 plus the firewall rule
+
+`.107` was power-cycled and registered at 10:31:50.
+* The answering report was :52508 (`n = 1`). The redraw was :56463.
+* The broker logged `p2p socket :52508 (answers 0x8101 seq 1)` and kept
+  serving that port. The bridge punched :52508, and the hello went to
+  both ports.
+* It went live at 10:31:57, `id3 0 → 1`, and media reached the bridge
+  that same second from :56465, another unreported port.
+* This is `.107`'s first success on a chain whose two reports differ;
+  the earlier eight all failed (§18.6).
+* At 10:33:20: 767 frames, 6.2 fps, no re-rendezvous since the chain.
+  `.108` was alongside it: 16,041 frames, 5.8 fps. The user confirmed
+  both visually.
+
+What it took, in order of evidence:
+1. **The host firewall must accept UDP from the cameras.** Each camera
+   streams from a port it never reports (§18.7, §18.9), so conntrack
+   from the bridge's punch cannot cover it. On the laptop this is a
+   firewalld rich rule in `public`, per camera IP; the homelab server's
+   ufw needs the same.
+2. **The hello goes to every reported port** (§18.6).
+3. **`stun-addr` serves the report that answers the `0x8101`** (§18.8,
+   §14.1).
+4. **There is a floor on same-pair `0x8101` re-sends** (§18.7). A changed
+   pair or a fresh registration always gets one.
+
+Still open:
+* why `.107` died 24 s into its 08:56 stream (§18.6);
+* whether item 3, rather than chance, is what made the 10:31 chain work.
+  `.108` went live without the bridge's punch (§18.8 correction).

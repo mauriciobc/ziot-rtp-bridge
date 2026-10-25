@@ -41,6 +41,7 @@ Usage:
     python3 ziot_fake_cloud.py --provision --ssid S --pwd P --ble-mac MAC
 """
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -180,6 +181,35 @@ KEEPALIVE_INTERVAL = 2.0
 # has asked for the stream -- minutes into a settled session. One
 # pending fire per camera, at most.
 RELAY_START_DELAY_S = 5.0
+
+# How long the direct chain waits for the camera to report its P2P
+# socket bound (mediaState 3) before the pending play is dropped.
+# Sending 0x8004 on this timer, without that report, is what the
+# firmware rejects as "p2p is not finish" and what stopped a view that
+# was still coming up (§16.3). The play goes out only after the report.
+P2P_PLAY_FALLBACK_S = 6.0
+
+# At most one 0x8101 per this many seconds for an unchanged viewer pair.
+# The bridge retries every 5/10/20 s while it sees no media, and each
+# retry re-asks for a 0x8101; a burst of them on a camera that is live
+# or coming up has taken it off the network until power-cycled
+# (`SIGNALLING_PROTOCOL.md` §18.7). The vendor app sends one a session.
+P2P_RESEND_MIN_S = 30.0
+
+# How long after that report the play waits. The camera's freshest RTP
+# port (its 0x0003) lands just after the report, and the viewer's hello
+# has to reach that port before the play -- PlayLiveview closes the
+# socket the camera was waiting on (§13.3).
+P2P_PLAY_SETTLE_S = 1.5
+
+# The sig socket is a TCP stream, so the camera coalesces queued frames
+# into one read (fifteen 0x0002 pings and a 0x0004 arrived as one
+# 389-byte chunk, 2026-10-24 19:40:11) and a frame can straddle two
+# reads. split_signalling() cuts the complete frames out of that stream;
+# a length field that would make a frame larger than this is a corrupt
+# header rather than a frame that will never close, so the splitter
+# resynchronises on the next magic instead of buffering forever.
+SIG_FRAME_MAX = 4096
 
 
 # The account token the local cloud issues. The camera never sees a
@@ -422,7 +452,7 @@ def vendor_time_answer(uid: str, seq: int, now: float | None = None) -> bytes:
     return signalling_frame(0x8021, seq, uid.encode(), body, pad=False)
 
 
-def vendor_pullvideo_answer(uid: str, seq: int) -> bytes:
+def vendor_pullvideo_answer(uid: str, seq: int, cseq: int | None = None) -> bytes:
     """The vendor's answer to the camera's `cmd 0x0002` (pullVideo).
 
     Captured live from sig.gps555.net on 2026-10-23: the camera's own
@@ -430,15 +460,28 @@ def vendor_pullvideo_answer(uid: str, seq: int) -> bytes:
     The answer is the command with the response bit set (`0x8001`), the
     camera's sequence number, the uid, and a five-byte body:
 
-        00 <03:2> <02:2> 00
+        cSeq:2 | cmd:2 | ack:1
 
-    Both numbers are fixed per request kind, not the sequence number:
-    the capture alternates between `00 03 00 02 00` (the answer to
-    pullVideo) and `00 04 00 04 00` (the answer to the status query).
-    The first is which request this answers, the second the value that
-    request carried.
+    **`cSeq` is the camera's own sequence number** -- its latest, not
+    necessarily the one of the frame being answered: the camera counts
+    up once per frame, and the answer can lag. In all 1134 acks of the
+    2 h vendor wiretap the body's first u16 equals the camera's latest
+    sequence number for that command (535 of them `00 03 00 02 00` and
+    535 `00 04 00 04 00`, the counter usually sitting at 3 and 4, with a
+    tail of `00 04 00 02 00`, `00 05 00 04 00`, `00 08 00 02 00`).
+    `cmd` is the request's own id.
+
+    The frame's own header sequence echoes the frame that is being
+    answered; the two can differ, as in the captured answer below,
+    whose header says seq 2 and whose body says cSeq 3.
+
+    An ack whose cSeq does not match the camera's counter is an ack of
+    nothing. Ours were constant, and the camera answered them by
+    re-asking: thirty `0x0002`s in a burst on 2026-10-24.
     """
-    body = b"\x00\x03\x00\x02\x00"
+    if cseq is None:
+        cseq = seq
+    body = struct.pack("!HH", cseq, 0x0002) + b"\x00"
     return signalling_frame(0x8001, seq, uid.encode(), body, pad=False)
 
 
@@ -466,18 +509,24 @@ def vendor_pushvideo_answer(uid: str, seq: int, url: str = "") -> bytes:
     return signalling_frame(0x8001, seq, uid.encode(), body, pad=False)
 
 
-def vendor_status_answer(uid: str, seq: int, value: int) -> bytes:
+def vendor_status_answer(uid: str, seq: int, value: int,
+                        cseq: int | None = None) -> bytes:
     """The vendor's answer to the camera's status queries (cmd 0x0004).
 
     Captured live from sig.gps555.net on 2026-10-23: the answer is the
     command with the response bit set (`0x8001`) and a five-byte body
-    that echoes the query's value:
+    that is an ack of the camera's request:
 
-        00 <value:2> <value:2> 00
+        cSeq:2 | cmd:2 | ack:1
 
-    For cmd 0x0004 the capture carried `00 04 00 04 00`.
+    `cSeq` is the camera's own sequence number (see
+    `vendor_pullvideo_answer`), `cmd` is the request's id -- 4 for the
+    status query -- and `ack` is 0. The capture's `00 04 00 04 00` is
+    the camera's `0x0004` with seq 4 being answered.
     """
-    body = b"\x00" + struct.pack("!HH", value, value) + b"\x00"
+    if cseq is None:
+        cseq = seq
+    body = struct.pack("!HH", cseq, value) + b"\x00"
     return signalling_frame(0x8001, seq, uid.encode(), body, pad=False)
 
 
@@ -505,7 +554,8 @@ def vendor_relay_trigger(uid: str, seq: int) -> bytes:
 
 
 def vendor_p2p_conn_req(uid: str, seq: int, pub_ip: str, pub_port: int,
-                        priv_ip: str, priv_port: int) -> bytes:
+                        priv_ip: str, priv_port: int,
+                        seq_no: int = 0) -> bytes:
     """The server's cmd 0x8101 -- deliver the viewer's address pairs.
 
     Firmware: CUSTOM_TASK_P2PConnReq, handler 0x1801ba22
@@ -517,8 +567,11 @@ def vendor_p2p_conn_req(uid: str, seq: int, pub_ip: str, pub_port: int,
     camera's side), else pair A; it stores the pick at dev+0xd1 and
     starts its P2P thread, bound to the RTP port, waiting for the
     viewer's first datagram.
+    The 20 bytes the handler never reads carry the registration number
+    (§14.1): the camera echoes it back in its `0x0003`, which is how
+    the cloud knows the camera has answered *this* registration.
     """
-    body = (b"\x00" * 20
+    body = (struct.pack("!H", seq_no) + b"\x00" * 18
             + pub_ip.encode().ljust(20, b"\x00") + struct.pack("!H", pub_port)
             + priv_ip.encode().ljust(20, b"\x00") + struct.pack("!H", priv_port))
     return signalling_frame(0x8101, seq, uid.encode(), body, pad=False)
@@ -537,18 +590,18 @@ def vendor_play_ctrl(uid: str, seq: int, value: int) -> bytes:
 
 
 def vendor_heartbeat(uid: str, seq: int) -> bytes:
-    """The server's cmd 0x8002 -- the live view's heartbeat (§13.4).
+    """The server's cmd 0x8002 -- the live-view heartbeat (§13.4).
 
-    Handler 0x1801b6ca stamps `dev->0x34`, the tick the media state
-    machine checks while a live view plays: 36 s without a stamp and the
-    camera logs `live heartbeat timeout, stop live` and stops
-    (0x1801a628). Once PlayLiveview is in, nothing else stamps it -- the
-    P2P thread that stamped it for every viewer datagram has exited --
-    so the viewer's keepAlive has to reach the camera as this frame. The
-    body is not read; on the first and then every fifth one the camera
-    sends its own cmd 0x0002.
-
-    The body is empty and the length counts the uid alone, like 0x8005.
+    Stamps the camera's liveness tick (`dev->0x34`), the only thing that
+    keeps a playing live view alive once the P2P thread has exited: the
+    camera stops the view 36 s after the last stamp ("live heartbeat
+    timeout, stop live"). The firmware's handler reads nothing from the
+    body, so the frame is the bare header + uid, exactly like the
+    camera's own ping. The vendor's cloud sends one for each app
+    `notify-live-event?eventType=0` (inferred, §13.4 -- the 2 h wiretap
+    held no 0x8002 because no viewer was attached), so the broker sends
+    one per notify(keepAlive) the bridge makes -- every 2 s, comfortably
+    under the camera's 36 s.
     """
     return signalling_frame(0x8002, seq, uid.encode(), b"", pad=False)
 
@@ -573,6 +626,64 @@ def vendor_config_answer(uid: str, seq: int) -> bytes:
     """
     body = b"\x00" * 37 + struct.pack("!HHH", 10000, 15, 15)
     return signalling_frame(0x8601, seq, uid.encode(), body, pad=False)
+
+
+def parse_status_report(body: bytes) -> dict:
+    """The camera's status report (cmd 0x0004) as {id: value}.
+
+    §13.7: the body is a count byte, then that many 4-byte entries
+    `00 id 00 value`. A single report reads `01 00 03 00 VV`; a full
+    one (argument 8) carries ids 1-7 and 9. Wire id 3 is the media
+    state:
+
+    | value | meaning |
+    |---|---|
+    | 0 | stopped |
+    | 1 | direct live |
+    | 2 | relay live |
+    | **3** | **P2P socket bound, waiting for the viewer** |
+    | 4 | the other StopPlay branch |
+    """
+    if len(body) < 1:
+        return {}
+    count = body[0]
+    out = {}
+    for i in range(count):
+        off = 1 + 4 * i
+        if off + 4 > len(body):
+            break
+        ident, value = body[off + 1], body[off + 3]
+        out[ident] = value
+    return out
+
+
+def parse_local_addr_report(body: bytes) -> dict:
+    """The camera's own address report (cmd 0x0003), §12.1.
+
+    The body is 47 bytes:
+
+    | offset | size | field |
+    |---|---|---|
+    | 0 | 20 | public IP, ASCII, NUL-padded (the STUN result) |
+    | 20 | 2 | public port, u16 BE |
+    | 22 | 20 | local IP, ASCII |
+    | 42 | 2 | local port = the RTP port, u16 BE |
+    | 44 | 2 | the registration number the camera is answering |
+    | 46 | 1 | a caller-supplied byte |
+
+    Returns the fields it can read; missing ones are absent.
+    """
+    if len(body) < 44:
+        return {}
+    out = {
+        "public_ip": body[:20].rstrip(b"\x00").decode("utf-8", "replace"),
+        "local_ip": body[22:42].rstrip(b"\x00").decode("utf-8", "replace"),
+    }
+    out["public_port"], = struct.unpack("!H", body[20:22])
+    out["local_port"], = struct.unpack("!H", body[42:44])
+    if len(body) >= 46:
+        out["seq_no"], = struct.unpack("!H", body[44:46])
+    return out
 
 
 def decode_signalling(data: bytes) -> dict:
@@ -606,6 +717,80 @@ def decode_signalling(data: bytes) -> dict:
         out["xor_ok"] = _xor(data[:len(data) - 2]) == data[-2]
     out["body"] = body.decode("utf-8", "replace").rstrip("\x00")
     return out
+
+
+def split_signalling(data: bytes) -> tuple[list[bytes], bytes]:
+    """Cut a sig stream chunk into complete frames, plus the tail.
+
+    The sig socket is a TCP stream, not a datagram socket: the camera
+    coalesces back-to-back frames into one read -- fifteen queued
+    0x0002 pings and a 0x0004 arrived as one 389-byte chunk (2026-10-24
+    19:40:11) -- and a frame can straddle two reads. Decoding such a
+    chunk as one frame failed the XOR check and was answered once, so
+    fourteen pings went unanswered and the camera went silent (the
+    documented silent-probe limbo). Every complete frame has to be cut
+    out and answered on its own.
+
+    The wire shape is signalling_frame's: magic 86 86, the header (cmd,
+    len, seq, uidLen), then `len` bytes -- the uid plus the body -- then
+    the XOR byte and the 0x0D end symbol. `len` counts everything
+    between the header and the XOR.
+
+    Returns (frames, tail): the complete frames in order, and whatever
+    cannot be decoded yet. A frame that straddles the read boundary
+    waits in the tail for the next read; garbage before, between or
+    after frames is dropped, a lone 0x86 at the end is kept because the
+    next read may complete it into a magic, and a length field that
+    would build a frame beyond SIG_FRAME_MAX is treated as a corrupt
+    header rather than a frame that will never close. A candidate frame
+    must also carry the end symbol and a correct XOR, so a magic-shaped
+    accident in the garbage is never emitted -- the scanner then tries
+    the next magic instead, which is how a stray 0x86 sitting right
+    before a real one is survived.
+    """
+    frames: list[bytes] = []
+    pos = 0
+    n = len(data)
+    while True:
+        # The first magic from pos that parses to a complete, valid
+        # frame. A false magic (garbage that happens to start 86 86, or
+        # a stray 0x86 ahead of a real one) can only fail three ways --
+        # header short, frame overlong or incomplete, body not
+        # XOR-checked -- and every failure moves on to the next magic
+        # rather than consuming.
+        scan = data.find(b"\x86\x86", pos)
+        end = 0
+        while scan >= 0:
+            if n - scan < 10:
+                break   # not even a header: it may complete later
+            _cmd, length, _seq, _uid_len = struct.unpack(
+                "!HHHH", data[scan + 2:scan + 10])
+            end = scan + 10 + length + 2
+            if 12 + length > SIG_FRAME_MAX or end > n:
+                scan = data.find(b"\x86\x86", scan + 1)
+                continue
+            frame = data[scan:end]
+            if frame[-1] != 0x0D or _xor(frame[:-2]) != frame[-2]:
+                scan = data.find(b"\x86\x86", scan + 1)
+                continue
+            break
+        if scan < 0:
+            if pos >= n:
+                return frames, b""
+            last = data.rfind(b"\x86\x86", pos)
+            if last < 0:
+                # No whole magic anywhere: a lone 0x86 at the very end
+                # may be the first byte of a magic the boundary split.
+                return frames, (data[-1:] if data[-1:] == b"\x86" else b"")
+            # Wait from the last magic: everything before it is already
+            # judged, and what follows may be a frame's first half.
+            return frames, data[last:]
+        if n - scan < 10:
+            return frames, data[scan:]
+        frames.append(data[scan:end])
+        pos = end
+        if pos >= n:
+            return frames, b""
 
 
 def arm_target(viewer: dict, relay_ip: str, relay_port: int,
@@ -772,26 +957,67 @@ class StreamHandler(socketserver.BaseRequestHandler):
             if raw:
                 uid_len = decoded.get("uid_len", 12)
                 body3 = raw[10 + uid_len:-2]
-                if len(body3) >= 44:
-                    pub_ip = body3[:20].rstrip(b"\x00").decode(
-                        "utf-8", "replace")
-                    pub_port, = struct.unpack("!H", body3[20:22])
-                    loc_ip = body3[22:42].rstrip(b"\x00").decode(
-                        "utf-8", "replace")
-                    loc_port, = struct.unpack("!H", body3[42:44])
+                report = parse_local_addr_report(body3)
+                if report:
+                    pub_ip = report["public_ip"]
+                    pub_port = report["public_port"]
+                    loc_ip = report["local_ip"]
+                    loc_port = report["local_port"]
                     log("stun-report", peer,
                         f"uid={uid} public={pub_ip}:{pub_port} "
                         f"local={loc_ip}:{loc_port}".encode())
                     if api is not None:
+                        # The camera's local pair is its RTP port -- the
+                        # one the P2P socket binds (§13.2), and the one
+                        # the viewer's hello has to reach.
                         api.set_camera_address(uid, loc_ip, loc_port)
+                        # Every distinct port is kept: the camera may
+                        # answer the 0x8101 from one and redraw (§18.6).
+                        api.note_p2p_port(uid, loc_port)
+                        # Its *public* pair is what the vendor's
+                        # stun-addr serves as IpcPublic* (§14.1: the
+                        # public pair is the camera's own STUN mapping,
+                        # not the viewer's). It was parsed and thrown
+                        # away until now.
+                        api.set_camera_public(uid, pub_ip, pub_port)
+                        # The registration number this report answers
+                        # (§14.1): the camera echoes the N the cloud put
+                        # in the 0x8101, so the record can show the
+                        # viewer's own number once the camera has
+                        # reported.
+                        if report.get("seq_no"):
+                            api.set_reported_seq(uid, report["seq_no"])
+                        # Only the report that echoes the 0x8101's seq
+                        # names the P2P socket; a redraw must not move
+                        # what stun-addr serves (§18.8).
+                        api.note_p2p_answer(uid, report.get("seq_no", 0),
+                                            pub_ip, pub_port,
+                                            loc_ip, loc_port)
             return
         elif cmd == "0x0002":
             # pullVideo: the camera asking to send its media. The
             # vendor's "go ahead" is what starts the session.
             reply = vendor_pullvideo_answer(uid, seq)
         elif cmd == "0x0004":
-            # a status query; the answer echoes the queried value.
+            # A status query; the answer echoes the queried value.
             reply = vendor_status_answer(uid, seq, 4)
+            if raw:
+                # The camera's own status report (§13.7): a count byte,
+                # then 4-byte entries `00 id 00 value`. Wire id 3 is the
+                # media state, and **3 is the one that matters**: "P2P
+                # socket bound, waiting for the viewer" -- which is
+                # exactly the precondition PlayLiveview checks
+                # (§13.3: it acts only when peerToPeerFlag == 1, else
+                # "p2p is not finish"). So the camera tells us when it
+                # is ready; the play must wait for that, not for a
+                # timer.
+                uid_len = decoded.get("uid_len", 12)
+                body4 = raw[10 + uid_len:-2]
+                state = parse_status_report(body4)
+                if state.get(3) is not None and api is not None:
+                    api.set_media_state(uid, state[3])
+                    if state[3] == 3:
+                        api.p2p_socket_bound(uid)
         elif cmd == "0x1601":
             # the camera asking for its configuration: the ports to use.
             reply = vendor_config_answer(uid, seq)
@@ -812,16 +1038,51 @@ class StreamHandler(socketserver.BaseRequestHandler):
                 except OSError:
                     pass
             # The `0x8000` answer only ARMS the media target; the
-            # unsolicited `0x8005` is what starts the actual send
+            # unsolicited `0x8005` is what starts the relay push
             # (SIGNALLING_PROTOCOL.md §6). Firing it inside the
             # handshake was tried live and broke it (reconnect-loop, no
             # media), so it is OFF unless --relay-start opts in -- and
             # even then it waits RELAY_START_DELAY_S, lands once, and
-            # only on a camera that is still connected. The answer above
-            # alone is enough for the register to settle into a session.
-            if (cmd == "0x0001" and armed[1] and api is not None
-                    and api.relay_start):
-                api.schedule_p2p_live(uid)
+            # only on a camera that is still connected.
+            #
+            # The *direct* chain (0x8101 then 0x8004) is a different
+            # thing and is not the relay: it is what the app's own
+            # live view does, and it is the only chain that has ever
+            # produced frames (2026-10-24 16:14). It must not be
+            # gated behind the relay flag -- doing so silently
+            # disarmed the direct path and left the cameras on the
+            # network, registering, and sending no media at all.
+            if cmd == "0x0001" and armed[1] and api is not None:
+                api.schedule_p2p_live(uid, force=True)
+                # The relay trigger rides the arm as well: the camera
+                # sets its relay-start flag when the 0x8005 arrives, and
+                # the armed address is where it would push. It is a
+                # no-op unless --relay-start asks for it.
+                api.schedule_relay_trigger(uid)
+            return
+        # A command we have no vendor answer for. The protocol is known
+        # now (§4: 0x8001 is the ack, body `cSeq/cmd/ack`), so the
+        # answer is the vendor's own shape with the camera's sequence
+        # number and its command id. The old candidate sweep sent the
+        # camera frames the vendor never sends -- including a `0x8001`
+        # with **no body at all**, which the camera's `cSeq/cmd/ack`
+        # parser cannot read. The sweep is kept behind `ack_sweep` for
+        # experiments; it is off by default.
+        if not self.server.ack_sweep:
+            cmd_id = int(decoded.get("cmd", "0x0"), 16)
+            reply = signalling_frame(0x8001, seq, uid.encode(),
+                                     b"\x00" + struct.pack("!HH", seq,
+                                                           cmd_id) + b"\x00",
+                                     pad=False)
+            log("sig-ack", peer, f"vendor-ack {reply.hex()}".encode())
+            api = self.server.api
+            if api is not None:
+                api.send_to(uid, reply)
+            else:
+                try:
+                    self.request.sendall(reply)
+                except OSError:
+                    pass
             return
         candidates = _ack_candidates(uid.encode(), seq,
                                      decoded.get("len", 0),
@@ -865,6 +1126,10 @@ class StreamHandler(socketserver.BaseRequestHandler):
     def handle(self):
         peer = self.request.getpeername()
         buf = b""
+        # The sig stream's undecoded tail: a frame that straddles two
+        # reads waits here until its second half arrives (the camera's
+        # TCP stream coalesces and splits frames freely).
+        sig_buf = b""
         # Per-kind idle timeout. A camera connection goes quiet for
         # 40-90 s while it waits for the server push (measured live,
         # both cameras), so it is held open for just over that: a
@@ -897,11 +1162,20 @@ class StreamHandler(socketserver.BaseRequestHandler):
                         if name.strip().lower() in (b"token", b"authorization"):
                             log("auth", peer, value.strip())
             if self.server.kind == "sig" and not _looks_http(data):
-                decoded = decode_signalling(data)
-                if len(decoded) > 1:
-                    log(self.server.kind, peer,
-                        ("decoded " + json.dumps(decoded)).encode())
-                    self._answer_camera(peer, decoded, data)
+                # The stream carries whole frames back to back, and a
+                # frame can straddle two reads: cut the complete frames
+                # out and answer each on its own. Decoding a coalesced
+                # chunk as one frame once answered fifteen queued pings
+                # with a single bogus ack (xor_ok false) and the camera
+                # went silent from then on (2026-10-24 19:40:11).
+                sig_buf += data
+                frames, sig_buf = split_signalling(sig_buf)
+                for frame in frames:
+                    decoded = decode_signalling(frame)
+                    if len(decoded) > 1:
+                        log(self.server.kind, peer,
+                            ("decoded " + json.dumps(decoded)).encode())
+                        self._answer_camera(peer, decoded, frame)
             # Answer as soon as the headers are complete; the body of a
             # POST is small and arrives with the headers.
             while b"\r\n\r\n" in buf:
@@ -981,6 +1255,16 @@ class StreamHandler(socketserver.BaseRequestHandler):
             for uid, conn in list(api.camera_links.items()):
                 if conn is self.request:
                     api.camera_links.pop(uid, None)
+                    # A dead sig link also ends any live view (the 36 s
+                    # heartbeat check only runs while the sig link is
+                    # up, §13.4, and the camera itself reports 0 on
+                    # stop) -- but the camera can no longer tell us, so
+                    # the row would keep the last `1`/`3` forever. The
+                    # app refuses to open a camera whose `mediaState` is
+                    # not "0" (`设备繁忙`, SIGNALLING_PROTOCOL.md
+                    # §17.1), so a stale busy row locks the app out.
+                    # Reset it to idle, which is what a gone camera is.
+                    api.set_media_state(uid, 0)
         super().finish()
 
 
@@ -1029,7 +1313,8 @@ class HttpApi:
 
     def __init__(self, viewer_file: str = "", camera_file: str = "",
                  relay_host: str = "", relay_port: int = 0,
-                 relay_start: bool = False):
+                 relay_start: bool = False,
+                 sig_host: str = "", sig_port: int = 8882):
         self.cameras: dict[str, dict] = {}
         self.camera_file = camera_file
         # Where each camera's media should be delivered: the viewer that
@@ -1057,6 +1342,11 @@ class HttpApi:
         # a message to it (the "start live" instruction) when a viewer
         # asks for the video.
         self.camera_links: dict[str, object] = {}
+        # Cameras whose live heartbeat (0x8002) could not be sent on the
+        # last beat: a drop is logged once per outage, not once per beat,
+        # because the bridge keeps sending every 2 s whether or not the
+        # camera is listening.
+        self.heartbeat_dropped: set[str] = set()
         # The last sequence number seen from each camera: an answer
         # echoes the sequence of the request it answers.
         self.last_seq: dict[str, int] = {}
@@ -1066,6 +1356,26 @@ class HttpApi:
         # scheduled after each camera's 0x8101, once per camera at a
         # time.
         self.p2p_fire_at: dict[str, float] = {}
+        # The cameras that have reported their P2P socket bound (their
+        # own media state 3, §13.7): the play for these is triggered by
+        # the camera, not by the fallback timer.
+        self.p2p_ready: dict[str, float] = {}
+        # The RTP ports the camera reported since the last 0x8101, in
+        # order: the hello has to reach each of them (§18.6).
+        self.p2p_ports: dict[str, list[int]] = {}
+        # The viewer pair carried by each camera's last 0x8101, so a
+        # pending chain is only reused while the pair is unchanged.
+        self.p2p_sent_pair: dict[str, tuple] = {}
+        # The HEADER seq of each camera's last 0x8101: the 0x0003 that
+        # answers it echoes this number as its seq_no (§14.1, §18.8).
+        self.p2p_sent_seq: dict[str, int] = {}
+        # (public_ip, public_port, local_ip, local_port) of the 0x0003
+        # that answered the last 0x8101 -- the camera's P2P socket,
+        # which `stun-addr` keeps serving through a later redraw.
+        self.p2p_answer: dict[str, tuple] = {}
+        # Monotonic time of each camera's last 0x8101, for the resend
+        # floor (P2P_RESEND_MIN_S).
+        self.p2p_sent_at: dict[str, float] = {}
         # One writer at a time per camera socket: the frames must not
         # interleave. Every send to a camera goes through send_to().
         self.push_lock = threading.Lock()
@@ -1073,6 +1383,30 @@ class HttpApi:
         self._keepalive_thread = None
         self._keepalive_stop = threading.Event()
         self.seq = 0
+        # The registration number per camera (§14.1). Each
+        # `send-stun-addr` takes the next N for that camera and answers
+        # with it; the camera echoes it back in its `0x0003`, and only
+        # then does `stun-addr` show it. One shared counter -- which is
+        # what this was -- never shows the viewer's own number, and the
+        # app waits for exactly that.
+        self.seq_no: dict[str, int] = {}
+        # The N the camera has reported answering.
+        self.reported_seq: dict[str, int] = {}
+        # The N handed to the camera in the last `0x8101`, waiting for
+        # the camera to echo it back in its `0x0003`.
+        self.pending_seq: dict[str, int] = {}
+        # This broker's own signalling address, as `get-sig-ip` serves it
+        # (§17.5): the app saves it as `icpSigAddress` and provisions new
+        # cameras with it over BLE (the wifiConnect frame's `urlAndPort`).
+        self.sig_host = sig_host
+        self.sig_port = sig_port
+
+    def sig_address(self) -> str:
+        """`host:port` of this broker's signalling server, or "" if the
+        sig plane is off."""
+        if not self.sig_port or not self.sig_host:
+            return ""
+        return f"{self.sig_host}:{self.sig_port}"
 
     def add_camera(self, uid: str, ip: str, port: int = 0, pwd: str = "123456"):
         """Register a camera and the address it should be told about."""
@@ -1229,6 +1563,30 @@ class HttpApi:
         if thread is not None:
             thread.join(timeout)
 
+    def send_heartbeat(self, uid: str) -> None:
+        """Turn one bridge keepAlive into the camera's 0x8002 (§13.6).
+
+        Every eventType=0 the bridge sends every 2 s must reach the
+        camera as the heartbeat frame: it is the only thing that stamps
+        the liveness tick during play, and without it the camera stops
+        every live view 36 s after its start (SIGNALLING_PROTOCOL.md
+        §15 item 6). A send whose socket is gone is logged once per
+        outage, not once per beat: the bridge keeps sending every 2 s
+        whether or not the camera is listening, and the log must not
+        drown in the absence.
+        """
+        if self.camera_links.get(uid) is None:
+            if uid not in self.heartbeat_dropped:
+                self.heartbeat_dropped.add(uid)
+                log("push", ("-", 0),
+                    f"uid={uid} 0x8002 heartbeat: camera not connected"
+                    .encode())
+            return
+        self.heartbeat_dropped.discard(uid)
+        # Every frame goes through send_to, so a heartbeat and a normal
+        # answer can never interleave on the socket.
+        self.send_to(uid, vendor_heartbeat(uid, self.last_seq.get(uid, 0)))
+
     def keepalive_due(self, uid: str, now: float | None = None) -> bool:
         """True when this camera is due for a keepalive.
 
@@ -1296,22 +1654,6 @@ class HttpApi:
         # vendor sending on this beat.
         return True
 
-    def live_heartbeat(self, uid: str) -> bool:
-        """Pass a viewer's keepAlive on to its camera as `0x8002`.
-
-        With the keepAlive only logged, every live view ended 35-36 s
-        after its start (live, 2026-10-24): the camera's own heartbeat
-        timeout (SIGNALLING_PROTOCOL.md §13.4). The bridge then saw 10 s
-        of silence and started it again, so Frigate got ~36 s of video
-        and ~14 s of nothing, over and over. Driven by the viewer's
-        keepAlive rather than the broker's own beat, so a camera nobody
-        watches still stops 36 s after its viewer goes away.
-
-        Returns False when the camera has no signalling connection.
-        """
-        seq = self.last_seq.get(uid, 0)
-        return self.send_to(uid, vendor_heartbeat(uid, seq))
-
     def push_start(self, uid: str) -> None:
         """Tell a camera to start sending its media.
 
@@ -1328,7 +1670,7 @@ class HttpApi:
             return
         self.push_relay_trigger(uid)
 
-    def schedule_p2p_live(self, uid: str) -> None:
+    def schedule_p2p_live(self, uid: str, force: bool = False) -> None:
         """Start the vendor's direct live-view chain for a camera (§13).
 
         The register's `0x8000` arm is already out. What the app's own
@@ -1336,14 +1678,28 @@ class HttpApi:
         applies the subnet rule, binds its P2P socket to the RTP port
         and waits for the viewer's hello) followed, 1.5 s later, by
         `0x8004` value 1 (PlayLiveview -- the firmware rejects it while
-        the P2P socket is unbound) and the hello punch. Gated behind
-        --relay-start like the relay trigger.
+        the P2P socket is unbound) and the hello punch.
+
+        This is the DIRECT chain, not the relay: it is not gated behind
+        --relay-start, which only governs the `0x8005` relay trigger
+        (`push_relay_trigger`). Gating this one too is what left both
+        cameras registered and silent on 2026-10-24: the flag went off,
+        the `0x8101` was held, the camera never bound its P2P socket,
+        and `0x8004` was rejected as "p2p is not finish".
+
+        An unchanged viewer pair is not re-sent within P2P_RESEND_MIN_S
+        of the last 0x8101 (§18.7); a moved pair always is. `force`
+        means the camera has just registered: its state is fresh, so
+        any chain and resend floor from the previous connection are
+        stale and dropped first.
         """
-        if not self.relay_start:
+        if force:
+            self.p2p_fire_at.pop(uid, None)
+            self.p2p_ready.pop(uid, None)
+            self.p2p_sent_at.pop(uid, None)
+        if self.camera_links.get(uid) is None:
             log("push", ("-", 0),
-                f"uid={uid} --relay-start off: 0x8101 held".encode())
-            return
-        if uid in self.p2p_fire_at:
+                f"uid={uid} not connected -- 0x8101 skipped".encode())
             return
         viewer = self.viewer_for(uid)
         priv_ip = str(viewer.get("privateIp") or "").strip()
@@ -1360,23 +1716,94 @@ class HttpApi:
             pub_port = int(viewer.get("publicPort") or 0) or priv_port
         except (TypeError, ValueError):
             pub_port = priv_port
+        pair = (pub_ip, pub_port, priv_ip, priv_port)
+        if uid in self.p2p_fire_at:
+            if self.p2p_sent_pair.get(uid) == pair:
+                # A play is already pending for this camera; the camera
+                # does not need a second viewer address.
+                return
+            # The viewer moved (e.g. the bridge restarted with a new
+            # port while the chain for the stale pair was pending): the
+            # camera streams to the pair of the last 0x8101 (§18.3), so
+            # it needs the new one, and a "socket bound" earned by the
+            # old pair must not fire the play (§18.5).
+            log("push", ("-", 0),
+                f"uid={uid} viewer moved -- 0x8101 re-sent".encode())
+            self.p2p_ready.pop(uid, None)
+        age = time.monotonic() - self.p2p_sent_at.get(uid, float("-inf"))
+        if (not force and pair == self.p2p_sent_pair.get(uid)
+                and age < P2P_RESEND_MIN_S):
+            log("push", ("-", 0),
+                f"uid={uid} 0x8101 sent {age:.0f}s ago -- held".encode())
+            return
         seq = self.last_seq.get(uid, 0)
         frame = vendor_p2p_conn_req(uid, seq, pub_ip, pub_port,
-                                    priv_ip, priv_port)
+                                    priv_ip, priv_port,
+                                    self.pending_seq.get(uid, 0))
         if not self.send_to(uid, frame):
             return
+        self.p2p_sent_pair[uid] = pair
+        self.p2p_sent_seq[uid] = seq
+        # The camera re-binds after every 0x8101, so the old answer is
+        # stale too.
+        self.p2p_answer.pop(uid, None)
+        self.p2p_sent_at[uid] = time.monotonic()
+        # The camera re-binds after every 0x8101, so ports reported for
+        # an earlier chain are stale.
+        self.p2p_ports[uid] = []
         log("push", ("-", 0),
             f"uid={uid} seq={seq} 0x8101 viewer "
             f"{pub_ip}:{pub_port}/{priv_ip}:{priv_port}".encode())
-        self.p2p_fire_at[uid] = time.monotonic() + 1.5
+        # The play waits for the camera to bind its P2P socket, which it
+        # signals by reporting mediaState 3 -- `p2p_socket_bound` fires it
+        # then. This deadline only bounds the wait: if the camera never
+        # reports, the play is dropped, not sent (§16.3).
+        self.p2p_fire_at[uid] = time.monotonic() + P2P_PLAY_FALLBACK_S
+
+    def p2p_socket_bound(self, uid: str) -> bool:
+        """The camera says its P2P socket is up: schedule the play.
+
+        `0x8101` tells the camera the viewer's address; it then starts
+        its P2P thread, binds the RTP port and waits there for the
+        viewer's hello. The camera says so itself: its `0x0004` status
+        report carries the media state, and **3** means "P2P socket
+        bound, waiting for the viewer" (§13.7). That is exactly the
+        precondition PlayLiveview checks (§13.3: `peerToPeerFlag == 1`,
+        else "p2p is not finish"), so the play waits for that report --
+        not for a timer.
+
+        The play is then a *short* delay away, not immediate: the
+        camera's `0x0003` with its freshest RTP port lands just after
+        the report, and the viewer's hello has to reach that port
+        **before** the play, because PlayLiveview closes the P2P socket
+        (§13.3) and the app punches before it starts the view (§14.1).
+
+        Live 2026-10-24 21:07: a 1.5 s timer fired the play *before* the
+        camera had bound its socket, and the camera sent nothing -- it
+        sat there asking to pull video (30 x `cmd 0x0002`) and never
+        pushed a byte.
+
+        Returns True when a play was scheduled.
+        """
+        if uid not in self.p2p_fire_at:
+            # No 0x8101 is outstanding for this camera, so there is no
+            # play to schedule.
+            return False
+        now = time.monotonic()
+        self.p2p_ready[uid] = now
+        self.p2p_fire_at[uid] = now + P2P_PLAY_SETTLE_S
+        return True
 
     def serve_due_p2p_fires(self, now: float | None = None) -> int:
         """Send each due `0x8004` PlayLiveview and punch the camera.
 
         A camera that dropped its session before the fire came due is
         skipped: the next register re-delivers 0x8101 and reschedules.
-        The hello punch goes to the camera's RTP port right after the
-        fire, so it lands inside PlayLiveview's wait window.
+
+        The order is the app's (§14.1): the viewer's hello reaches the
+        camera's RTP port first, then the play. The camera's P2P thread
+        is waiting for exactly that datagram, and PlayLiveview closes
+        the socket it was waiting on (§13.3).
         """
         if now is None:
             now = time.monotonic()
@@ -1385,42 +1812,69 @@ class HttpApi:
             if now < due:
                 continue
             del self.p2p_fire_at[uid]
+            ready = self.p2p_ready.pop(uid, None)
+            if ready is None:
+                # The deadline passed with no mediaState-3 report. A
+                # play sent now is the one the firmware ignores
+                # ("p2p is not finish", §16.3).
+                log("push", ("-", 0),
+                    f"uid={uid} 0x8004 dropped -- P2P socket never bound"
+                    .encode())
+                continue
             if self.camera_links.get(uid) is None:
                 log("push", ("-", 0),
                     f"uid={uid} 0x8004 due but not connected -- dropped"
                     .encode())
                 continue
+            # The hello first, at the port the camera has just told us
+            # is its RTP port.
+            self.punch_camera(uid)
             seq = self.last_seq.get(uid, 0)
             if self.send_to(uid, vendor_play_ctrl(uid, seq, 1)):
                 sent += 1
                 log("push", ("-", 0),
-                    f"uid={uid} seq={seq} 0x8004 play-liveview".encode())
-            self.punch_camera(uid)
+                    f"uid={uid} seq={seq} 0x8004 play-liveview (p2p bound)"
+                    .encode())
         return sent
 
+    def note_p2p_port(self, uid: str, port: int) -> None:
+        """Remember an RTP port the camera reported for this chain."""
+        ports = self.p2p_ports.setdefault(uid, [])
+        if port and port not in ports:
+            ports.append(port)
+
     def punch_camera(self, uid: str) -> None:
-        """Send the viewer's hello to the camera's RTP port (§13.2).
+        """Send the viewer's hello to the camera's RTP port(s) (§13.2).
 
         The camera's P2P socket is bound to the RTP port its STUN comes
         from; the first datagram there is the vendor's "App send
         hello". The media goes to the pair the camera armed from
         `0x8101`, not to the punch's source, so any local socket can
-        punch.
+        punch. The camera often reports two different ports per chain
+        (the answer to the 0x8101, then a redraw), and captures show
+        .107's P2P socket on the first while .108 went live on the
+        second (`SIGNALLING_PROTOCOL.md` §18.6), so every distinct
+        reported port gets the hello; one nobody listens on is harmless.
         """
         camera = self.cameras.get(uid) or {}
         ip = camera.get("_ip") or ""
-        port = camera.get("_port") or 0
-        if not ip or not port:
+        ports = [int(p) for p in self.p2p_ports.get(uid) or []]
+        last = int(camera.get("_port") or 0)
+        if last and last not in ports:
+            ports.append(last)
+        if not ip or not ports:
             log("push", ("-", 0),
                 f"uid={uid} no camera address to punch".encode())
             return
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             for _ in range(3):
-                s.sendto(b"hello", (ip, int(port)))
+                for port in ports:
+                    s.sendto(b"hello", (ip, port))
                 time.sleep(0.15)
             log("push", ("-", 0),
-                f"uid={uid} hello x3 -> {ip}:{port}".encode())
+                f"uid={uid} hello x3 -> {ip}:"
+                f"{','.join(str(p) for p in ports)}".encode())
         except OSError as exc:
             log("push", ("-", 0), f"uid={uid} punch failed {exc}".encode())
         finally:
@@ -1507,22 +1961,98 @@ class HttpApi:
             sent += 1 if self.push_relay_trigger(uid) else 0
         return sent
 
-    def set_camera_address(self, uid: str, ip: str, port: int) -> None:
+    def set_camera_address(self, uid: str, ip: str, port: int) -> bool:
         """Record the address a camera's own call came from.
 
         The camera's STUN Binding Request comes from the port its media
         socket listens on, so this is how the vendor's cloud learns where
         a camera is -- and how the bridge learns where to send its
         requests.
+
+        Returns True when the address changed: a camera that re-runs
+        STUN from a *new* port has just bound a new socket (the P2P one,
+        after a `0x8101`), and that is the moment PlayLiveview has to
+        arrive -- the firmware rejects it while the socket is unbound
+        ("p2p is not finish").
+        """
+        camera = self.cameras.get(uid)
+        if camera is None:
+            return False
+        if camera.get("_ip") == ip and camera.get("_port") == port:
+            return False
+        camera["_ip"] = ip
+        camera["_port"] = port
+        self.save_cameras()
+        return True
+
+    def set_media_state(self, uid: str, value: int) -> None:
+        """Record the camera's own media state (§13.7).
+
+        The device list's `mediaState` is the camera's own report, not a
+        server-side opinion: the camera sends it as `cmd 0x0004`, wire
+        id 3. 3 means "P2P socket bound, waiting for the viewer", 1
+        direct live, 2 relay live, 0 stopped.
         """
         camera = self.cameras.get(uid)
         if camera is None:
             return
-        if camera.get("_ip") == ip and camera.get("_port") == port:
+        if str(camera.get("mediaState", "")) == str(value):
             return
-        camera["_ip"] = ip
-        camera["_port"] = port
+        camera["mediaState"] = str(value)
         self.save_cameras()
+
+    def set_camera_public(self, uid: str, ip: str, port: int) -> None:
+        """Record the camera's own STUN mapping (its public pair).
+
+        §14.1: the vendor's `IpcPublicIP/IpcPublicPort` is the
+        **camera's** pair, not the viewer's -- the phone and the camera
+        shared one NAT in the capture, so the IPs matched, but the ports
+        never did. The camera reports it in `cmd 0x0003` (the STUN
+        result at body 0/20).
+        """
+        camera = self.cameras.get(uid)
+        if camera is None:
+            return
+        if camera.get("_pub_ip") == ip and camera.get("_pub_port") == port:
+            return
+        camera["_pub_ip"] = ip
+        camera["_pub_port"] = port
+        self.save_cameras()
+
+    def note_p2p_answer(self, uid: str, seq_no: int, pub_ip: str,
+                        pub_port: int, loc_ip: str, loc_port: int) -> bool:
+        """Keep the 0x0003 that answers the last 0x8101; True if it did.
+
+        The answering report carries seq_no == the 0x8101's header seq
+        (verified in every chain: 1->1, 13->13, 87->87, 210->210); a
+        later "redraw" report carries seq_no 0 and often another port.
+        The P2P socket is the answering report's port (camera .107
+        punched us from it every time, the redraw port got nothing),
+        and the vendor's `stun-addr` serves that record (§14.1, §18.8).
+        """
+        if not seq_no or seq_no != self.p2p_sent_seq.get(uid):
+            return False
+        self.p2p_answer[uid] = (pub_ip, int(pub_port), loc_ip, int(loc_port))
+        log("push", ("-", 0),
+            f"uid={uid} p2p socket {loc_ip}:{loc_port} "
+            f"(answers 0x8101 seq {seq_no})".encode())
+        return True
+
+    def set_pending_seq(self, uid: str, n: int) -> None:
+        """The registration number to carry in the next `0x8101`."""
+        if n:
+            self.pending_seq[uid] = n
+
+    def set_reported_seq(self, uid: str, n: int) -> None:
+        """Record the registration number the camera has reported.
+
+        §14.1: each `send-stun-addr` takes the next N for the camera;
+        the camera echoes N back in its `0x0003`, and only then does
+        `stun-addr` show it. The app waits for its own N and does
+        nothing else until it sees it -- which is why the 13:47 app
+        gave up and went to relay.
+        """
+        self.reported_seq[uid] = n
 
     def save_cameras(self) -> None:
         """Write the camera registry out, so a restart keeps it.
@@ -1550,7 +2080,12 @@ class HttpApi:
             return
         if isinstance(saved, dict):
             for uid, camera in saved.items():
-                if uid not in self.cameras:
+                if uid not in self.cameras and isinstance(camera, dict):
+                    # Nothing is live at startup: a mediaState left over
+                    # from the last run would make the app refuse the
+                    # camera (`设备繁忙`, §17.1) until the camera
+                    # reported again. Idle is "0".
+                    camera["mediaState"] = "0"
                     self.cameras[uid] = camera
                     log("camera", ("-", 0),
                         f"uid={uid} restored from {self.camera_file}".encode())
@@ -1584,37 +2119,32 @@ class HttpApi:
             return {}
         return {"host": self.relay_host, "port": self.relay_port}
 
-    def _stun(self, uid: str, receive_ts: bool = True) -> dict:
+    def _stun(self, uid: str, receive_ts: bool = True,
+              seq_no: int | None = None) -> dict:
         """The camera's address, as the capture shows it.
 
         The two endpoints answer with slightly different shapes, and the
         difference is in the capture: send-stun-addr carries `receiveTs`,
         stun-addr carries `updateTime` instead.
 
-        What comes back is a MIX of the two, and the capture keeps them
-        apart: the **public** pair is the VIEWER's -- the app sends
-        `publicIp=177.221.120.116` (its own NAT address) and the vendor
-        echoes that same public IP back, with the port the viewer's
-        media socket used -- while the **private** pair is the CAMERA's
-        (`192.168.18.75:53693`, the camera's private address and the
-        port its media comes from).
+        **Both pairs are the camera's own** (§14.1, two vendor-era
+        captures): the public pair is the camera's STUN mapping -- the
+        address and port the camera's own STUN call came from, which the
+        camera reports in `cmd 0x0003` -- and the private pair is its
+        local pair, the RTP port its media comes from. The earlier
+        reading (the public pair being the *viewer's*) came from a
+        capture where phone and camera shared one NAT, so the IPs matched
+        and only the ports disagreed.
 
-        So the reply carries the viewer's public address and the
-        camera's private address. The broker learns the camera's private
-        address from the camera's own STUN call, and the viewer's public
-        address from `send-stun-addr`.
+        `seqNo` is the registration number: the one `send-stun-addr`
+        handed out for this camera, but only once the camera has
+        reported answering it (§14.1). The app waits for its own number
+        to come back and does nothing else until it does.
         """
         cam = self.cameras.get(uid) or {}
-        viewer = self.viewers.get(uid) or {}
-        self.seq += 1
-        # The public pair is the viewer's: the app's own public address
-        # and the port its media socket used. Behind NAT the camera's own
-        # public address is not knowable from here.
-        public_ip = viewer.get("publicIp") or cam.get("_ip") or ""
+        public_ip = cam.get("_pub_ip") or cam.get("_ip") or ""
         try:
-            public_port = int(viewer.get("publicPort")
-                              or viewer.get("privatePort")
-                              or cam.get("_port") or 0)
+            public_port = int(cam.get("_pub_port") or cam.get("_port") or 0)
         except (TypeError, ValueError):
             public_port = 0
         out = {
@@ -1623,12 +2153,24 @@ class HttpApi:
             "IpcPrivateIP": cam.get("_ip", ""),
             "IpcPrivatePort": cam.get("_port", 0),
         }
+        answer = self.p2p_answer.get(uid)
+        if answer is not None:
+            # The vendor serves the report that answered the 0x8101
+            # (§14.1, §18.8); a later redraw to another port must not
+            # move the bridge's punch target off the P2P socket.
+            (out["IpcPublicIP"], out["IpcPublicPort"],
+             out["IpcPrivateIP"], out["IpcPrivatePort"]) = answer
         if receive_ts:
             out["receiveTs"] = int(time.time())
-        out["seqNo"] = self.seq
+        # The number: `send-stun-addr` answers with the one it has just
+        # taken for this camera, `stun-addr` with the one the camera has
+        # reported answering (§14.1). The app waits for its own number to
+        # come back before it starts the view.
+        out["seqNo"] = (seq_no if seq_no is not None
+                        else self.reported_seq.get(uid, 0))
         return out
 
-    def _register_viewer(self, uid: str, one: dict) -> None:
+    def _register_viewer(self, uid: str, one: dict) -> int:
         """Remember where the viewer wants the media delivered.
 
         The viewer's address is what the camera is told over the signalling
@@ -1641,6 +2183,10 @@ class HttpApi:
         camera to punch at the wrong address: a restarted broker that
         forgot the viewer would send the camera back to the vendor's own
         STUN server.
+
+        Returns the registration number taken for this camera (§14.1):
+        the next N for it, which the answer carries and the camera
+        echoes back in its `0x0003`.
         """
         try:
             public_port = int(one.get("publicPort") or 0)
@@ -1656,6 +2202,13 @@ class HttpApi:
         self._save_viewers()
         log("viewer", ("-", 0),
             f"uid={uid} -> {one.get('privateIp')}:{private_port}".encode())
+        # The registration number for this camera (§14.1): the next one
+        # for it, which the answer carries, which the `0x8101` carries
+        # to the camera, and which the camera echoes back in its
+        # `0x0003`. Only then does `stun-addr` show it.
+        n = self.seq_no.get(uid, 0) + 1
+        self.seq_no[uid] = n
+        return n
 
     def _save_viewers(self) -> None:
         """Write the viewer registrations out, so a restart keeps them."""
@@ -1749,12 +2302,31 @@ class HttpApi:
                 port = int(cam.get("port") or cam.get("IpcPrivatePort") or 0)
                 self.add_camera(uid, ip, port, cam.get("pwd") or "123456")
             data = "ok"
+        elif path == "/api/v1/ipc-function/get-sig-ip":
+            # §17.5: the app reads the answer's `code` and only when it
+            # equals 400 takes `data` (a plain "host:port" string) and
+            # saves it as `icpSigAddress` -- the urlAndPort its BLE
+            # provisioning frame carries. The vendor's success marker
+            # here really is 400, so this answer deliberately breaks the
+            # {"code": 200, ...} envelope every other route uses.
+            payload = json.dumps({"requestId": str(uuid.uuid4()),
+                                  "code": 400, "msg": msg,
+                                  "data": self.sig_address()}).encode()
+            return _http_response("200 OK", payload)
         elif path == "/api/v1/ipc/send-stun-addr":
             uid = one.get("uid", "")
             # The viewer registers where it wants the media delivered; the
             # camera is told that address over the signalling connection.
-            self._register_viewer(uid, one)
-            data = self._stun(uid)
+            n = self._register_viewer(uid, one)
+            data = self._stun(uid, seq_no=n)
+            # §15 item 5: the viewer address reaches the camera in the
+            # `0x8101`, and the registration number goes with it (the
+            # camera echoes it in its `0x0003`). This is the app's
+            # order: the viewer registers, the camera binds its P2P
+            # socket, the app sees its own number come back and only
+            # then starts the view.
+            self.set_pending_seq(uid, n)
+            self.schedule_p2p_live(uid)
         elif path.startswith("/api/v1/ipc/stun-addr/"):
             uid = path.rsplit("/", 1)[-1]
             stun = self._stun(uid, receive_ts=False)
@@ -1765,19 +2337,46 @@ class HttpApi:
             event = one.get("eventType", "")
             log("notify", ("-", 0),
                 f"uid={uid} event={event}".encode())
-            # The event reaches the camera over the signalling connection
-            # (SIGNALLING_PROTOCOL.md §13.6). eventType "0" (keepAlive) is
-            # the live view's heartbeat, `0x8002`: without it the camera
-            # stops 36 s after each start. Only eventType "1" is "start
-            # live" (verified in the app capture). The other event types
-            # the app sends must not fire the punch: a push fired on a
-            # stop event makes the rotation's reaction -- which can only
-            # be read in the bridge's datagram count -- unattributable.
-            if event == "0":
-                self.live_heartbeat(uid)
-            elif event == "1":
+            # The event reaches the camera over the signalling connection.
+            # eventType "1" is "start live" and "4" is "connected" -- the
+            # app's P2P-established notify, which replaces start on every
+            # X5 newer than V1.0.11.46, i.e. both our units
+            # (SIGNALLING_PROTOCOL.md §17.2). The cloud's translation for
+            # 4 was never captured; the camera has only one live-start
+            # arm (PlayLiveview), so it gets the same chain. The other
+            # event types the app sends must not fire the punch: a push
+            # fired on a stop event makes the rotation's reaction --
+            # which can only be read in the bridge's datagram count --
+            # unattributable.
+            if event in ("1", "4"):
+                # The direct chain's own timing: the 0x8101 goes out now
+                # and the 0x8004 1.5 s later, once the camera has bound
+                # its P2P socket. The caller must not overwrite the due
+                # time -- that would fire the play before the viewer
+                # address had been delivered, and the firmware rejects
+                # PlayLiveview while the P2P socket is unbound.
                 self.schedule_p2p_live(uid)
-                self.p2p_fire_at[uid] = time.monotonic() + 1.0
+            elif event == "0":
+                # §13.6/§15 item 6: the bridge's keepAlive every 2 s is
+                # the camera's live heartbeat. Without the 0x8002 the
+                # camera stops every live view 36 s after its start
+                # ("live heartbeat timeout, stop live") -- seen live
+                # 16:14-16:23, where every stream was a ~36 s burst.
+                self.send_heartbeat(uid)
+            elif event in ("2", "3"):
+                # pause (2) and stop (3) are one command with a value in
+                # its body (vendor_play_ctrl, §13.3). The bridge sends
+                # stop when it tears a session down; not translating it
+                # left the camera pushing into a socket nobody reads.
+                self.send_to(uid, vendor_play_ctrl(
+                    uid, self.last_seq.get(uid, 0), int(event)))
+            elif event == "5":
+                # §13.6: eventType 5 is `CameraEventType.relay`, and the
+                # cloud answers it with the unsolicited `0x8005` -- the
+                # relay start (mode 2, §6). The trigger is held unless
+                # --relay-start asks for it: fired unsolicited on
+                # 2026-10-24 it broke the camera's handshake.
+                self.push_relay_trigger(uid)
             data = "ok"
         elif path.startswith("/api/v1/ipc/viewer/"):
             # The camera's side of the rendezvous: where the media should
@@ -1848,6 +2447,11 @@ class StreamServer(socketserver.ThreadingTCPServer):
         # not in the firmware's strings, so the candidates are tried in
         # turn and the camera's reaction decides.
         self.ack_index: dict[str, int] = {}
+        # The candidate sweep is off by default: the protocol is known
+        # now (SIGNALLING_PROTOCOL.md §4 -- the ack is a 0x8001 with a
+        # `cSeq/cmd/ack` body), and the sweep's frames are not ones the
+        # vendor sends. --ack-sweep turns it back on for experiments.
+        self.ack_sweep = False
         super().__init__(addr, StreamHandler)
 
 
@@ -1935,14 +2539,24 @@ class StunHandler(socketserver.BaseRequestHandler):
     """
 
     def handle(self):
-        data, sock = self.request
+        data, sock, dest = self.request
+        # `dest` is the local address the request was sent to, and the
+        # reply has to come from it (§12.5): the phone sends to
+        # `stunaddr.gps555.net` (a claimed vendor address) and drops an
+        # answer that comes from anywhere else. The socket is bound to
+        # 0.0.0.0, so the kernel would pick the source address from the
+        # route; IP_PKTINFO tells us the destination the request
+        # arrived at, and lets us answer from it.
         log("stun", self.client_address, data)
         reply = stun_binding_success(data, self.client_address[0],
                                      self.client_address[1],
-                                     self.server.own_ip,
+                                     dest or self.server.own_ip,
                                      self.server.server_address[1])
         if reply:
-            sock.sendto(reply, self.client_address)
+            if dest:
+                self._send_from(sock, reply, dest)
+            else:
+                sock.sendto(reply, self.client_address)
             log("stun", self.client_address, b"-> " + reply[:24].hex().encode())
         api = self.server.api
         if api is not None:
@@ -1956,6 +2570,17 @@ class StunHandler(socketserver.BaseRequestHandler):
                         f"uid={uid} media at {ip}:{port}".encode())
                     break
 
+    def _send_from(self, sock, payload: bytes, src: str) -> None:
+        """Send with the source address the request came to."""
+        try:
+            info = struct.pack("i4s4s", 0, socket.inet_aton(src),
+                               b"\x00" * 8)
+            sock.sendmsg([payload],
+                         [(socket.IPPROTO_IP, socket.IP_PKTINFO, info)],
+                         0, self.client_address)
+        except OSError:
+            sock.sendto(payload, self.client_address)
+
 
 class StunServer(socketserver.ThreadingUDPServer):
     allow_reuse_address = True
@@ -1965,6 +2590,32 @@ class StunServer(socketserver.ThreadingUDPServer):
         self.own_ip = own_ip
         self.api = api
         super().__init__(addr, StunHandler)
+
+    def server_bind(self):
+        # Ask for the destination address of every datagram, so the
+        # reply can come from the address the request was sent to (§12.5).
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
+        except OSError:
+            pass
+        socketserver.ThreadingUDPServer.server_bind(self)
+
+    def get_request(self):
+        """Read one datagram, with the address it was sent to."""
+        try:
+            data, ancdata, _, addr = self.socket.recvmsg(
+                self.max_packet_size, socket.CMSG_SPACE(64))
+        except OSError:
+            return (b"", self.socket, ""), addr
+        dest = ""
+        for level, ctype, cdata in ancdata:
+            if level == socket.IPPROTO_IP and ctype == socket.IP_PKTINFO:
+                try:
+                    _, spec_dst, _ = struct.unpack("i4s4s", cdata[:12])
+                    dest = socket.inet_ntoa(spec_dst)
+                except (OSError, struct.error):
+                    dest = ""
+        return (data, self.socket, dest), addr
 
 
 # --- DNS hijack + forward -------------------------------------------------
@@ -2126,10 +2777,27 @@ def _lp(s: str) -> bytes:
     return _u8(len(raw)) + raw
 
 
+def string_to_uint32(text: str) -> int:
+    """The app's regCode nonce: `DeviceAddData.stringToUint32`.
+
+    sha256(text), then digest bytes 0, 2, 4 and 6 packed big-endian
+    (device_add_controller.dart 0x6e7d5c: lsl #0x18, #0x10, #8, #0).
+    The app feeds it `phoneUuid + DateTime.microseconds`, which makes it a
+    nonce rather than a credential -- the camera cannot validate a phone
+    UUID -- but the app sends it for every real device, so the four bytes
+    belong in the frame.
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return (digest[0] << 24) | (digest[2] << 16) | (digest[4] << 8) | digest[6]
+
+
 def wifi_connect_frame(ssid: str, pwd: str, sig_addr: str, tz_minutes: int,
                        seq: int = 1, reg_code: int = 0) -> bytes:
     # Negative minutes are biased +0x8000, not two's complement
-    # (custom_ble_protocol_packet.dart 0x53ec64/0x53ecc4).
+    # (custom_ble_protocol_packet.dart 0x53ec64/0x53ecc4; the app's
+    # _getTimezoneOffset is microseconds ~/ 60000000, then +0x8000).
+    # reg_code is the app's 4-byte nonce (string_to_uint32); 0 omits it,
+    # which the app only does for its "FFFFFFFFFFFF" placeholder device.
     t = tz_minutes + 0x8000 if tz_minutes < 0 else tz_minutes
     payload = (b"\x00\x01" + _lp(ssid) + _lp(pwd) + _lp(sig_addr) + _be16(t))
     if reg_code:
@@ -2597,7 +3265,9 @@ def main() -> int:
                    or (base + "-cameras.json" if base else ""),
                   relay_host=my_ip or _detect_lan_ip(),
                   relay_port=args.relay_port,
-                  relay_start=args.relay_start)
+                  relay_start=args.relay_start,
+                  sig_host=my_ip or _detect_lan_ip(),
+                  sig_port=args.sig)
     api.load_viewers()
     api.load_cameras()
     for spec in args.camera:

@@ -917,6 +917,10 @@ The literal pool backing this function sits at payload `0x15bb8`–
 `0x15bec`, and the pool entries appear in exactly that order — the
 compiler's emission order, which is the source order.
 
+> That was the 2026-10-23 reading. §14.0 below corrects it: the pool
+> belongs to a parser that serves **two** commands, and the `wifiConnect`
+> subset is `cmd, ssid, pwd, urlAndPort, timezone[, regCode]`.
+
 Two other strings settle how the frame is framed: `BLE totalLen:%d,
 offset:%d` means the camera **reassembles chunks** until it holds the
 whole frame (so a partial write is not an error, it is a wait), and
@@ -979,32 +983,119 @@ camera's own field names. Mapping one onto the other:
 | `ssid` | ssid | ✓ |
 | `pwd` | pwd | ✓ |
 | `urlAndPort` | sigAddr (`host:port`) | ✓ |
-| `p1` | — | not in our frame |
-| `port` | — | not in our frame |
+| `p1` | — | another command (§14.0) |
+| `port` | — | another command (§14.0) |
 | `timezone` | timezone | ✓ |
-| `bind id` | — | not in our frame |
-| `param bind id` | `regCode` (when present) | **different thing** |
+| `bind id` | — | another command (§14.0) |
+| `param bind id` | `regCode` (when present) | different thing |
 
-The two binding fields are the camera's **binding key** — the camera
-advertises `key` plus 16 ASCII characters in its ServiceData on
-`0xa201` (`keyyfg5y34yqxqgd` observed on unit `140979857781`), and
-§8 already recorded that this string is the camera's own
-binding/registration secret.
+The four fields we do not send are the reading this section started
+from, and §14.0 below supersedes it: the app's own `wifiConnect`
+builder has six fields, so `p1`, `port`, `bind id` and `param bind id`
+are not part of it at all. Where they *are* used is the camera's
+**binding key** — the camera advertises `key` plus 16 ASCII characters
+in its ServiceData on `0xa201` (`keyyfg5y34yqxqgd` observed on unit
+`140979857781`), and §8 already recorded that this string is the
+camera's own binding/registration secret.
 
-Whether the missing four belong to `wifiConnect` itself is **not yet
-settled**, and the evidence cuts both ways:
+### 14.0 Settled by the app's own builder (2026-10-24, Blutter)
 
-* *For:* the strings sit in one parse function's literal pool, in that
-  order, right beside `cmd`, `ssid`, `pwd` and `urlAndPort`.
-* *Against:* the app provisioned this camera successfully — it is on our
-  WiFi with the vendor's `sig.gps555.net:8882` stored — and the app
-  builds the six-field frame. So this firmware accepts six fields for
-  `wifiConnect`, and the extra names most likely belong to the other
-  commands that share the parser.
+The nine-field question above is now **closed, by the app's code**: the
+app's `wifiConnect` payload has **six fields, the last optional, and no more**, so
+`p1`, `port`, `bind id` and `param bind id` are *not* fields of
+`wifiConnect` — they belong to the other commands that share the
+camera's parse function.
 
-The end symbol (§14.1) was the real defect, and it is fixed. What is
-left is to confirm the payload by *doing* it: re-provision the camera
-with our broker as the signalling server and watch it register.
+The builder was read out of the app's AOT snapshot (Blutter, Dart
+3.10.8, snapshot `1ce86630892e2dca9a8543fdb8ed8e22` — the same build
+this section analyses). `DeviceBluetoothAddController.getApCommand`
+calls `CustomBleProtocolPacket::sendApInfoRequest`, which calls
+`_handleApRequest` (the payload) and `combineRequestPackage` (the
+frame):
+```
+sendApInfoRequest(1, routeName, wifiPwd, urlAndPort, tz, regCode)
+        │        │     │         │          │      │      └─ the nonce
+        │        │     │         │          │      └──────── the phone's tz offset
+        │        │     │         │          └─────────────── 2 bytes, big-endian
+        │        │     │         └────────────────────────── the sig address
+        │        │     └──────────────────────────────────── the WiFi password
+        │        └────────────────────────────────────────── the SSID ("routeName")
+        └─────────────────────────────────────────────────── cmd 1 = wifiConnect
+```
+
+`_handleApRequest` UTF-8-encodes exactly **three** strings and
+appends them length-prefixed, then the timezone (2 bytes) and the
+regCode (4 bytes):
+
+```
+payload = 00 01 | <len><ssid> | <len><pwd> | <len><urlAndPort> | <tz:2> | [regCode:4]
+```
+
+`combineRequestPackage` builds the frame around it, with
+`LEN16 = DLEN + 5`:
+
+```
+86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8 | 0D
+```
+
+**This is byte-for-byte the frame `wifi_connect_frame()` builds.** Our
+frame's *shape* was never the problem.
+
+The regCode is confirmed a **nonce, not a credential**:
+`DeviceAddData.stringToUint32(text)` is
+`sha256(text)` with the digest's bytes 0, 2, 4 and 6 packed
+big-endian into a uint32, and the text is the **phone's** UUID
+(`DeviceUuid::getUUID`, or the app's saved UUID when the camera is
+already in its device list) interpolated with
+`DateTime._getCurrentMicros()`. The app appends it for every real
+device and omits it only for the placeholder `"FFFFFFFFFFFF"`.
+
+So the only differences between our frame and the app's are the
+**values**: the `urlAndPort` (ours is this host's LAN address, the
+app's is the cloud's `icpSigAddress`) and the regCode nonce itself.
+
+The app's API surface also names the binding endpoints, which the
+broker does not serve: `/v1/ipc/bind`, `/v1/ipc/unbind`,
+`/v1/ipc/set-pwd`, `/v1/ipc/reset-pwd`, `/v1/ipc/send-code`,
+`/v1/ipc-function/get-sig-ip`. The app keeps the camera's bind
+password in its own storage (`init:deviceBindPwd`,
+`get:deviceBindNewPwdPlaceHolder`, `deviceBindPwd`).
+
+Where the four extra firmware names come from: the camera's BLE parse
+function serves more than one command, and the app sends more than one
+request. `sendApInfoRequest` is `wifiConnect` (cmd `1`); the app
+also has `CustomBleProtocolPacket::sendDevicePullRequest`, which wraps a
+second payload builder, `_handleSetupAPData`, and goes through the same
+`combineRequestPackage`. That second builder is where the setup data
+(`p1`, `port`, the binding ids) lives. The camera prints the field names
+of *both* parsers into one literal pool, which is why §13's inventory
+looks like a single nine-field frame. It is not.
+
+**What this means for unit `.107`.** The frame-shape theory is dead, so
+the silence of `.107` since 20:39 is not "our frame was malformed". The
+frame it received was ours, built in the app's shape. What differed is
+inside it, and
+two candidates remain:
+
+1. the `urlAndPort` value — the app stores the cloud's `icpSigAddress`;
+   we wrote `sig.gps555.net:8882` (which resolves here) and, in earlier
+   attempts, `192.168.68.114:8882`;
+2. the absence of the regCode — `att_try.py` sends `reg_code=0`, and
+   `wifi_connect_frame()` then omits the four bytes. The app appends
+   them for every real device and only omits them for the
+   `"FFFFFFFFFFFF"` placeholder.
+
+Both are *values*, not layout, and both are testable without guessing:
+re-provision with a regCode and with the vendor's own `urlAndPort`, and
+compare the camera's behaviour against §14.1's oracle.
+
+The end symbol (§14.1) was the real layout defect, and it is fixed. The
+regCode gap is now closed as well: `string_to_uint32()` reproduces
+`DeviceAddData.stringToUint32`, and `att_try.py` builds its frame with a
+real nonce (`sha256(hostId + micros)`), so what goes over BLE is the
+app's frame field for field. What is left is to confirm it by *doing* it:
+re-provision a camera with our broker as the signalling server and watch
+it register.
 
 ### 14.1 The camera's error frame is a usable oracle — and it exposed our own bug
 
@@ -1061,13 +1152,10 @@ Two conclusions:
    complete oracle for the payload layout, and `att_candidates.py`
    drives it.
 
-The nine-field question from §13.3 is still open, and now has a cheaper
-route to an answer: the app itself provisioned this camera successfully
-earlier (it is on our WiFi with the vendor's `sig.gps555.net:8882`
-stored), so the six-field payload the app builds — the same one we build
-— is accepted by this firmware. The firmware's extra field names (`p1`,
-`port`, `bind id`, `param bind id`) are most likely other commands
-sharing one parse function, not fields of `wifiConnect`.
+The nine-field question from §13.3 is **closed by §14.0**: the app's
+`wifiConnect` builder has six fields, the app provisioned this camera
+successfully with them, and `_handleSetupAPData` — the other request that
+shares the framing — is where `p1`, `port` and the two `bind id`s live.
 
 ## 15. The camera talks to the broker — the signalling protocol, captured, 2026-10-23
 
@@ -1210,8 +1298,10 @@ the *content* of the signalling answers — which body the camera accepts
 1. **The camera must wake up.** Everything below needs it awake and
    advertising; it is a battery camera that was silent for 100 s of
    capture.
-2. **Fill the frame to nine fields** and grade each candidate layout
-   against the oracle of §14.1.
+2. **The frame itself is settled** (§14.0): it is six fields, exactly
+   what we send, and the regCode nonce now goes out with it. What to test
+   next is *values* — the `urlAndPort` the camera stores and the
+   `regCode` — not layouts, against the oracle of §14.1.
 3. **Implement `CUSTOM_PROTOCOL`** in the broker: `cmd:%04X, len:%d,
    uidLen:%d` plus XOR plus uid, answered per
    `CUSTOM_PROTOCOL_ParseData`'s vocabulary (`req cmd`, `cSeq/cmd/ack`,
@@ -1504,3 +1594,49 @@ are not evidence against the path.
 
 Details and addresses: `ziot-fw/SIGNALLING_PROTOCOL.md` §0 (16:14 box),
 §13.4, §13.5, §13.7, §15 items 6, 7, 9 and 10.
+
+**Live runs, 22:28–23:41** (`ziot-fw/SIGNALLING_PROTOCOL.md` §16):
+- The `0x8002` heartbeat held `.108` for 16 unbroken minutes.
+- The bridge's ~60 s retry fires a fresh `0x8101` that stops a view still
+  coming up. The broker's 6 s fallback play still fires after it.
+- `.107` also fails once without that collision.
+- The vendor app now skips P2P and asks for relay straight away.
+- The unknown-command `vendor-ack` body is 6 bytes. The vendor's 1,138
+  wiretap acks are all 5 bytes, but they answer only `0x0002`/`0x0004`.
+  The vendor's answer to `0x0005` was never captured.
+- Two lab conditions mimicked protocol faults: the laptop idle-suspending,
+  and the cameras sending but not receiving.
+
+## 18. The app's own connect flow, decoded, 2026-10-25
+
+Full write-up with addresses: `ziot-fw/SIGNALLING_PROTOCOL.md` §17. From
+the same Blutter snapshot. The headline findings:
+
+* **`eventType=4` (`connected`) is what these units send at live start.**
+  `CameraAPI.requestSendConnectState` sends `start` (1) only when
+  `CameraInfoModel.supportCacheStun()` is true, and that is
+  `deviceNeedUpdate(version, "TXW817_A_V1.0.11.46")` for an X5 — i.e. only
+  for firmware *older* than V1.0.11.46. On `TXW817_A_V1.0.12.32` the app
+  sends `connected` (4), never `start` (1). The broker must map 4 like 1.
+* **The cached-stun fast path is dead code for our units**
+  (`isCacheStun()` requires that same `supportCacheStun()`), and with it
+  the "app remembers the P2P failure" theory of the 23:37 relay fallback.
+  What remains proven: the punch times out → callback `0` → log
+  `公网 IP 获取异常, 走转发` → `CameraConnectState.relay`. The exact
+  23:37 entry point (no `send-stun-addr` was ever sent) is still open.
+* **The punch needs ~10 datagrams back from the camera** before the app
+  logs `P2P Serve 连接设备: 成功 success` (a counter seeded at 20,
+  decremented per received datagram, success at ≤ 9). Viewer punch port is
+  `Random().nextInt(10001) + 50000`; the punch repeats every 1 s.
+* **`natType` is never read** by the app (only `fromJson`/`toJson`).
+* **`GET /v1/ipc-function/get-sig-ip`** (param `supportLoadBalance=1`) is
+  parsed as `code == 400` → `data` string → `SpUtil.putString(
+  "icpSigAddress", …)`. `icpSigAddress` is the `urlAndPort` the BLE
+  `wifiConnect` frame carries (§14.0), so serving that endpoint makes the
+  app provision cameras with the bridge's sig address.
+* **`lang`** is a `POST /v1/login` body field; dictionaries come from
+  `/v1/lang/applang` (answer shape unrecovered; app continues without it).
+* `handleActionForPrepare` refuses to connect unless the device row's
+  `mediaState` reads `"0"` (`isFree`), logging `设备繁忙, 请稍后再试`.
+* Teardown (`requestSendStop`) sends `eventType=3` (stop) — `pause` (2)
+  only for CacheStun devices — matching §7's bridge change.

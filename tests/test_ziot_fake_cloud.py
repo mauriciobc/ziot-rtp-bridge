@@ -5,6 +5,7 @@ import json
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -229,6 +230,29 @@ class ProvisionFrameTests(unittest.TestCase):
         self.assertEqual(len(with_reg) - len(without), 4)
         self.assertIn(b"\x11\x22\x33\x44", with_reg)
 
+    def test_string_to_uint32_is_the_apps_nonce(self):
+        # DeviceAddData.stringToUint32: sha256(text), digest bytes 0/2/4/6
+        # packed big-endian (device_add_controller.dart 0x6e7d5c).
+        import hashlib
+        text = "0123456789ABCDEF1730000000000000"
+        digest = hashlib.sha256(text.encode()).digest()
+        expected = (digest[0] << 24) | (digest[2] << 16) | (digest[4] << 8) | digest[6]
+        self.assertEqual(fake.string_to_uint32(text), expected)
+        # it is a uint32, and it tracks its input
+        self.assertTrue(0 <= fake.string_to_uint32(text) <= 0xFFFFFFFF)
+        self.assertNotEqual(fake.string_to_uint32(text + "x"),
+                            fake.string_to_uint32(text))
+
+    def test_reg_code_lands_after_the_timezone(self):
+        # The app's order is tz then regCode; a frame that put the nonce
+        # anywhere else would still be 4 bytes longer and pass the test
+        # above, so pin the position too.
+        frame = fake.wifi_connect_frame("s", "p", "h:1", -60,
+                                        reg_code=0xAABBCCDD)
+        dlen = (frame[6] << 8) | frame[7]
+        self.assertEqual(frame[8 + dlen - 6:8 + dlen],
+                         b"\x7f\xc4\xaa\xbb\xcc\xdd")
+
     def test_chunks_are_20_bytes(self):
         frame = fake.wifi_connect_frame("a" * 200, "p", "h:1", 0)
         chunks = fake.chunk20(frame)
@@ -318,6 +342,62 @@ class SignallingFrameTests(unittest.TestCase):
         unpadded = fake.signalling_frame(1, 1, b"u" * 12, b"hi", pad=False)
         self.assertEqual(len(unpadded), 26)    # 10 + 12 + 2 + 2
 
+    def test_the_p2p_request_carries_the_pairs_at_20_40_42_62(self):
+        # SIGNALLING_PROTOCOL.md §13.1: 20 bytes the handler never
+        # reads, then pair A (IP at 20, port at 40) and pair B (IP at 42,
+        # port at 62). The camera picks B only if A equals its own
+        # STUN-learned public IP and B shares its local /24 -- so the
+        # offsets are load-bearing, not decoration.
+        frame = fake.vendor_p2p_conn_req("140979857781", 7,
+                                         "192.168.68.114", 60587,
+                                         "192.168.68.114", 60587)
+        body = frame[22:-2]
+        self.assertEqual(len(body), 64)
+        self.assertEqual(body[20:40].rstrip(b"\x00"),
+                         b"192.168.68.114")
+        self.assertEqual(struct.unpack("!H", body[40:42])[0], 60587)
+        self.assertEqual(body[42:62].rstrip(b"\x00"),
+                         b"192.168.68.114")
+        self.assertEqual(struct.unpack("!H", body[62:64])[0], 60587)
+
+    def test_the_p2p_request_carries_the_registration_number(self):
+        # The 20 unread bytes carry the number the camera echoes back in
+        # its 0x0003 (§14.1) -- how the cloud knows the camera has
+        # answered *this* registration.
+        frame = fake.vendor_p2p_conn_req("140979857781", 7,
+                                         "192.168.68.114", 60587,
+                                         "192.168.68.114", 60587,
+                                         seq_no=186)
+        body = frame[22:-2]
+        self.assertEqual(struct.unpack("!H", body[0:2])[0], 186)
+        self.assertEqual(body[2:20], b"\x00" * 18)
+
+    def test_the_play_control_carries_value_one_at_offset_20(self):
+        # §13.3: the handler reads a u16 BE at body offset 20; 1 is
+        # PlayLiveview, 2 PlayPause, 3 stop.
+        for value in (1, 2, 3):
+            frame = fake.vendor_play_ctrl("140979857781", 9, value)
+            body = frame[22:-2]
+            self.assertEqual(len(body), 22)
+            self.assertEqual(struct.unpack("!H", body[20:22])[0], value)
+
+    def test_the_ack_echoes_the_frames_own_sequence_number(self):
+        # §4: the ack body is `cSeq/cmd/ack`, and the cSeq is the
+        # camera's own sequence number. The 2 h vendor wiretap holds
+        # 535 acks of `00 03 00 02 00` and 535 of `00 04 00 04 00` --
+        # the camera's counter usually sat at 3 and 4 -- and a tail of
+        # `00 04 00 02 00`, `00 05 00 04 00`, `00 08 00 02 00`, so the
+        # vendor tracks it. An ack of the wrong number is an ack of
+        # nothing, and the camera answers it by re-asking.
+        pull = fake.vendor_pullvideo_answer("140979857781", 3)
+        self.assertEqual(pull[22:-2], b"\x00\x03\x00\x02\x00")
+        pull = fake.vendor_pullvideo_answer("140979857781", 17)
+        self.assertEqual(pull[22:-2], b"\x00\x11\x00\x02\x00")
+        status = fake.vendor_status_answer("140979857781", 4, 4)
+        self.assertEqual(status[22:-2], b"\x00\x04\x00\x04\x00")
+        status = fake.vendor_status_answer("140979857781", 19, 4)
+        self.assertEqual(status[22:-2], b"\x00\x13\x00\x04\x00")
+
     def test_a_long_body_keeps_its_own_length(self):
         body = b"seq:1, stun port:5000, stun ip:192.168.1.2"
         frame = fake.signalling_frame(1, 1, b"u" * 12, body, pad=False)
@@ -368,9 +448,14 @@ class SignallingFrameTests(unittest.TestCase):
         # The camera's cmd 0x0002 is pullVideo -- the same command the
         # app sends over the LAN. The vendor answers with the response
         # bit set and a five-byte body, which is the camera's "go ahead".
+        #
+        # Note the two numbers: the frame's header sequence is 2 (the
+        # frame being answered) and the body's cSeq is 3 -- the camera's
+        # *latest* counter, which had moved on by the time the answer
+        # went out (§4).
         captured = bytes.fromhex(
             "8686800100110002000c313430393739383537373831" "0003000200" "99" "0d")
-        built = fake.vendor_pullvideo_answer("140979857781", 2)
+        built = fake.vendor_pullvideo_answer("140979857781", 2, cseq=3)
         self.assertEqual(built, captured)
 
 
@@ -600,6 +685,596 @@ class KeepaliveTests(unittest.TestCase):
 
 
 
+class SplitSignallingTests(unittest.TestCase):
+    """The sig socket is a TCP stream: frames arrive coalesced, split
+    across reads, and with garbage around them.
+
+    Decoding a whole chunk as one frame is what left camera .108 silent
+    on 2026-10-24 19:40:11: it flushed fifteen queued 0x0002 pings and a
+    0x0004 as one 389-byte read, the single-frame decode failed the XOR
+    check, one bogus ack went out, and the camera never came back. Every
+    complete frame must be cut out and answered on its own.
+    """
+
+    def frame(self, seq=1):
+        return fake.signalling_frame(0x0002, seq, b"140979857781", b"",
+                                     pad=False)
+
+    def test_cuts_back_to_back_frames(self):
+        frames, tail = fake.split_signalling(
+            self.frame(1) + self.frame(2) + self.frame(3))
+        self.assertEqual(
+            [fake.decode_signalling(f)["seq"] for f in frames], [1, 2, 3])
+        self.assertEqual(tail, b"")
+
+    def test_a_frame_straddling_two_reads_waits_in_the_tail(self):
+        frames, tail = fake.split_signalling(
+            self.frame(1) + self.frame(2)[:10])
+        self.assertEqual([fake.decode_signalling(f)["seq"] for f in frames],
+                         [1])
+        self.assertEqual(tail, self.frame(2)[:10])
+        frames, tail = fake.split_signalling(
+            tail + self.frame(2)[10:] + self.frame(3))
+        self.assertEqual([fake.decode_signalling(f)["seq"] for f in frames],
+                         [2, 3])
+        self.assertEqual(tail, b"")
+
+    def test_garbage_between_frames_is_skipped(self):
+        frames, tail = fake.split_signalling(
+            self.frame(1) + b"junk\x00\xff\x86" + self.frame(2))
+        self.assertEqual([fake.decode_signalling(f)["seq"] for f in frames],
+                         [1, 2])
+        self.assertEqual(tail, b"")
+
+    def test_a_trailing_partial_magic_is_kept(self):
+        frames, tail = fake.split_signalling(self.frame(1) + b"\x86")
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(tail, b"\x86")
+
+    def test_a_corrupt_length_does_not_wedge_the_stream(self):
+        corrupt = b"\x86\x86" + struct.pack("!HHHH", 0x0002, 60000, 1, 12)
+        frames, tail = fake.split_signalling(corrupt + self.frame(1))
+        self.assertEqual([fake.decode_signalling(f)["seq"] for f in frames],
+                         [1])
+        self.assertEqual(tail, b"")
+
+    def test_empty_input_is_no_frames(self):
+        self.assertEqual(fake.split_signalling(b""), ([], b""))
+
+
+class SigStreamTests(unittest.TestCase):
+    """The real handler answers a coalesced or straddling stream frame
+    by frame, the way split_signalling promises."""
+
+    def start(self):
+        srv = fake.serve("sig", ("127.0.0.1", 0))
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+        return srv.server_address[1]
+
+    def frame(self, seq=1):
+        return fake.signalling_frame(0x0002, seq, b"140979857781", b"",
+                                     pad=False)
+
+    def replies(self, s, count, timeout=3.0):
+        buf = b""
+        deadline = time.time() + timeout
+        while len(buf) < count and time.time() < deadline:
+            try:
+                buf += s.recv(4096)
+            except socket.timeout:
+                break
+        return fake.split_signalling(buf)[0]
+
+    def test_a_coalesced_chunk_is_answered_frame_by_frame(self):
+        s = socket.create_connection(("127.0.0.1", self.start()), timeout=3)
+        self.addCleanup(s.close)
+        s.sendall(self.frame(1) + self.frame(2) + self.frame(3))
+        frames = self.replies(s, 3 * 29)
+        self.assertEqual(len(frames), 3, "each queued ping needs its answer")
+        self.assertEqual(
+            [fake.decode_signalling(f)["seq"] for f in frames], [1, 2, 3])
+        self.assertEqual(
+            {fake.decode_signalling(f)["cmd"] for f in frames}, {"0x8001"})
+
+    def test_a_frame_straddling_reads_is_answered_when_complete(self):
+        s = socket.create_connection(("127.0.0.1", self.start()), timeout=3)
+        self.addCleanup(s.close)
+        ping = self.frame(9)
+        s.sendall(ping[:15])
+        time.sleep(0.1)
+        s.sendall(ping[15:])
+        frames = self.replies(s, 29)
+        self.assertEqual(len(frames), 1)
+        decoded = fake.decode_signalling(frames[0])
+        self.assertEqual(decoded["cmd"], "0x8001")
+        self.assertEqual(decoded["seq"], 9)
+
+
+class HeartbeatTests(unittest.TestCase):
+    """The bridge's notify(keepAlive) every 2 s must reach the camera as
+    the 0x8002 heartbeat.
+
+    Only 0x8002 stamps the camera's liveness tick during play; without
+    it the camera stopped every live view 36 s after its start
+    (SIGNALLING_PROTOCOL.md §13.4, live 16:14-16:23), and every stream
+    was a ~36 s burst restarted by the bridge's re-rendezvous.
+    """
+
+    UID = "140979857781"
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+
+    def api_with_link(self):
+        api = fake.HttpApi()
+        sent = []
+        api.camera_links[self.UID] = _FakeSocket(sent)
+        api.last_seq[self.UID] = 7
+        return api, sent
+
+    def notify(self, api, event):
+        return api.respond("GET", "/api/v1/ipc/notify-live-event",
+                           f"uid={self.UID}&eventType={event}")
+
+    def bodies(self, sent):
+        # Body = what follows the header and the uid, without the XOR
+        # byte and the end symbol.
+        return [f[22:-2] for f in sent]
+
+    def test_the_frame_is_the_bare_header_plus_uid(self):
+        frame = fake.vendor_heartbeat(self.UID, 7)
+        decoded = fake.decode_signalling(frame)
+        self.assertEqual(decoded["cmd"], "0x8002")
+        self.assertEqual(decoded["len"], 12)
+        self.assertEqual(decoded["seq"], 7)
+        self.assertTrue(decoded["xor_ok"])
+
+    def test_keepalive_becomes_a_heartbeat(self):
+        api, sent = self.api_with_link()
+        self.notify(api, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(fake.decode_signalling(sent[0])["cmd"], "0x8002")
+
+    def test_stop_becomes_play_ctrl_3(self):
+        api, sent = self.api_with_link()
+        self.notify(api, 3)
+        self.assertEqual(len(sent), 1)
+        decoded = fake.decode_signalling(sent[0])
+        self.assertEqual(decoded["cmd"], "0x8004")
+        # Body offset 20 is the u16 command: 3 = stop.
+        self.assertEqual(struct.unpack("!H", self.bodies(sent)[0][20:22]),
+                         (3,))
+
+    def test_pause_becomes_play_ctrl_2(self):
+        api, sent = self.api_with_link()
+        self.notify(api, 2)
+        self.assertEqual(struct.unpack("!H", self.bodies(sent)[0][20:22]),
+                         (2,))
+
+    def test_a_heartbeat_without_a_link_is_logged_once_per_outage(self):
+        api = fake.HttpApi()
+        self.notify(api, 0)
+        self.notify(api, 0)
+        self.notify(api, 0)
+        dropped = "0x8002 heartbeat: camera not connected"
+        self.assertEqual(self.out.getvalue().count(dropped), 1)
+        # The link coming back must be fed, and a fresh outage logged
+        # again -- the silencing must not outlive the outage.
+        api, sent = self.api_with_link()
+        self.notify(api, 0)
+        self.assertEqual(len(sent), 1)
+        api.camera_links.clear()
+        self.notify(api, 0)
+        self.assertEqual(self.out.getvalue().count(dropped), 2)
+
+    def test_start_still_fires_the_push_and_nothing_else(self):
+        api, sent = self.api_with_link()
+        fires = []
+        real = api.schedule_p2p_live
+        api.schedule_p2p_live = lambda uid: fires.append(uid)
+        self.notify(api, 0)
+        self.assertEqual(fires, [])
+        self.notify(api, 1)
+        self.assertEqual(fires, [self.UID])
+
+    def test_connected_event_fires_the_push_like_start(self):
+        # SIGNALLING_PROTOCOL.md §17.2: on an X5 newer than
+        # V1.0.11.46 the app's P2P-established notify is eventType=4
+        # (connected), never eventType=1 (start). The camera has one
+        # live-start arm (PlayLiveview), so 4 must drive the same
+        # direct chain.
+        api, sent = self.api_with_link()
+        fires = []
+        api.schedule_p2p_live = lambda uid: fires.append(uid)
+        self.notify(api, 4)
+        self.assertEqual(fires, [self.UID])
+        self.notify(api, 2)
+        self.notify(api, 3)
+        self.notify(api, 5)
+        self.assertEqual(fires, [self.UID])
+
+
+class DirectChainTests(unittest.TestCase):
+    """The direct live-view chain is not the relay, and must not be
+    gated behind the relay flag.
+
+    The direct chain is `0x8101` (the camera learns the viewer's
+    address and binds its P2P socket) then `0x8004` value 1
+    (PlayLiveview) then the hello punch. It is the only chain that has
+    ever produced frames (2026-10-24 16:14).
+
+    It used to sit behind `--relay-start` together with the `0x8005`
+    relay trigger, because the two were written next to each other.
+    Turning the flag off -- which is what the docs ask for, because the
+    `0x8005` breaks the camera's session -- silently disarmed the
+    direct chain too: both cameras were on the network, registering,
+    and sending no media at all, and the log said "0x8101 held".
+    """
+
+    UID = "140979857781"
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+
+    def make(self, relay_start: bool = False):
+        api = fake.HttpApi(relay_start=relay_start)
+        api.camera_links[self.UID] = _FakeSocket([])
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 48666}
+        api.last_seq[self.UID] = 7
+        return api
+
+    def cmds(self, api):
+        link = api.camera_links.get(self.UID)
+        return [fake.decode_signalling(f)["cmd"] for f in link.sink]
+
+    def test_the_viewer_address_goes_out_with_the_relay_flag_off(self):
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        self.assertIn("0x8101", self.cmds(api))
+        self.assertNotIn("0x8005", self.cmds(api))
+
+    def test_the_play_is_scheduled_behind_the_viewer_address(self):
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        # The 0x8004 must not fire before the camera had a chance to
+        # bind its P2P socket -- the firmware rejects PlayLiveview while
+        # it is unbound ("p2p is not finish").
+        self.assertIn(self.UID, api.p2p_fire_at)
+        self.assertGreater(api.p2p_fire_at[self.UID], time.monotonic())
+
+    def test_a_second_start_does_not_crowd_out_the_pending_play(self):
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        due = api.p2p_fire_at[self.UID]
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        # The pending play keeps its own time: the caller must not
+        # overwrite it with a shorter delay.
+        self.assertEqual(api.p2p_fire_at[self.UID], due)
+        self.assertEqual(self.cmds(api).count("0x8101"), 1)
+
+    def test_the_relay_trigger_stays_opt_in(self):
+        # The 0x8005 is a different thing and stays behind the flag.
+        api = self.make(relay_start=False)
+        self.assertFalse(api.push_relay_trigger(self.UID))
+        self.assertNotIn("0x8005", self.cmds(api))
+
+    def test_the_play_waits_for_the_camera_to_bind_its_socket(self):
+        # The firmware rejects PlayLiveview while the camera's P2P socket
+        # is unbound ("p2p is not finish"), and the camera binds it when
+        # it re-runs STUN from a new port -- so the play cannot go out on
+        # a fixed timer. Live 2026-10-24 21:07: a 1.5 s timer fired it
+        # before the camera's P2P STUN arrived, and no media came.
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        self.assertIn("0x8101", self.cmds(api))
+        self.assertNotIn("0x8004", self.cmds(api))
+
+    def test_the_play_goes_out_when_the_camera_binds_its_socket(self):
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        self.assertTrue(api.p2p_socket_bound(self.UID))
+        # The play is scheduled, not immediate: the camera's freshest RTP
+        # port and the viewer's hello have to land first.
+        self.assertNotIn("0x8004", self.cmds(api))
+        late = time.monotonic() + fake.P2P_PLAY_SETTLE_S + 1
+        self.assertEqual(api.serve_due_p2p_fires(late), 1)
+        self.assertIn("0x8004", self.cmds(api))
+
+    def test_a_bound_socket_without_a_pending_play_sends_nothing(self):
+        api = self.make(relay_start=False)
+        self.assertFalse(api.p2p_socket_bound(self.UID))
+        self.assertEqual(self.cmds(api), [])
+
+    def test_the_play_is_dropped_when_the_camera_never_binds(self):
+        # §16.3: a 0x8004 sent on the timer, with no mediaState-3
+        # report, is the play the firmware ignores ("p2p is not
+        # finish"). The deadline drops it.
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        late = time.monotonic() + fake.P2P_PLAY_FALLBACK_S + 1
+        self.assertEqual(api.serve_due_p2p_fires(late), 0)
+        self.assertNotIn("0x8004", self.cmds(api))
+        self.assertNotIn(self.UID, api.p2p_fire_at)
+
+    def test_a_new_socket_port_is_what_counts_as_bound(self):
+        api = self.make(relay_start=False)
+        api.cameras[self.UID] = {"_ip": "192.168.68.107", "_port": 52122}
+        self.assertFalse(api.set_camera_address(self.UID, "192.168.68.107",
+                                                52122))
+        self.assertTrue(api.set_camera_address(self.UID, "192.168.68.107",
+                                               51323))
+
+    def test_the_relay_trigger_is_armed_by_the_registration(self):
+        # The 0x8005 has to be armed somewhere: the camera sets its
+        # relay-start flag when it arrives, and the armed address (the
+        # bridge's UDP socket) is where it would push.
+        api = self.make(relay_start=True)
+        api.schedule_relay_trigger(self.UID)
+        self.assertIn(self.UID, api.relay_trigger_at)
+        late = time.monotonic() + fake.RELAY_START_DELAY_S + 1
+        self.assertEqual(api.serve_due_relay_triggers(late), 1)
+        self.assertIn("0x8005", self.cmds(api))
+
+    def test_the_relay_trigger_is_not_armed_without_the_flag(self):
+        api = self.make(relay_start=False)
+        api.schedule_relay_trigger(self.UID)
+        self.assertFalse(api.relay_trigger_at)
+
+    def test_the_status_report_is_parsed(self):
+        # §13.7: a count byte, then 4-byte entries `00 id 00 value`.
+        one = fake.parse_status_report(bytes([1, 0, 3, 0, 3]))
+        self.assertEqual(one, {3: 3})
+        full = fake.parse_status_report(bytes(
+            [8, 0, 1, 0, 0, 0, 2, 0, 1, 0, 3, 0, 1, 0, 4, 0, 1,
+             0, 5, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 9, 0, 1]))
+        self.assertEqual(full[3], 1)
+        self.assertEqual(full[9], 1)
+
+    def test_the_address_report_is_parsed(self):
+        # §12.1: the 0x0003 body -- public pair at 0/20, local pair at
+        # 22/42, the registration number it answers at 44.
+        body = (b"186.233.129.211".ljust(20, b"\x00")
+                + struct.pack("!H", 27719)
+                + b"192.168.68.107".ljust(20, b"\x00")
+                + struct.pack("!H", 59596)
+                + struct.pack("!H", 186)
+                + b"\x00")
+        report = fake.parse_local_addr_report(body)
+        self.assertEqual(report["public_ip"], "186.233.129.211")
+        self.assertEqual(report["public_port"], 27719)
+        self.assertEqual(report["local_ip"], "192.168.68.107")
+        self.assertEqual(report["local_port"], 59596)
+        self.assertEqual(report["seq_no"], 186)
+
+    def test_a_short_address_report_is_refused(self):
+        self.assertEqual(fake.parse_local_addr_report(b"\x00" * 10), {})
+
+    def test_the_play_follows_the_cameras_own_p2p_report(self):
+        # The camera reports the media state; 3 means "P2P socket bound,
+        # waiting for the viewer" -- the precondition PlayLiveview
+        # checks. Until then there must be no play.
+        api = self.make(relay_start=False)
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+        self.assertIn("0x8101", self.cmds(api))
+        self.assertNotIn("0x8004", self.cmds(api))
+        # Now the camera says its socket is up.
+        self.assertTrue(api.p2p_socket_bound(self.UID))
+        late = time.monotonic() + fake.P2P_PLAY_SETTLE_S + 1
+        self.assertEqual(api.serve_due_p2p_fires(late), 1)
+        self.assertIn("0x8004", self.cmds(api))
+
+    def test_the_media_state_is_served_from_the_camera(self):
+        api = self.make(relay_start=False)
+        api.cameras[self.UID] = {"mediaState": "0"}
+        api.set_media_state(self.UID, 3)
+        self.assertEqual(api.cameras[self.UID]["mediaState"], "3")
+
+
+class DirectChainPortAndPairTests(unittest.TestCase):
+    """The hello reaches every port the camera reported, and a moved
+    viewer re-sends the 0x8101 (SIGNALLING_PROTOCOL.md §18.3-§18.6)."""
+
+    UID = DirectChainTests.UID
+    setUp = DirectChainTests.setUp
+    make = DirectChainTests.make
+    cmds = DirectChainTests.cmds
+
+    def start(self, api):
+        api.respond("GET", "/api/v1/ipc/notify-live-event",
+                    f"uid={self.UID}&eventType=1")
+
+    def listeners(self, n):
+        socks = []
+        for _ in range(n):
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.bind(("127.0.0.1", 0))
+            s.settimeout(2)
+            self.addCleanup(s.close)
+            socks.append(s)
+        return socks
+
+    def test_the_hello_reaches_both_ports_the_camera_reported(self):
+        api = self.make()
+        self.start(api)
+        first, second = self.listeners(2)
+        # The latest report is the second port; the first must still be
+        # punched.
+        api.cameras[self.UID] = {"_ip": "127.0.0.1",
+                                 "_port": second.getsockname()[1]}
+        api.note_p2p_port(self.UID, first.getsockname()[1])
+        api.note_p2p_port(self.UID, second.getsockname()[1])
+        api.punch_camera(self.UID)
+        self.assertEqual(first.recvfrom(16)[0], b"hello")
+        self.assertEqual(second.recvfrom(16)[0], b"hello")
+        self.assertIn(f"{first.getsockname()[1]},{second.getsockname()[1]}",
+                      self.out.getvalue())
+
+    def test_a_repeated_or_zero_port_is_not_noted_twice(self):
+        api = self.make()
+        api.note_p2p_port(self.UID, 5000)
+        api.note_p2p_port(self.UID, 5000)
+        api.note_p2p_port(self.UID, 0)
+        self.assertEqual(api.p2p_ports[self.UID], [5000])
+
+    def test_a_new_0x8101_forgets_the_previous_chains_ports(self):
+        api = self.make()
+        api.note_p2p_port(self.UID, 5000)
+        self.start(api)
+        self.assertEqual(api.p2p_ports[self.UID], [])
+
+    def test_a_pending_chain_with_the_same_viewer_skips_the_second_0x8101(self):
+        api = self.make()
+        self.start(api)
+        api.schedule_p2p_live(self.UID)
+        self.assertEqual(self.cmds(api).count("0x8101"), 1)
+
+    def test_a_pending_chain_with_a_moved_viewer_resends_the_0x8101(self):
+        api = self.make()
+        self.start(api)
+        api.p2p_ready[self.UID] = time.monotonic()
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 51111}
+        api.schedule_p2p_live(self.UID)
+        self.assertEqual(self.cmds(api).count("0x8101"), 2)
+        self.assertNotIn(self.UID, api.p2p_ready)
+        self.assertEqual(api.p2p_sent_pair[self.UID][3], 51111)
+        link = api.camera_links[self.UID]
+        self.assertIn(struct.pack(">H", 51111), link.sink[-1])
+        self.assertIn("viewer moved", self.out.getvalue())
+
+
+class DirectChainAnswerTests(unittest.TestCase):
+    """stun-addr serves the 0x0003 that answered the 0x8101, not the
+    latest one: a redraw must not move the bridge's punch target
+    (SIGNALLING_PROTOCOL.md §14.1, §18.8)."""
+
+    UID = DirectChainTests.UID
+    setUp = DirectChainTests.setUp
+    make = DirectChainTests.make
+    cmds = DirectChainTests.cmds
+
+    def sent(self):
+        api = self.make()
+        api.cameras[self.UID] = {"_ip": "192.168.68.107", "_port": 1111}
+        api.schedule_p2p_live(self.UID)
+        return api, api.p2p_sent_seq[self.UID]
+
+    def redraw(self, api, port):
+        # What the 0x0003 branch does with a report.
+        api.set_camera_address(self.UID, "192.168.68.107", port)
+        api.set_camera_public(self.UID, "200.1.1.1", port + 1)
+
+    def test_the_header_seq_of_the_0x8101_is_remembered(self):
+        api, seq = self.sent()
+        self.assertEqual(seq, 7)
+
+    def test_a_redraw_after_the_answer_does_not_move_stun_addr(self):
+        api, seq = self.sent()
+        self.assertTrue(api.note_p2p_answer(
+            self.UID, seq, "200.1.1.1", 2001, "192.168.68.107", 2000))
+        self.redraw(api, 3000)
+        out = api._stun(self.UID)
+        self.assertEqual(out["IpcPrivatePort"], 2000)
+        self.assertEqual(out["IpcPublicPort"], 2001)
+        self.assertEqual(out["IpcPrivateIP"], "192.168.68.107")
+        self.assertIn("answers 0x8101 seq 7", self.out.getvalue())
+
+    def test_a_report_with_another_seq_is_not_the_answer(self):
+        api, seq = self.sent()
+        self.assertFalse(api.note_p2p_answer(
+            self.UID, 0, "200.1.1.1", 2001, "192.168.68.107", 2000))
+        self.assertFalse(api.note_p2p_answer(
+            self.UID, seq + 1, "200.1.1.1", 2001, "192.168.68.107", 2000))
+        self.assertNotIn(self.UID, api.p2p_answer)
+        self.redraw(api, 3000)
+        self.assertEqual(api._stun(self.UID)["IpcPrivatePort"], 3000)
+
+    def test_a_new_0x8101_clears_the_answer(self):
+        api, seq = self.sent()
+        api.note_p2p_answer(self.UID, seq, "200.1.1.1", 2001,
+                            "192.168.68.107", 2000)
+        api.schedule_p2p_live(self.UID, force=True)
+        self.assertNotIn(self.UID, api.p2p_answer)
+        self.redraw(api, 3000)
+        self.assertEqual(api._stun(self.UID)["IpcPrivatePort"], 3000)
+
+    def test_without_a_0x8101_nothing_is_an_answer(self):
+        api = self.make()
+        self.assertFalse(api.note_p2p_answer(
+            self.UID, 7, "200.1.1.1", 2001, "192.168.68.107", 2000))
+
+
+class DirectChainResendFloorTests(unittest.TestCase):
+    """An unchanged viewer pair gets one 0x8101 per P2P_RESEND_MIN_S: the
+    bridge's retries otherwise burst 0x8101s onto a camera that is live,
+    and that took one off the network (SIGNALLING_PROTOCOL.md §18.7)."""
+
+    UID = DirectChainTests.UID
+    setUp = DirectChainTests.setUp
+    make = DirectChainTests.make
+    cmds = DirectChainTests.cmds
+
+    def first(self):
+        api = self.make()
+        api.schedule_p2p_live(self.UID)
+        # The chain has completed: nothing is pending any more.
+        api.p2p_fire_at.pop(self.UID, None)
+        return api
+
+    def test_a_same_pair_resend_inside_the_floor_is_held(self):
+        api = self.first()
+        api.schedule_p2p_live(self.UID)
+        self.assertEqual(self.cmds(api).count("0x8101"), 1)
+        self.assertIn("-- held", self.out.getvalue())
+        self.assertNotIn(self.UID, api.p2p_fire_at)
+
+    def test_a_same_pair_resend_after_the_floor_is_sent(self):
+        api = self.first()
+        api.p2p_sent_at[self.UID] -= fake.P2P_RESEND_MIN_S
+        api.schedule_p2p_live(self.UID)
+        self.assertEqual(self.cmds(api).count("0x8101"), 2)
+        self.assertNotIn("-- held", self.out.getvalue())
+
+    def test_a_moved_pair_inside_the_floor_is_sent(self):
+        api = self.first()
+        api.viewers[self.UID] = {"privateIp": "192.168.68.114",
+                                 "privatePort": 51111}
+        api.schedule_p2p_live(self.UID)
+        self.assertEqual(self.cmds(api).count("0x8101"), 2)
+        self.assertEqual(api.p2p_sent_pair[self.UID][3], 51111)
+
+    def test_force_inside_the_floor_sends_and_clears_the_old_chain(self):
+        api = self.make()
+        api.schedule_p2p_live(self.UID)
+        api.p2p_ready[self.UID] = time.monotonic()
+        stale = api.p2p_fire_at[self.UID] = time.monotonic() - 100
+        api.schedule_p2p_live(self.UID, force=True)
+        self.assertEqual(self.cmds(api).count("0x8101"), 2)
+        self.assertNotIn(self.UID, api.p2p_ready)
+        self.assertGreater(api.p2p_fire_at[self.UID], stale)
+
+    def test_the_register_path_forces_the_0x8101(self):
+        import inspect
+        self.assertIn("api.schedule_p2p_live(uid, force=True)",
+                      inspect.getsource(fake.StreamHandler))
+
+
 class RelayTriggerTests(unittest.TestCase):
     """Media starts with two frames, not a search.
 
@@ -643,6 +1318,10 @@ class RelayTriggerTests(unittest.TestCase):
             if int(d["cmd"], 16) == 0x8005:
                 out.append(d)
         return out
+
+    def cmds(self, api):
+        """Every frame's command id, in order."""
+        return [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
 
     def test_the_trigger_is_the_bare_frame_the_firmware_expects(self):
         api = self.make()
@@ -705,89 +1384,23 @@ class RelayTriggerTests(unittest.TestCase):
         self.assertFalse(api.push_relay_trigger(self.UID))
         self.assertEqual(self.triggers(api), [])
 
-    def test_an_unknown_event_sends_nothing(self):
+    def test_only_event_type_1_fires_a_push(self):
+        # eventType=1 ("start live") is the app's live-view press and it
+        # starts the DIRECT chain: the 0x8101 that hands the camera the
+        # viewer's address, so the camera binds its P2P socket. It does
+        # not fire the 0x8005 relay trigger -- that one is opt-in
+        # (--relay-start) and pushing it broke the camera's session.
         api = self.make()
         api.respond("GET", "/api/v1/ipc/notify-live-event",
                     f"uid={self.UID}&eventType=20")
-        self.assertEqual(self.frames(api), [])
-
-    def test_event_type_1_starts_the_direct_chain_not_the_relay(self):
-        # Start live is 0x8101 (the viewer's pairs) and then 0x8004, not
-        # the relay's 0x8005 (SIGNALLING_PROTOCOL.md §13): that chain is
-        # what made camera .107 stream to the bridge on 2026-10-24.
-        api = self.make()
+        self.assertEqual(self.triggers(api), [])
+        self.assertEqual(self.cmds(api), [])
         api.respond("GET", "/api/v1/ipc/notify-live-event",
                     f"uid={self.UID}&eventType=1")
-        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
-        self.assertEqual(cmds, ["0x8101"])
-        self.assertIn(self.UID, api.p2p_fire_at)
+        # The viewer address goes out ...
+        self.assertIn("0x8101", self.cmds(api))
+        # ... and the relay trigger does not.
         self.assertEqual(self.triggers(api), [])
-
-
-class LiveHeartbeatTests(unittest.TestCase):
-    """The viewer's keepAlive reaches the camera as `0x8002`.
-
-    While a live view plays, the camera's only liveness clock is the
-    server's `0x8002` (SIGNALLING_PROTOCOL.md §13.4): with keepAlive only
-    logged, camera .107 ended every live view 35-36 s after its start
-    (2026-10-24), and Frigate saw the stream drop every ~50 s.
-    """
-
-    UID = "140979857781"
-
-    def setUp(self):
-        self.out = io.StringIO()
-        self._ctx = contextlib.redirect_stdout(self.out)
-        self._ctx.__enter__()
-        self.addCleanup(self._ctx.__exit__, None, None, None)
-
-    def make(self):
-        api = fake.HttpApi(relay_start=True)
-        api.camera_links[self.UID] = _FakeSocket([])
-        api.last_seq[self.UID] = 7
-        return api
-
-    def frames(self, api):
-        return api.camera_links[self.UID].sink
-
-    def test_the_heartbeat_is_the_bare_frame_the_firmware_expects(self):
-        frame = fake.vendor_heartbeat(self.UID, 7)
-        # 86 86 | 80 02 | len 000c | seq 0007 | uidLen 000c | uid | xor | 0d
-        self.assertEqual(len(frame), 24)
-        self.assertEqual(frame[:4], b"\x86\x86\x80\x02")
-        d = fake.decode_signalling(frame)
-        self.assertEqual(d["cmd"], "0x8002")
-        self.assertEqual(d["len"], 12)          # the uid, and nothing else
-        self.assertEqual(d["seq"], 7)
-        self.assertEqual(d["uid"], self.UID)
-        self.assertTrue(d["xor_ok"])
-
-    def test_each_keepalive_sends_one_heartbeat(self):
-        api = self.make()
-        for _ in range(3):
-            self.assertEqual(
-                api.respond("GET", "/api/v1/ipc/notify-live-event",
-                            f"uid={self.UID}&eventType=0")[:12],
-                b"HTTP/1.1 200")
-        cmds = [fake.decode_signalling(f)["cmd"] for f in self.frames(api)]
-        self.assertEqual(cmds, ["0x8002"] * 3)
-        # A keepAlive is not a start: no viewer pairs, no play control.
-        self.assertEqual(api.p2p_fire_at, {})
-
-    def test_the_heartbeat_echoes_the_cameras_last_seq(self):
-        api = self.make()
-        api.last_seq[self.UID] = 41
-        api.respond("GET", "/api/v1/ipc/notify-live-event",
-                    f"uid={self.UID}&eventType=0")
-        self.assertEqual(fake.decode_signalling(self.frames(api)[0])["seq"],
-                         41)
-
-    def test_a_keepalive_for_a_disconnected_camera_is_answered(self):
-        api = fake.HttpApi(relay_start=True)
-        self.assertFalse(api.live_heartbeat(self.UID))
-        reply = api.respond("GET", "/api/v1/ipc/notify-live-event",
-                            f"uid={self.UID}&eventType=0")
-        self.assertEqual(reply[:12], b"HTTP/1.1 200")
 
 
 class RelayTriggerTimingTests(unittest.TestCase):
@@ -939,6 +1552,23 @@ class CameraLinkTests(unittest.TestCase):
         while api.camera_links and time.time() < deadline:
             time.sleep(0.02)
         self.assertEqual(api.camera_links, {}, "the dead link survives")
+
+    def test_a_dropped_link_leaves_the_camera_idle(self):
+        # §17.1: a mediaState other than "0" makes the app refuse to
+        # open the camera. The camera cannot report the stop once its
+        # sig link is gone, so the drop itself is the idle report.
+        api, port = self.serve()
+        s = self.link(port)
+        deadline = time.time() + 3
+        while self.UID not in api.camera_links and time.time() < deadline:
+            time.sleep(0.02)
+        api.set_media_state(self.UID, 1)
+        s.close()
+        deadline = time.time() + 3
+        while api.cameras.get(self.UID, {}).get("mediaState") != "0" \
+                and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(api.cameras[self.UID]["mediaState"], "0")
 
     def test_a_replaced_connection_survives_the_old_close(self):
         """A camera that reconnects must not lose its new link when the
@@ -1107,35 +1737,29 @@ class StunTests(unittest.TestCase):
     def test_header_cookie_and_transaction_id_are_echoed(self):
         reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
                                           64668, "172.16.110.64", 13478)
-        # Binding Success, the same cookie and txid. The length is the
-        # vendor's three attributes (0x24) plus the camera's 0x0020 (12).
+        # Binding Success, the same cookie and txid.
         self.assertEqual(reply[:2], b"\x01\x01")
+        # The length covers the attribute block only: four attributes of
+        # eight bytes each, plus their four-byte headers.
         self.assertEqual(reply[2:4], b"\x00\x30")
         self.assertEqual(reply[4:20], self.REQUEST[4:20])
 
-    def test_the_camera_reads_its_address_the_way_its_firmware_does(self):
-        # The camera's own request: RFC 5389 cookie, the fixed txid both
-        # units send. Its STUN client (CUSTOM_TASK_StunXorAddr, 0x180190e8)
-        # wants type 0x0101, walks the attributes by length, takes ONLY
-        # 0x0020 and XORs it with 0x2112 / 21 12 A4 42
-        # (SIGNALLING_PROTOCOL.md §12.2). Without it every camera STUN
-        # failed and no session ever reached the live view.
-        request = bytes.fromhex("000100002112a442"
-                                "63c7117e0714278f5ded3221")
-        reply = fake.stun_binding_success(request, "192.168.68.107", 52688,
-                                          "192.168.68.114", 13478)
-        self.assertEqual(reply[:2], b"\x01\x01")
-        pos, found = 20, None
-        while pos + 4 <= len(reply):
-            atype, alen = struct.unpack("!HH", reply[pos:pos + 4])
-            if atype == 0x0020:
-                found = reply[pos + 4:pos + 4 + alen]
-            pos += 4 + alen
-        self.assertIsNotNone(found)
-        port = struct.unpack("!H", found[2:4])[0] ^ 0x2112
-        ip = bytes(a ^ b for a, b in zip(found[4:8], b"\x21\x12\xa4\x42"))
-        self.assertEqual(port, 52688)
-        self.assertEqual(socket.inet_ntoa(ip), "192.168.68.107")
+    def test_the_camera_gets_the_xor_mapped_address_it_accepts(self):
+        # The camera's STUN client (`CUSTOM_TASK_StunXorAddr`) accepts a
+        # Binding Success only if it carries a standard XOR-MAPPED-ADDRESS
+        # (attribute 0x0020). Without it the camera retries four times
+        # from fresh ports and then closes its own signalling socket --
+        # which is what every session before 2026-10-24 ended on.
+        reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
+                                          64668, "172.16.110.64", 13478)
+        attrs = self.attrs(reply)
+        self.assertIn(0x0020, attrs)
+        val = attrs[0x0020]
+        port = int.from_bytes(val[2:4], "big") ^ 0x2112
+        mask = reply[4:8] + reply[8:12]
+        ip = bytes(x ^ y for x, y in zip(val[4:8], mask))
+        self.assertEqual(port, 64668)
+        self.assertEqual(".".join(str(b) for b in ip), "177.221.120.116")
 
     def test_mapped_address_and_server_address_match_the_vendor(self):
         reply = fake.stun_binding_success(self.REQUEST, "177.221.120.116",
@@ -1441,6 +2065,52 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(body["data"]["IpcPrivateIP"], "192.168.68.50")
         self.assertIn("updateTime", body["data"])
 
+    def test_the_public_pair_is_the_cameras_own(self):
+        # §14.1: the vendor's IpcPublic* is the CAMERA's STUN mapping,
+        # not the viewer's. The camera reports it in its 0x0003.
+        self.api.set_camera_public("141030191094", "186.233.129.211", 27719)
+        body = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
+        self.assertEqual(body["data"]["IpcPublicIP"], "186.233.129.211")
+        self.assertEqual(body["data"]["IpcPublicPort"], 27719)
+        # And the viewer's own address is not in the answer.
+        self.assertNotEqual(body["data"]["IpcPublicIP"], "1.2.3.4")
+
+    def test_the_registration_number_is_per_camera(self):
+        # §14.1: each send-stun-addr takes the next number FOR THAT
+        # CAMERA, and the camera echoes it back in its 0x0003. One
+        # shared counter never shows the viewer's own number, and the
+        # app waits for exactly that before it starts the view.
+        uid = "141030191094"
+        first = self.call("GET", "/api/v1/ipc/send-stun-addr",
+                          f"uid={uid}&publicIp=1.2.3.4&publicPort=1"
+                          f"&privateIp=5.6.7.8&privatePort=2")
+        second = self.call("GET", "/api/v1/ipc/send-stun-addr",
+                           f"uid={uid}&publicIp=1.2.3.4&publicPort=3"
+                           f"&privateIp=5.6.7.8&privatePort=4")
+        self.assertEqual(first["data"]["seqNo"] + 1,
+                         second["data"]["seqNo"])
+        # Polling must not move it on: the number belongs to the
+        # registration, not to the poll.
+        poll = self.call("GET", f"/api/v1/ipc/stun-addr/{uid}")
+        self.assertEqual(poll["data"]["seqNo"], 0)
+        # Another camera has its own counter.
+        self.api.add_camera("140979857781", "192.168.68.51", 1)
+        other = self.call("GET", "/api/v1/ipc/send-stun-addr",
+                          "uid=140979857781&publicIp=1.2.3.4&publicPort=1"
+                          "&privateIp=5.6.7.8&privatePort=2")
+        self.assertEqual(other["data"]["seqNo"], 1)
+
+    def test_the_reported_number_is_what_stun_addr_shows(self):
+        # The camera answers a registration by echoing its number in the
+        # 0x0003; only then does stun-addr show it.
+        uid = "141030191094"
+        self.call("GET", "/api/v1/ipc/send-stun-addr",
+                  f"uid={uid}&publicIp=1.2.3.4&publicPort=1"
+                  f"&privateIp=5.6.7.8&privatePort=2")
+        self.api.set_reported_seq(uid, 1)
+        body = self.call("GET", f"/api/v1/ipc/stun-addr/{uid}")
+        self.assertEqual(body["data"]["seqNo"], 1)
+
     def test_notify_is_acknowledged(self):
         body = self.call("GET", "/api/v1/ipc/notify-live-event",
                          "appId=x&eventType=1&uid=141030191094")
@@ -1466,10 +2136,42 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(stun["data"]["IpcPrivateIP"], "192.168.68.77")
         self.assertEqual(stun["data"]["IpcPrivatePort"], 9000)
 
-    def test_seqno_advances_between_answers(self):
+    def test_a_poll_does_not_move_the_registration_number(self):
+        # §14.1: the number belongs to a registration, not to a poll.
+        # The old shared counter moved on every answer -- including the
+        # poll -- so the viewer's own number never came back and the app
+        # gave up and went to relay.
         first = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
         second = self.call("GET", "/api/v1/ipc/stun-addr/141030191094")
-        self.assertGreater(second["data"]["seqNo"], first["data"]["seqNo"])
+        self.assertEqual(second["data"]["seqNo"], first["data"]["seqNo"])
+
+    def test_get_sig_ip_hands_the_app_this_brokers_address(self):
+        # §17.5: the app saves `data` as icpSigAddress only when `code`
+        # is 400, and that string is the BLE wifiConnect urlAndPort.
+        self.api.sig_host = "192.168.68.114"
+        self.api.sig_port = 8882
+        body = self.call("GET", "/api/v1/ipc-function/get-sig-ip",
+                         "supportLoadBalance=1")
+        self.assertEqual(body["code"], 400)
+        self.assertEqual(body["data"], "192.168.68.114:8882")
+
+    def test_get_sig_ip_is_empty_when_signalling_is_off(self):
+        self.api.sig_port = 0
+        body = self.call("GET", "/api/v1/ipc-function/get-sig-ip")
+        self.assertEqual(body["code"], 400)
+        self.assertEqual(body["data"], "")
+
+    def test_a_restart_serves_an_idle_media_state(self):
+        # §17.1: the app will not open a camera whose mediaState is not
+        # "0". A state left over from the previous run is not live.
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        self.addCleanup(Path(fh.name).unlink, missing_ok=True)
+        json.dump({"141030191094": {"uid": "141030191094",
+                                    "mediaState": "3"}}, fh)
+        fh.close()
+        api = fake.HttpApi(camera_file=fh.name)
+        api.load_cameras()
+        self.assertEqual(api.cameras["141030191094"]["mediaState"], "0")
 
 
 class HttpApiServerTests(unittest.TestCase):

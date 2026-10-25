@@ -446,12 +446,132 @@ exercises only that experiment path.
 >   re-rendezvous.
 >
 > `ziot-fw/SIGNALLING_PROTOCOL.md` §0 (16:14 box), §13.4 and §15 item 6.
+
+> **Update 2026-10-24 20:45 — the direct chain was gated behind the relay
+> flag.** `--relay-start` governs the `0x8005` relay trigger, and the
+> `0x8005` is the thing that breaks the camera's session (it fires the
+> relay task, and the firmware closes a live session fd on it). It was
+> therefore off. But `schedule_p2p_live()` — the **direct** chain
+> (`0x8101` viewer address → `0x8004` value 1 → hello punch) — sat
+> behind the same flag, because the two were written next to each other.
+> Turning the flag off disarmed the direct chain as well: the log said
+> `0x8101 held`, the camera never bound its P2P socket, and it sent no
+> media at all. The two are now separate: the direct chain always runs,
+> only the `0x8005` is opt-in. `DirectChainTests` pins it.
 >
-> **Fixed on `frigate-continuous-stream`, not yet validated live.** The
-> broker now forwards each `eventType=0` keepAlive to the camera as
-> `0x8002`, so a live view lasts as long as its viewer keeps sending
-> keepAlives. The live check: the camera's `0x0002` shows up on sig about
-> every 10 s, and no `0x0004` value 0 follows 36 s after a value 1.
+> **Update 2026-10-24 22:28 — camera .108 streams, end to end.**
+> The direct chain works, with the vendor's own protocol shapes:
+> **8.0-8.4 fps, continuous**, no 36 s stop, and the bridge serving
+> baseline **640x480** JPEGs (66 frames in 8 s) plus a RIFF WAV audio
+> stream. What made it work, in the order it mattered:
+>
+> 1. **The `0x8001` ack carries the camera's own counter** (`cSeq:2 |
+>    cmd:2 | ack:1`). In all 1134 acks of the 2 h vendor wiretap the
+>    body's first u16 is the camera's *latest* sequence number for that
+>    command; ours were constant, so no ack ever matched and the camera
+>    answered by re-asking — thirty `0x0002`s in a burst, then silence.
+> 2. **The play follows the camera's own report**: its `0x0004` carries
+>    the media state, and `3` means "P2P socket bound" — the
+>    precondition `0x8004` PlayLiveview checks. Not a timer.
+> 3. **The hello comes first, at the camera's freshest RTP port** (the
+>    `0x8101` makes it re-run STUN and draw a new port), because
+>    PlayLiveview closes the socket the camera was waiting on.
+> 4. **Unknown camera commands get the vendor's shape**, not the
+>    candidate sweep's frames (one of which was a `0x8001` with no body
+>    at all, which the camera's `cSeq/cmd/ack` parser cannot read).
+> 5. **The `0x8002` heartbeat holds the view open** — `re_rendezvous`
+>    stayed at 84 for the whole run.
+>
+> The wire, for the record (`.108`, 22:28):
+>
+> ```
+> 22:28:17  0x0001 register        -> 0x8000 arm + 0x8101 viewer
+> 22:28:19  0x0004  id3 = 3        (P2P socket bound)
+> 22:28:19  STUN from :50293      (the new RTP port)
+> 22:28:21  hello x3 -> :50293    (the fresh port, first)
+> 22:28:21  0x8004 play-liveview  (p2p bound)
+> 22:28:22  0x0004  id3 = 0 -> 1   (direct live)
+> ```
+>
+> **Camera `.107` still fails, and the difference is on its side**: its
+> handshake completes and it reports the same states, but its frames
+> then stop for ~30 s, arrive as a 14-frame burst, and the session dies.
+> A healthy camera settles into one `0x0002` every 10 s and stays.
+>
+> *Retracted 23:50:* the "media engine is not running / TCP ports dead"
+> line that used to sit here was never a diagnosis. Streaming `.108` has
+> no TCP ports open either — all media is UDP. See the BLE box below for
+> what `.107` actually changed.
+
+> The tell is in the log. `--relay-start off: 0x8101 held` on a camera
+> that is registered and answering means the direct chain is switched
+> off, not that the camera is asleep.
+>
+> **Update 2026-10-24 21:12 — the play must follow the camera's own
+> STUN.** `0x8004` PlayLiveview was fired on a fixed 1.5 s timer after
+> the `0x8101`. But the camera's P2P socket is only bound when it
+> re-runs STUN from a **new port**, and the firmware rejects
+> PlayLiveview while that socket is unbound ("p2p is not finish"). Live
+> 21:07, the timer won the race: the play went out at 21:07:22 and the
+> camera's P2P STUN arrived in the same second, and the camera sent
+> **nothing** — it sat there asking to pull video (30 × `cmd 0x0002`)
+> and never pushed a byte.
+>
+> The play is now triggered by the camera itself: a STUN call (or a
+> `0x0003` report) from a **new** source port means the socket is
+> bound, and `p2p_socket_bound()` fires PlayLiveview and punches the
+> hello at that new port. A timer (6 s) remains as the fallback for a
+> camera that does not re-run STUN.
+>
+> The log now says `0x8004 play-liveview (p2p bound)` — that is the
+> line to look for. A bare `0x8004 play-liveview` means the fallback
+> timer fired, i.e. the camera never re-ran STUN.
+>
+> **Update 2026-10-24 21:30 — the ack's `cSeq`, and what the vendor
+> actually sends.** The `0x8001` ack body is `cSeq:2 | cmd:2 | ack:1`,
+> and the **cSeq is the camera's own sequence number**. The 2 h vendor
+> wiretap settles it: in **all 1134** acks the body's first u16 equals
+> the camera's latest counter for that command — 535 of them
+> `00 03 00 02 00` and 535 `00 04 00 04 00` (the counter usually sitting
+> at 3 and 4), with a tail of `00 04 00 02 00`, `00 05 00 04 00`,
+> `00 08 00 02 00`. The frame's *header* sequence echoes the frame
+> being answered, which can be one behind.
+>
+> Ours were constant (`cSeq` 3 for the pullVideo answer, `cSeq` = the
+> command id for the status answer). An ack of the wrong number is an
+> ack of nothing, and the camera answered it by re-asking: **thirty
+> `0x0002`s in a burst**, and then silence. Both builders now take the
+> camera's number, and `SignallingFrameTests` pins the captured bytes.
+>
+> **The unknown-command answer was junk.** A camera command with no
+> vendor answer (the `0x0005` and friends) went to the exploratory
+> candidate sweep, which rotates through frames the vendor never sends —
+> including a `0x8001` with **no body at all**, which the camera's
+> `cSeq/cmd/ack` parser cannot read. Those two facts line up with the
+> camera falling silent right after its `0x0005` (19:43:12 and 21:22:20).
+> The sweep is now behind `--ack-sweep` (off); the default answer is the
+> vendor's own shape with the camera's number and its command id.
+>
+> **Other deviations closed the same evening:**
+>
+> * `stun-addr` serves the **camera's** pairs, not the viewer's:
+>   `IpcPublic*` is the camera's own STUN mapping (from its `0x0003`),
+>   `IpcPrivate*` its local pair (§14.1). The public pair was parsed
+>   and thrown away.
+> * `seqNo` is **per camera**: each `send-stun-addr` takes the next
+>   number *for that camera*, the `0x8101` carries it to the camera,
+>   the camera echoes it in its `0x0003`, and only then does
+>   `stun-addr` show it. One shared counter moved on every answer
+>   (including the app's polls), so the app's own number never came
+>   back — which is why the 13:47 app gave up and went to relay.
+> * A **STUN reply now comes from the address the request was sent to**
+>   (`IP_PKTINFO`), which the phone needs and the camera does not
+>   (§12.5). Verified live: a request to `47.238.125.111:13478` is
+>   answered from `47.238.125.111`.
+> * `eventType=5` → the `0x8005` relay start is mapped (§13.6), still
+>   held unless `--relay-start`.
+> * The `0x8101` is sent when the **viewer registers**
+>   (`send-stun-addr`), which is the app's order (§15 item 5).
 
 `ziot_wiretap.py` was how that link was read: it sits in front of the
 vendor's signalling server, forwards the camera's traffic to the real
@@ -506,6 +626,45 @@ sudo cp ziot-ips.service /etc/systemd/system/
 sudo systemctl enable --now ziot-ips.service
 ```
 
+> **Update 2026-10-24 21:02 — claim them in NetworkManager, not in a
+> boot-time script.** `ziot-ips.service` is a one-shot: it claims the six
+> addresses once and exits. When the WiFi re-associates (the link drops
+> for a second and comes back — which the AP does on its own now and
+> then), the kernel flushes **every address on the interface except the
+> DHCP one**, and nothing re-claims them. The symptom is identical to
+> "the cameras went to sleep":
+>
+> * the bridge fails its re-rendezvous with
+>   `transport attempt failed: [Errno 99] Cannot assign requested
+>   address` — it cannot bind the socket to `192.168.68.114`;
+> * the router's static routes point at an address **nobody answers
+>   ARP for**, so the camera's own packets are dropped before they
+>   reach the broker;
+> * the cameras never register again, and nothing in the logs says
+>   "the host lost its addresses".
+>
+> Put the addresses in the **connection profile** instead — NetworkManager
+> re-adds them on every re-association and every boot, and it needs no
+> password:
+>
+> ```bash
+> nmcli con mod "House of Cats 1" \
+>   +ipv4.addresses 192.168.68.114/32 \
+>   +ipv4.addresses 120.26.121.165/32 \
+>   +ipv4.addresses 47.110.77.193/32 \
+>   +ipv4.addresses 47.97.71.82/32 \
+>   +ipv4.addresses 47.238.125.111/32 \
+>   +ipv4.addresses 8.130.23.234/32
+> nmcli device reapply wlan1        # applies them without dropping the link
+> ```
+>
+> `reapply` is the safe verb: `nmcli con up` would re-associate the
+> WiFi and take the default route (and the internet) down with it. The
+> address list must stay identical to `VENDOR_IPS` in
+> `ziot_fake_cloud.py` — `47.97.71.82` was missing once, and every
+> camera attempt to the *current* `sig.gps555.net` answer then went
+> unanswered.
+
 **2 — Point the router at this host.** In the Deco app: *More → Advanced →
 Static Routing → +*. One entry per address:
 
@@ -513,6 +672,7 @@ Static Routing → +*. One entry per address:
 |---|---|---|---|---|
 | ZIOT ipc | `120.26.121.165` | `255.255.255.255` | `192.168.68.114` | LAN |
 | ZIOT sig | `47.110.77.193` | `255.255.255.255` | `192.168.68.114` | LAN |
+| ZIOT sig (current) | `47.97.71.82` | `255.255.255.255` | `192.168.68.114` | LAN |
 | ZIOT stun+ws | `47.238.125.111` | `255.255.255.255` | `192.168.68.114` | LAN |
 | ZIOT stunaddr | `8.130.23.234` | `255.255.255.255` | `192.168.68.114` | LAN |
 
@@ -521,6 +681,23 @@ gateway is this host, and it must sit on the same subnet as the router
 interface that sends the traffic out — hence **LAN**, not WAN: the packets
 leave the router's LAN side towards us. The four destinations are public
 addresses, so none of them collides with the router's own LAN or WAN.
+
+**Both signalling addresses are needed, and they are not a range.** The
+camera resolves the *name* `sig.gps555.net` and connects to the address
+it gets — and that address moves: it was `47.110.77.193` on 2026-10-23
+and is `47.97.71.82` today (`getent hosts sig.gps555.net`), which is
+also the address the vendor's own `0x8000` names in its signalling slot
+and the one the wiretap reached the vendor on. A camera whose stored
+signalling server is that name therefore talks to `47.97.71.82`, and
+without a route for it the packets go out to the internet and the camera
+never registers — the symptom is a camera that is on the LAN, answers
+ping, and is simply absent from the broker's log. Claiming a *range*
+would be wrong: these are five specific addresses, and a /24 of someone
+else's public space is not ours to take.
+
+The host side must claim the same set (the six addresses in the
+NetworkManager profile below), or the reply comes from an address the
+camera does not expect and it drops the connection.
 
 **3 — Open the host firewall.** The broker's ports must be reachable from the
 LAN. If the host runs `firewalld` (as this deployment does), they are **not**
@@ -549,6 +726,27 @@ long written off as an asleep battery unit was in fact knocking on `:8882`
 every few seconds and being rejected by the firewall the whole time — check
 this before concluding a camera is asleep (`tcpdump -i wlan0 host <cam-ip>`
 shows the rejected SYNs and the `admin prohibited` ICMP).
+
+**The media needs the firewall too, and per camera, not per port.** The
+bridge's UDP socket is ephemeral. A camera's RTP gets in only when it matches
+a conntrack entry that the bridge's own punch created, and the cameras stream
+from ports they never report. On 2026-10-25 `.108` sent from `:51783` after
+reporting `:51873` and `:51781`. So without a rule, firewalld drops the whole
+stream with `admin prohibited` while the camera reports itself live
+(`ziot-fw/SIGNALLING_PROTOCOL.md` §18.7, §18.9). Accept UDP from each camera's
+IP, runtime and permanent:
+
+```bash
+for ip in 192.168.68.107 192.168.68.108; do
+  sudo firewall-cmd --zone=public --add-rich-rule="rule family=ipv4 source address=$ip protocol value=udp accept"
+  sudo firewall-cmd --permanent --zone=public --add-rich-rule="rule family=ipv4 source address=$ip protocol value=udp accept"
+done
+```
+
+On a `ufw` host (the homelab server), the equivalent is `sudo ufw allow from
+<cam-ip> proto udp` for each camera, plus the four broker ports above
+(`sudo ufw allow 80,8882,7080/tcp` and `sudo ufw allow 13478/udp`). The
+cameras' IPs must be fixed (DHCP reservations) for a per-IP rule to hold.
 
 **4 — Run the broker and watch.** The API answers on the vendor's port 80,
 the signalling server on 8882, STUN on 13478 and the websocket on 7080. With
@@ -592,12 +790,30 @@ over BLE with this host as its signalling server, is the cleaner end state.
 #### Re-provisioning over BLE — the frame the camera actually wants
 
 The app builds a `wifiConnect` frame (§9) and `--provision` writes it
-over raw ATT (§10). The camera's firmware names the fields it parses —
-`cmd`, `ssid`, `pwd`, `urlAndPort`, `p1`, `port`, `timezone`, `bind id`,
-`param bind id` — of which our frame carries the first four and the
-timezone; the last two are the camera's *binding key*, the
-16-character string it advertises in its ServiceData. See
-`DECOMPILATION_REPORT.md` §13–§14 and `ziot-fw/REPORT.md`.
+over raw ATT (§10). §13 read nine field names out of the camera's
+firmware — `cmd`, `ssid`, `pwd`, `urlAndPort`, `p1`, `port`,
+`timezone`, `bind id`, `param bind id` — and §14 assumed they were the
+fields of one frame. **They are not.** The app's own builder, recovered
+with Blutter (see `DECOMPILATION_REPORT.md` §14.0), shows
+`wifiConnect` is six fields:
+
+```
+payload = 00 01 | <len><ssid> | <len><pwd> | <len><urlAndPort>
+                | <tz:2> | [regCode:4]        ← regCode omitted for placeholder devices
+```
+
+`p1`, `port`, `bind id` and `param bind id` come from the camera's
+*other* BLE request (`sendDevicePullRequest` → `_handleSetupAPData`); the
+camera prints both parsers' field names into one literal pool, which is
+what made them look like one nine-field frame.
+
+The timezone is **minutes**, negative values biased by `+0x8000`
+(`_getTimezoneOffset` is `timeZoneOffset.inMicroseconds ~/ 60000000`,
+then `+0x8000` when negative) — `wifi_connect_frame()` already does
+exactly that. The regCode is a nonce, not a credential:
+`sha256(phoneUuid + micros)`, digest bytes 0, 2, 4 and 6 packed
+big-endian. The app sends it for every real device; our `att_try.py`
+sends `0`, and the builder then leaves the four bytes out.
 
 **The frame was missing its end symbol.** The camera's own answers
 settled the format:
@@ -617,6 +833,73 @@ ignoring the frame, it was waiting for its last byte.
 The camera is therefore a usable oracle: `ffff00` means the frame was
 read and the command not understood, silence means the frame never
 completed. `att_candidates.py` drives that oracle.
+
+> **Update 2026-10-24 20:40 — BLE provisioning WORKS.** After a *reset*
+> (which wipes the stored WiFi and puts the camera in AP mode, where it
+> broadcasts an open network named `ZIOTA_<uid>`) the camera was
+> provisioned over raw ATT and **joined the house WiFi**. The recipe:
+>
+> ```bash
+> python3 att_try.py E0:44:40:60:68:82 "sig.gps555.net:8882"
+> ```
+>
+> * **handle `0x0008` is the command channel.** The frame goes there in
+>   20-byte chunks (`chunk20`); every chunk is acknowledged (`13`).
+> * **The camera answers.** The answer is a notification, split over two
+>   ATT PDUs — read them together:
+>   `86 86 00 15 00 00 00 10 | 80 01 00 0c "140979857781" | 8e | 0d`
+>   → `0x8001` sub-header, **status `0x00` = accepted**, the uid, the
+>   frame's XOR and the `0x0d` end symbol. This is the answer the old
+>   notes said was never seen.
+> * The camera then associates with the SSID in the frame and, ~60 s
+>   later, registers with the signalling server — so the whole chain
+>   works over **BLE, with no change to this host's networking** (the
+>   host stays on the house WiFi; the camera talks to the broker
+>   through the router's static routes, as it always did).
+> * `urlAndPort` was given the vendor's own `sig.gps555.net:8882`, so
+>   the camera's configuration ends up exactly as the app left it.
+>
+> The handle probe in `att_try.py` writes the frame to several candidate
+> handles; only `0x0008` produces the notification, and the camera
+> closes the ATT link right after answering — which is why the script
+> then fails on the next handle. That is expected, not a bug.
+>
+> `att_prov.py` is the tidier writer but it dies on the CCCD write
+> (the camera sends its own MTU request first and the link goes with
+> it); `att_try.py` survives because its first CCCD write absorbs that
+> request.
+
+> **Update 2026-10-24 23:50 — accepted is not the same as streaming, and
+> the frame shape is now ruled out.** Unit `.107` answered our BLE frame
+> with status `0x00` (above) and joined the WiFi, but it has not pushed a
+> single frame since. The correlation is exact: it streamed at
+> 19:39–19:43 (83,353 datagrams, 4,351 frames) while its configuration
+> was still the app's, and it has not streamed once since the BLE writes
+> of 20:39 and 21:06. Unit `.108`, which was never re-provisioned, still
+> streams.
+>
+> The obvious suspect was a malformed frame — and it is **wrong**. The
+> app's own builder (Blutter, Dart 3.10.8, snapshot
+> `1ce86630892e2dca9a8543fdb8ed8e22`) builds the same bytes this repo
+> builds: header, `LEN = DLEN + 5`, the three length-prefixed strings,
+> the two timezone bytes and the optional four regCode bytes. Same shape,
+> same bias, same end symbol. Our problem is not layout; it is *values*.
+>
+> Two value-level differences remain, both cheap to test:
+>
+> * **`urlAndPort`** — the app stores the cloud's `icpSigAddress`; we
+>   wrote `sig.gps555.net:8882`, which our DNS and the claimed /32s
+>   answer, but which is not what the camera was bound to before.
+> * **the regCode** — the app appends it for every real device
+>   (`sha256(phoneUuid + micros)`, bytes 0/2/4/6, big-endian). Our
+>   `att_try.py` used to pass `0`, which omits the four bytes entirely;
+>   it now sends the nonce (`string_to_uint32`), so the frame matches the
+>   app's field for field.
+>
+> Also worth retiring: the old note that `.107`'s "media engine is not
+> running / its TCP ports are dead" is not a diagnosis. The healthy
+> `.108` has **no TCP ports open either** — media is always UDP. A dead
+> TCP listener means nothing here.
 
 ### Docker (recommended)
 

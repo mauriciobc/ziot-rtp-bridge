@@ -159,6 +159,15 @@ The literal pool for this function is at payload `0x15bb8`–`0x15bec`, and
 the pool entries appear in exactly that order, which is the compiler's
 emission order and therefore the source order.
 
+> **Correction (2026-10-24, from the app's builder).** These nine names
+> are not the fields of one frame. The camera's BLE parse function serves
+> **two** app requests — `wifiConnect` (cmd `1`) and the setup/pull
+> request — and the compiler emitted both parsers' literals into one
+> pool. The app's `wifiConnect` payload is six fields (`cmd`, `ssid`,
+> `pwd`, `urlAndPort`, `timezone`, optional `regCode`); `p1`, `port`,
+> `bind id` and `param bind id` belong to the other command. See
+> `DECOMPILATION_REPORT.md` §14.0 for the recovered builder.
+
 #### The cloud signalling protocol (payload `0x5ff00`–`0x60400`)
 
 ```
@@ -618,7 +627,7 @@ one connection per probe:
 |---|---|
 | 1 byte `00` | `86 86 0008 0001 0003 ffff00 0a 0d` |
 | 2 bytes | *silence* |
-| 57-byte frame (`86 86 …`) | *silence* |
+| 57-byte frame (`86 86 …`, **no** `0d` terminator) | *silence* |
 
 Decoding the one-byte answer against the firmware's own format
 (`CUSTOM_PROTOCOL`: `cmd:%04X, len:%d, uidLen:%d`):
@@ -639,9 +648,10 @@ So the camera:
 * **answers** a malformed one-byte write with an error frame;
 * **waits** for more data when the head is `86 86` — "BLE totalLen:%d,
   offset:%d" means it reassembles chunks until it has the whole frame;
-* never answers our 57-byte frame, because the frame's **field layout is
-  wrong** — the firmware expects nine fields, the frame we send (built
-  from the app's assembly) carries six.
+* never answered our 57-byte frame, because it was **incomplete**: the
+  request frame ends with `0x0d`, and ours did not. The *layout* was
+  right — the firmware's nine names span two commands (correction in
+  §2), and the app's `wifiConnect` carries six, exactly what we send.
 
 Note the camera's error frame has the same `86 86` framing as the app's
 request frame, and it ends with `0x0d` — the byte the app's parser
@@ -650,13 +660,13 @@ trailing `0x0d`; the camera's *replies* include it.
 
 ---
 
-## 4. The BLE frame we send, and why it is wrong
+## 4. The BLE frame we send — correct, but it was incomplete
 
 Reconstructed from the app's Dart assembly (Blutter), the frame is:
 
 ```
-86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8
-LEN16 = 5 + DLEN          (counts SEQ + DLEN + payload + XOR)
+86 86 | LEN16 | SEQ16 | DLEN16 | payload | XOR8 | 0D
+LEN16 = 5 + DLEN          (counts SEQ + DLEN + payload + XOR, not the end symbol)
 payload = 00 01 | <len>ssid | <len>pwd | <len>sigAddr | tz(2, +0x8000 if negative)
                  | [regCode(4, optional)]
 ```
@@ -666,7 +676,10 @@ plain and the regCode variant, reproduced exactly by
 `ziot_fake_cloud.py`'s `wifi_connect_frame()`).
 
 The firmware's field list says the camera expects: `cmd, ssid, pwd,
-urlAndPort, p1, port, timezone, bind id, param bind id`.
+urlAndPort, p1, port, timezone, bind id, param bind id` — but, as the
+correction in §2 notes, that list spans **two** commands. For
+`wifiConnect` the fields are the first four plus `timezone` and the
+optional `regCode`.
 
 Mapping what we send onto what it wants:
 
@@ -676,21 +689,26 @@ Mapping what we send onto what it wants:
 | ssid | ssid | ✓ |
 | pwd | pwd | ✓ |
 | urlAndPort | sigAddr (`host:port`) | ✓ (matches the `icpSigAddress` field) |
-| p1 | — | **missing** |
-| port | — | **missing** |
-| timezone | tz | ✓ |
-| bind id | — | **missing** |
-| param bind id | — | **missing** (we send `regCode` here, which is a different thing) |
+| p1 | — | other command (setup/pull), not `wifiConnect` |
+| port | — | other command (setup/pull), not `wifiConnect` |
+| timezone | tz | ✓ (minutes, negative biased `+0x8000`) |
+| bind id | — | other command (setup/pull), not `wifiConnect` |
+| param bind id | — | other command (setup/pull), not `wifiConnect` |
 
-The two "bind id" fields are the **binding key** — the camera
+The two "bind id" fields are the camera's **binding key** — the camera
 advertises `key` + 16 ASCII chars in its ServiceData (`keyyfg5y34yqxqgd`
 observed on unit `140979857781`), and §8 of the decompilation report
 already notes this is the camera's own binding/registration secret. The
-app reads it from the advertisement; the camera expects it back in the
-provisioning frame. We have been sending a `regCode` nonce instead.
+app reads it from the advertisement. It is *not*, however, part of the
+`wifiConnect` frame: the app's `regCode` (a nonce,
+`sha256(phoneUuid + micros)`) is what it appends there.
 
-**This is the concrete defect in our BLE provisioning**, and it is
-fixable now that the field list is known.
+**Correction to the earlier conclusion:** the frame shape was never the
+defect — `wifi_connect_frame()` reproduces the app's frame byte for byte,
+as §4's byte-level comparison already showed. The end symbol was the
+real defect (see `DECOMPILATION_REPORT.md` §14.1), and it is fixed. What
+remains is value-level: the `urlAndPort` we choose and the missing
+`regCode` (`att_try.py` passes `0`, which omits the four bytes).
 
 ---
 
@@ -780,12 +798,11 @@ still running as an ordinary user with a readable log.
    port 8882 is where the camera will appear, and the firmware's
    `CUSTOM_PROTOCOL_ParseData` tells us the frame shape
    (`cmd:%04X, len:%d, uidLen:%d`, XOR-checked, uid-prefixed).
-2. **The BLE frame's field list.** The firmware wants nine fields; we
-   send six. The missing ones are `p1`, `port`, `bind id` and
-   `param bind id` — and the binding key is the thing the camera
-   advertises in cleartext, so we can supply it. The camera's own error
-   frame (`ff ff 00` = unknown command) is a ready-made oracle for
-   testing candidate layouts.
+2. **The BLE frame's field list — resolved, see §4's correction.** The
+   nine names span two commands; `wifiConnect` is six fields and our
+   builder matches the app's byte for byte. The camera accepted our
+   frame (status `0x00`). What is still open is the *values* we send
+   (`urlAndPort`, the omitted `regCode`).
 3. **The signalling protocol implementation.** `CUSTOM_PROTOCOL_*` is
    readable in the firmware; the broker needs to answer it.
 
@@ -809,7 +826,11 @@ still running as an ordinary user with a readable log.
   `01 12 0c 00 0a` = *attribute not found*.
 * **The claim that the app's frame was byte-verified** held only for the
   *builder against the assembly*. The frame was never observed on the
-  air, and the firmware now shows its field list is wrong.
+  air, and the firmware's field list appeared to contradict it — but the
+  contradiction was the field list's, not the builder's: those nine names
+  are two commands' worth of literals. The app's builder has since been
+  recovered in full (Blutter, `DECOMPILATION_REPORT.md` §14.0) and it
+  agrees with `wifi_connect_frame()`.
 * **The vendor's API host appeared unreachable** when the answer was that
   *our own* broker answered it (the local claim made the address
   resolve to us).
@@ -961,12 +982,11 @@ tap — which `ziot_wiretap.py` does.
    port 8882 is where the camera will appear, and the firmware's
    `CUSTOM_PROTOCOL_ParseData` tells us the frame shape
    (`cmd:%04X, len:%d, uidLen:%d`, XOR-checked, uid-prefixed).
-2. **The BLE frame's field list.** The firmware wants nine fields; we
-   send six. The missing ones are `p1`, `port`, `bind id` and
-   `param bind id` — and the binding key is the thing the camera
-   advertises in cleartext, so we can supply it. The camera's own error
-   frame (`ff ff 00` = unknown command) is a ready-made oracle for
-   testing candidate layouts.
+2. **The BLE frame's field list — resolved, see §4's correction.** The
+   nine names span two commands; `wifiConnect` is six fields and our
+   builder matches the app's byte for byte. The camera accepted our
+   frame (status `0x00`). What is still open is the *values* we send
+   (`urlAndPort`, the omitted `regCode`).
 3. **The signalling protocol implementation.** `CUSTOM_PROTOCOL_*` is
    readable in the firmware; the broker needs to answer it.
 

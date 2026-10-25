@@ -10,3 +10,6 @@ ZIOT_FINDINGS.md
 
 # broker state: camera/viewer registries, includes account data
 broker-data/
+
+# packet captures can carry account tokens
+*.pcap

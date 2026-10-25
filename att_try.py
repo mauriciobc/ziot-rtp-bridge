@@ -16,6 +16,7 @@ import socket
 import struct
 import sys
 import time
+import uuid
 
 sys.path.insert(0, "/home/mauriciobc/Documentos/Code/ziot-rtp-bridge")
 import ziot_fake_cloud as z
@@ -50,8 +51,16 @@ def connect(mac):
 
 def main():
     env = z._load_env("/home/mauriciobc/Documentos/Code/ziot-rtp-bridge/.env")
-    frame = z.wifi_connect_frame(env["WIFI_SSID"], env["WIFI_PWD"], SIG, -180)
+    # The app's frame carries a regCode nonce: sha256(phoneUuid + micros),
+    # four bytes, after the timezone. Sending it makes our frame the app's
+    # frame rather than a truncated one.
+    tz_minutes = time.localtime().tm_gmtoff // 60
+    seed = "%012X%d" % (uuid.getnode(), time.time_ns() // 1000)
+    reg_code = z.string_to_uint32(seed)
+    frame = z.wifi_connect_frame(env["WIFI_SSID"], env["WIFI_PWD"], SIG,
+                                 tz_minutes, reg_code=reg_code)
     chunks = z.chunk20(frame)
+    print(f"tz {tz_minutes} min, regCode {reg_code:#010x}", flush=True)
     print(f"frame {len(frame)}B -> {len(chunks)} chunks", flush=True)
     print(f"frame: {frame.hex()}", flush=True)
 
