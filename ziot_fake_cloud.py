@@ -54,6 +54,13 @@ import time
 import urllib.parse
 import uuid
 
+# socket.IP_PKTINFO only exists from Python 3.12; the Docker image runs
+# 3.11, where touching it raised AttributeError and crash-looped the
+# broker (2026-10-25 cutover). 8 is its value on Linux, the only platform
+# the STUN reply path targets; elsewhere setsockopt fails with OSError,
+# which the callers already treat as "no destination address".
+IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8)
+
 VENDOR_DOMAINS = ("ipc.gps555.net", "sig.gps555.net", "stun.gps555.net",
                   "stunaddr.gps555.net", "ws.gps555.net", "gps555.net")
 
@@ -2576,7 +2583,7 @@ class StunHandler(socketserver.BaseRequestHandler):
             info = struct.pack("i4s4s", 0, socket.inet_aton(src),
                                b"\x00" * 8)
             sock.sendmsg([payload],
-                         [(socket.IPPROTO_IP, socket.IP_PKTINFO, info)],
+                         [(socket.IPPROTO_IP, IP_PKTINFO, info)],
                          0, self.client_address)
         except OSError:
             sock.sendto(payload, self.client_address)
@@ -2595,7 +2602,7 @@ class StunServer(socketserver.ThreadingUDPServer):
         # Ask for the destination address of every datagram, so the
         # reply can come from the address the request was sent to (§12.5).
         try:
-            self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_PKTINFO, 1)
+            self.socket.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
         except OSError:
             pass
         socketserver.ThreadingUDPServer.server_bind(self)
@@ -2609,7 +2616,7 @@ class StunServer(socketserver.ThreadingUDPServer):
             return (b"", self.socket, ""), addr
         dest = ""
         for level, ctype, cdata in ancdata:
-            if level == socket.IPPROTO_IP and ctype == socket.IP_PKTINFO:
+            if level == socket.IPPROTO_IP and ctype == IP_PKTINFO:
                 try:
                     _, spec_dst, _ = struct.unpack("i4s4s", cdata[:12])
                     dest = socket.inet_ntoa(spec_dst)
