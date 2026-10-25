@@ -3176,6 +3176,11 @@ def main() -> int:
                          "Tried live 2026-10-24, it broke the handshake "
                          "-- keep off until a capture shows where it "
                          "fits (SIGNALLING_PROTOCOL.md §0/§6/§9)")
+    ap.add_argument("--strict-bind", action="store_true",
+                    help="a requested listener that cannot bind is fatal, "
+                         "so a supervisor restarts the broker instead of "
+                         "it running without, e.g., signalling; meant for "
+                         "deployments (compose)")
     ap.add_argument("--ws", type=int, default=7080, help="websocket port (0=off)")
     ap.add_argument("--dns", type=int, default=53,
                     help="DNS hijack port, 0=off (needs root; answer "
@@ -3282,6 +3287,7 @@ def main() -> int:
               f"{':' + port.strip() if port.strip() else ''}", flush=True)
 
     servers = []
+    failed = []
     for kind, port in (("http", args.http), ("sig", args.sig),
                        ("ws", args.ws), ("stun", args.stun)):
         if port:
@@ -3299,6 +3305,22 @@ def main() -> int:
             except OSError as e:
                 print(f"cannot bind {kind} port {port}: {e} -- ports below "
                       "1024 need root (see module docstring)", file=sys.stderr)
+                failed.append(f"{kind}:{port}")
+    # With --strict-bind, a listener the operator asked for that cannot
+    # bind is fatal (opt-in: dev hosts often cannot bind :80 without
+    # root, so the default reports and continues). A broker that stays
+    # up without its signalling port looks healthy (the container
+    # healthcheck only connects to :80) while no camera can register --
+    # a silent outage; Docker restarts a container on exit, not on
+    # "unhealthy", so exiting lets it retry until the port is free.
+    # Every bind was attempted first so one run reports all failures.
+    if failed and args.strict_bind:
+        print(f"fatal: could not bind {', '.join(failed)} -- exiting so "
+              "the supervisor can retry", file=sys.stderr)
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+        return 1
     # The session-keeper: feeds every connected camera every couple of
     # seconds, on a clock of its own -- a camera goes silent for 40-90 s
     # while it waits for that beat, and a session that is not fed dies
@@ -3307,6 +3329,8 @@ def main() -> int:
     # --relay-start, once per arm.
     api.start_keepalive_worker()
     if args.dns:
+        # DNS stays best-effort (non-fatal): the deploy runs --dns 0, and
+        # on a dev host port 53 is often owned by systemd-resolved.
         try:
             srv = DnsServer((args.bind, args.dns), my_ip, upstream)
             threading.Thread(target=srv.serve_forever, daemon=True).start()

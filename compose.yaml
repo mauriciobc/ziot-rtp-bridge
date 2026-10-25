@@ -27,9 +27,13 @@ services:
     # the registries are named explicitly. --dns 0 because systemd-resolved
     # owns port 53 and no camera ever asked the broker: they arrive through
     # the router's static routes. Runs as root (port 80), so no cap_add.
+    # --strict-bind: Docker restarts on exit, not on unhealthy; a broker
+    # without :8882 looks healthy (the probe only hits :80) but no camera
+    # can register.
     command: >
       python3 /app/ziot_fake_cloud.py
       --http 80 --sig 8882 --stun 13478 --ws 7080 --dns 0
+      --strict-bind
       --bind-ip 192.168.68.114
       --camera-file /data/broker-cameras.json
       --viewer-file /data/broker-viewers.json
