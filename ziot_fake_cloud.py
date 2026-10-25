@@ -44,6 +44,7 @@ import argparse
 import hashlib
 import json
 import os
+import select
 import socket
 import socketserver
 import struct
@@ -178,6 +179,15 @@ ACK_HOLD_S = 6.0   # how long one candidate answer is held before the next
 # closed socket -- the log's 22 `Bad file descriptor` failures.
 STREAM_IDLE_S = 75.0   # a camera connection is closed after this much
                        # silence -- just above the longest observed idle gap
+# A write to a camera's signalling socket never blocks longer than this.
+# Live 2026-10-25 15:41: camera .107 went deaf (connected, no longer
+# reading; its sig Send-Q grew 501 -> 1813 bytes) and `sendall` on a
+# 75 s socket timeout blocked under the one broker-wide lock, so .108
+# lost its 0x8002 heartbeats (its view died 36 s later) and the
+# bridge's own API calls timed out. Heartbeats are 2 s apart and a
+# healthy camera drains a frame in milliseconds: 2 s of no progress
+# means deaf, and the link is dropped instead of waited on.
+SEND_DEADLINE_S = 2.0
 # The camera's session dies in about twelve seconds without a message
 # every two seconds -- the same interval the app's keepalive uses.
 KEEPALIVE_INTERVAL = 2.0
@@ -1404,7 +1414,8 @@ class HttpApi:
         self.p2p_sent_at: dict[str, float] = {}
         # One writer at a time per camera socket: the frames must not
         # interleave. Every send to a camera goes through send_to().
-        self.push_lock = threading.Lock()
+        # The lock is per camera: a deaf camera stalls only itself.
+        self.push_locks: dict[str, threading.Lock] = {}
         # The keepalive worker's thread and its stop event.
         self._keepalive_thread = None
         self._keepalive_stop = threading.Event()
@@ -1533,18 +1544,55 @@ class HttpApi:
         """Send one frame to a camera's signalling connection.
 
         Every write to that socket goes through here, so a pushed frame
-        and a normal answer can never interleave.
+        and a normal answer can never interleave -- the lock is per
+        camera, so cameras never wait on each other. A write has at most
+        SEND_DEADLINE_S to finish: live 2026-10-25 15:41 a deaf camera
+        (.107) filled its send buffer, `sendall` blocked for the socket's
+        75 s timeout under a broker-wide lock, and both cameras dropped
+        together. A camera that stalls or errors is treated as gone: its
+        link is removed, its media state reset to idle, and the socket
+        shut down so its handler's recv wakes up and cleans up.
         """
         conn = self.camera_links.get(uid)
         if conn is None:
             return False
-        with self.push_lock:
+        lock = self.push_locks.setdefault(uid, threading.Lock())
+        with lock:
+            if self.camera_links.get(uid) is not conn:
+                return False     # dropped while this send waited its turn
+            view = memoryview(frame)
+            sent = 0
+            deadline = time.monotonic() + SEND_DEADLINE_S
+            why = ""
             try:
-                conn.sendall(frame)
-            except OSError as e:
-                log("push", ("-", 0), f"uid={uid} send failed: {e}".encode())
-                return False
-        return True
+                while sent < len(view):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        why = (f"send stalled {SEND_DEADLINE_S:g}s "
+                               f"(camera not reading)")
+                        break
+                    _, writable, _ = select.select([], [conn], [], remaining)
+                    if not writable:
+                        continue
+                    try:
+                        sent += conn.send(view[sent:])
+                    except (BlockingIOError, InterruptedError,
+                            socket.timeout):
+                        continue
+            except (OSError, ValueError) as e:
+                why = f"send failed: {e}"
+            if not why:
+                return True
+            if self.camera_links.get(uid) is conn:
+                self.camera_links.pop(uid, None)
+                log("push", ("-", 0),
+                    f"uid={uid} {why} -- closing its link".encode())
+                self.set_media_state(uid, 0)
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return False
 
     def start_keepalive_worker(self, interval: float = KEEPALIVE_INTERVAL):
         """Start the thread that keeps every camera's session alive.
@@ -2327,6 +2375,12 @@ class HttpApi:
                 ip = cam.get("ip") or cam.get("IpcPrivateIP") or ""
                 port = int(cam.get("port") or cam.get("IpcPrivatePort") or 0)
                 self.add_camera(uid, ip, port, cam.get("pwd") or "123456")
+                # Persist now: a registration kept only in memory was lost
+                # by the next restart unless some other camera's state
+                # change happened to save the registry first (2026-10-25,
+                # the third camera), and the bridge's roster comes from
+                # this list.
+                self.save_cameras()
             data = "ok"
         elif path == "/api/v1/ipc-function/get-sig-ip":
             # §17.5: the app reads the answer's `code` and only when it

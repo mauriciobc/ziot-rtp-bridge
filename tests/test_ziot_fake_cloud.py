@@ -1833,9 +1833,22 @@ class _FakeSocket:
 
     def __init__(self, sink):
         self.sink = sink
+        # send_to() select()s on the socket: borrow a real, always
+        # writable descriptor for it.
+        self._a, self._b = socket.socketpair()
+
+    def fileno(self):
+        return self._a.fileno()
+
+    def send(self, data):
+        self.sink.append(bytes(data))
+        return len(data)
 
     def sendall(self, data):
         self.sink.append(data)
+
+    def shutdown(self, how):
+        pass
 
 
 class StunTests(unittest.TestCase):
@@ -2262,6 +2275,16 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(stun["data"]["IpcPrivateIP"], "192.168.68.77")
         self.assertEqual(stun["data"]["IpcPrivatePort"], 9000)
 
+    def test_a_registration_survives_a_restart(self):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        fh.close()
+        self.addCleanup(Path(fh.name).unlink, missing_ok=True)
+        self.api.camera_file = fh.name
+        self.call("POST", "/api/v1/ipc", "", b'{"uid":"140996632758"}')
+        restarted = fake.HttpApi(camera_file=fh.name)
+        restarted.load_cameras()
+        self.assertIn("140996632758", restarted.cameras)
+
     def test_a_poll_does_not_move_the_registration_number(self):
         # §14.1: the number belongs to a registration, not to a poll.
         # The old shared counter moved on every answer -- including the
@@ -2466,6 +2489,101 @@ class AttTransportTests(unittest.TestCase):
         result, _, _, _ = self._run_attempt(script)
         self.assertEqual(result, "write 0 rejected")
 
+
+
+class DeafCameraTests(unittest.TestCase):
+    """A camera that stops reading must not stall the others.
+
+    Live 2026-10-25 15:41: camera .107 went deaf, `sendall` blocked
+    under one broker-wide lock, and the healthy camera lost its
+    heartbeats and its view.
+    """
+
+    DEAF = "140979857781"
+    GOOD = "140979857782"
+    FRAME = b"\x5a" * 1024
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self._ctx = contextlib.redirect_stdout(self.out)
+        self._ctx.__enter__()
+        self.addCleanup(self._ctx.__exit__, None, None, None)
+        self.socks = []
+        self.api = fake.HttpApi()
+        self.peers = {}
+        for i, uid in enumerate((self.DEAF, self.GOOD)):
+            self.api.add_camera(uid, f"192.168.18.{70 + i}", 0)
+            self.api.cameras[uid]["mediaState"] = "3"
+            self.peers[uid] = self.pair(uid)
+
+    def pair(self, uid):
+        lsn = socket.socket()
+        self.socks.append(lsn)
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(1)
+        lsn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        cam = socket.socket()
+        self.socks.append(cam)
+        cam.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        cam.connect(lsn.getsockname())
+        srv, _ = lsn.accept()
+        self.socks.append(srv)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        srv.settimeout(60)     # like STREAM_IDLE_S: select must bound it
+        self.api.camera_links[uid] = srv
+        return cam, srv
+
+    def tearDown(self):
+        for s in self.socks:
+            s.close()
+
+    def test_deaf_camera_is_dropped_within_the_deadline(self):
+        cam, srv = self.peers[self.DEAF]
+        t0 = time.monotonic()
+        ok = True
+        while ok and time.monotonic() - t0 < fake.SEND_DEADLINE_S + 3:
+            ok = self.api.send_to(self.DEAF, self.FRAME)
+        self.assertFalse(ok)
+        self.assertLess(time.monotonic() - t0, fake.SEND_DEADLINE_S + 3)
+        self.assertNotIn(self.DEAF, self.api.camera_links)
+        self.assertEqual(self.api.cameras[self.DEAF]["mediaState"], "0")
+        self.assertIn("camera not reading", self.out.getvalue())
+        # The socket was shut down, not closed: the peer drains and sees EOF.
+        cam.settimeout(3)
+        while cam.recv(65536):
+            pass
+        self.assertEqual(srv.fileno() >= 0, True)
+
+    def test_deaf_camera_does_not_block_a_healthy_one(self):
+        with mock.patch.object(fake, "SEND_DEADLINE_S", 1.0):
+            cam, _ = self.peers[self.GOOD]
+            got = bytearray()
+            def reader():
+                cam.settimeout(5)
+                try:
+                    while len(got) < len(self.FRAME):
+                        got.extend(cam.recv(65536))
+                except OSError:
+                    pass
+            th = threading.Thread(target=reader, daemon=True)
+            th.start()
+            done = threading.Event()
+            def hammer():
+                while self.api.send_to(self.DEAF, self.FRAME):
+                    pass
+                done.set()
+            hm = threading.Thread(target=hammer, daemon=True)
+            hm.start()
+            # Let the deaf camera's buffers fill so the hammer is blocked.
+            time.sleep(0.5)
+            self.assertFalse(done.is_set())
+            t0 = time.monotonic()
+            self.assertTrue(self.api.send_to(self.GOOD, self.FRAME))
+            self.assertLess(time.monotonic() - t0, 0.5)
+            th.join(3)
+            self.assertEqual(bytes(got), self.FRAME)
+            self.assertTrue(done.wait(4))
+            self.assertIn(self.GOOD, self.api.camera_links)
 
 
 if __name__ == "__main__":
