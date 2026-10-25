@@ -4,3 +4,9 @@ ziot_config.json
 __pycache__/
 *.xapk
 *.apk
+
+# state and captures hold the account JWT and Wi-Fi credentials; keep them
+# out of the build context
+broker-data/
+*.log
+*.pcap

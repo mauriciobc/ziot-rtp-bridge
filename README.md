@@ -924,6 +924,86 @@ bridge exits 2 with a log line naming the mount it wanted, rather than a bare
 bridge's IP — Docker bridge networking puts the container behind NAT and the
 camera sends to an unroutable address.
 
+### Deploying to a server (broker + bridge)
+
+`compose.yaml` runs the broker (`ziot_fake_cloud.py`) and the bridge from one
+image, both on the host network. The host must own the broker's addresses, let
+the cameras through its firewall, and be the router's target for the vendor IPs.
+
+#### Addresses
+
+`ziot-addresses.conf` is a systemd-networkd drop-in holding 192.168.68.114 and
+the five vendor IPs as /32 addresses. Unlike a one-shot script, they survive a
+DHCP renewal or Wi-Fi roam (which wiped them on the dev laptop and dropped both
+cameras). The directory name must match the interface's generated file
+(`ls /run/systemd/network/`):
+
+```bash
+sudo install -D -m 644 ziot-addresses.conf /etc/systemd/network/10-netplan-wlp1s0.network.d/ziot-addresses.conf
+sudo networkctl reload
+ip -br addr show wlp1s0
+```
+
+If the addresses do not appear, `sudo networkctl reconfigure wlp1s0` (brief
+network blip).
+
+#### Firewall (ufw)
+
+```bash
+sudo ufw allow proto tcp from 192.168.68.0/24 to any port 80,7080,8882
+sudo ufw allow proto udp from 192.168.68.0/24 to any port 13478
+sudo ufw allow proto udp from <camera-ip>      # one line per camera
+```
+
+The per-camera UDP rule is needed because the bridge's media sockets use
+ephemeral ports and the camera can change its source port mid-stream, which
+conntrack treats as a new flow.
+
+#### Router
+
+In the Deco's DHCP, reserve 192.168.68.114 (it sits inside the pool) and each
+camera's address. The static routes are unchanged; see
+[Taking the camera off the vendor cloud](#taking-the-camera-off-the-vendor-cloud).
+
+#### Config keys
+
+| Key | Value | Why |
+| --- | --- | --- |
+| `port` | `8085` | Frigate's go2rtc reads `http://127.0.0.1:8085/cam/<uid>` |
+| `api_base` | `http://120.26.121.165/api` | the local broker answers the vendor API |
+
+Do not run the bridge with `--offline`.
+
+#### Bring-up and verification
+
+```bash
+docker compose up -d --build
+docker logs ziot-broker | grep ' sig '   # cameras reaching the broker
+curl -s 127.0.0.1:8085/health
+```
+
+#### Moving from another host
+
+Only one host may hold the addresses. On the old host, stop and disable the
+broker, the address unit (`ziot-ips.service`) and the bridge, and remove its
+addresses *before* the new host claims them. On the new host, remove the old
+container first, since compose reuses its name (`docker rm -f ziot-bridge`),
+then bring it up and announce the move so the router and peers refresh their
+ARP caches (package `iputils-arping`):
+
+```bash
+sudo arping -U -I wlp1s0 -c 3 192.168.68.114
+```
+
+#### Notes
+
+- **`--dns 0`**: systemd-resolved owns port 53, and the broker's DNS listener
+  never received a query; the cameras reach it through the router's static
+  routes.
+- **Log hygiene**: the broker's logs carry the account token. Compose caps them
+  at 3 x 20 MB; do not paste them into issues, and keep `broker-data/` out of
+  version control (it is gitignored).
+
 ### systemd (bare Python)
 
 `/etc/systemd/system/ziot-bridge.service`:
@@ -989,6 +1069,7 @@ should come back up rather than sit dead.
       "streaming": true,
       "fps": 6.5,
       "frames_total": 1234,
+      "frames_dropped": 3,
       "audio_pkts": 5678,
       "rx_datagrams": 9012,
       "rx_errors": 0,
@@ -1020,7 +1101,11 @@ from the app's /24 rule, or `static-lan` when `--offline` pins the
 configured IP and takes only the STUN private port. `re_rendezvous_count`
 and `backoff_s` are the recovery loop. `foreign_ssrc` counts datagrams
 dropped for carrying another camera's SSRC, `rx_errors` counts packets
-whose handling raised.
+whose handling raised. `frames_dropped` counts frames whose first or middle
+packet never arrived. They are held back rather than served broken,
+because a JPEG joined around a hole decodes with smeared blocks that
+Frigate's motion detector reads as motion. A few per thousand is normal
+Wi-Fi loss; a share in the percent range points at the camera's signal.
 
 `rx_datagrams` counts every datagram that arrived on the direct socket, before
 any filtering. It is the one number that separates *"the camera is silent"*
@@ -1237,6 +1322,17 @@ camera's JPEG, no transcode. You can verify by checking
 **ffmpeg logs `overread 8`.**
 Cosmetic. The camera's entropy data has a few trailing bytes ffmpeg's MJPEG
 decoder is strict about; every frame still decodes.
+
+**ffmpeg logs `bad vlc` or `error count: …`.**
+That is a frame with a missing packet. Bridges before
+`frames_dropped` existed joined the frame around the hole and served it
+broken. The current bridge drops it instead and counts it in `/health`.
+
+**Video plays at a third of real speed when ffmpeg reads `/cam/<uid>`
+directly.**
+Multipart MJPEG carries no timestamps, so ffmpeg assumes 25 fps against the
+camera's ~8. Read it through the shipped go2rtc config, which is the tested
+path, or give ffmpeg `-use_wallclock_as_timestamps 1`.
 
 **Colors look washed out / tinted.**
 The sensor, not the decoder. The camera's chroma quantization table is pinned

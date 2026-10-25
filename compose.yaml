@@ -1,0 +1,72 @@
+# Broker + bridge on a server that runs next to Frigate.
+#
+# Host prerequisites (see README, "Deploying to a server (broker + bridge)"):
+#   - this host owns 192.168.68.114 and the five vendor IPs as /32 addresses,
+#     persisted in the network config: install ziot-addresses.conf
+#   - ufw admits the cameras: TCP 80,7080,8882 and UDP 13478 from the LAN, and
+#     UDP from each camera's address (the bridge's media ports are ephemeral)
+#   - the router's static routes send the vendor IPs to 192.168.68.114
+#
+# Config keys the bridge needs in ziot_config.json (mounted read-only below):
+#   "port": 8085                                (Frigate's go2rtc reads it)
+#   "api_base": "http://120.26.121.165/api"     (the broker answers the API)
+# and it must NOT run with --offline.
+#
+# Both services use host networking: the camera sends UDP straight to this
+# host, and Docker's bridge NAT would hide it. Bring up with
+#   docker compose up -d --build
+
+services:
+  ziot-broker:
+    build: .
+    image: ziot-rtp-bridge:local
+    container_name: ziot-broker
+    network_mode: host
+    restart: unless-stopped
+    # Without --log every line goes to stdout, so nothing is persisted unless
+    # the registries are named explicitly. --dns 0 because systemd-resolved
+    # owns port 53 and no camera ever asked the broker: they arrive through
+    # the router's static routes. Runs as root (port 80), so no cap_add.
+    command: >
+      python3 /app/ziot_fake_cloud.py
+      --http 80 --sig 8882 --stun 13478 --ws 7080 --dns 0
+      --bind-ip 192.168.68.114
+      --camera-file /data/broker-cameras.json
+      --viewer-file /data/broker-viewers.json
+    volumes:
+      - ./broker-data:/data
+    # The image's own probe targets the bridge on 8085. A bare connect-and-
+    # close on port 80 logs nothing and changes no broker state.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 80), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # The broker's stdout includes auth lines carrying the account token, so
+    # keep the logs bounded and treat them as secrets.
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+
+  ziot-bridge:
+    build: .
+    image: ziot-rtp-bridge:local
+    container_name: ziot-bridge
+    network_mode: host
+    restart: unless-stopped
+    command: >
+      python3 /app/ziot_rtp_bridge.py
+      --config /app/ziot_config.json
+      --bind-ip 192.168.68.114
+    volumes:
+      - ./ziot_config.json:/app/ziot_config.json:ro
+    depends_on:
+      - ziot-broker
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"

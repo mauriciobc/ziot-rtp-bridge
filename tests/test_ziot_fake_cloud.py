@@ -1817,6 +1817,20 @@ class ClaimIpsTests(unittest.TestCase):
         # The router needs the gateway to be this host and a host route.
         self.assertIn("255.255.255.255", text)
 
+    def test_networkd_dropin_lists_exactly_the_vendor_addresses(self):
+        """ziot-addresses.conf is what keeps the addresses across a DHCP
+        renewal on the server; a missing one strands every camera that is
+        pointed at it."""
+        conf = Path(__file__).resolve().parent.parent / "ziot-addresses.conf"
+        found = set()
+        for line in conf.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("Address="):
+                addr, _, prefix = line[len("Address="):].partition("/")
+                self.assertEqual(prefix, "32", line)
+                found.add(addr)
+        self.assertEqual(found, set(fake.VENDOR_IPS) | {"192.168.68.114"})
+
     def test_print_only_does_not_touch_the_host(self):
         with mock.patch.object(fake.subprocess, "run") as run:
             with contextlib.redirect_stdout(io.StringIO()):

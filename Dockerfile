@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 RUN mkdir -p /app
 COPY ziot_rtp_bridge.py /app/
+# The broker (the local stand-in for the vendor cloud) ships in the same image
+# and runs with a command override; see compose.yaml.
+COPY ziot_fake_cloud.py /app/
 WORKDIR /app
 # Port the healthcheck probes. Keep in sync with the config's "port" via
 #   -e BRIDGE_PORT=9090

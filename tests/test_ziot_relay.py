@@ -162,7 +162,9 @@ class RelayTests(unittest.TestCase):
         for i in range(frames):
             first = self._fragment(i, marker=False, first=True)
             s.sendall(b"$" + bytes([0]) + struct.pack(">H", len(first)) + first)
-            last = self._fragment(i, marker=True, first=False, offset=16)
+            # The offset is where this data starts in the scan data: right
+            # after the first fragment's 32 bytes (RFC 2435).
+            last = self._fragment(i, marker=True, first=False, offset=32)
             s.sendall(b"$" + bytes([0]) + struct.pack(">H", len(last)) + last)
             time.sleep(0.03)
         return s
